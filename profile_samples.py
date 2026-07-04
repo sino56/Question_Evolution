@@ -318,6 +318,12 @@ def coerce_score_rate(value: Any) -> Optional[float]:
 
 
 def get_score_rate(item: Dict[str, Any]) -> Optional[float]:
+    summary = item.get("round0_score_summary")
+    if isinstance(summary, dict):
+        stable_score = coerce_score_rate(summary.get("stable_score"))
+        if stable_score is not None:
+            return stable_score
+
     top_level = coerce_score_rate(item.get("score_rate"))
     if top_level is not None:
         return top_level
@@ -350,6 +356,12 @@ def get_reference_answer(item: Dict[str, Any]) -> str:
 
 
 def get_candidate_answer(item: Dict[str, Any]) -> str:
+    representative = item.get("representative_round0_answer")
+    if isinstance(representative, dict):
+        value = representative.get("candidate_answer")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
     scoring_result = item.get("scoring_result")
     if isinstance(scoring_result, dict):
         value = scoring_result.get("candidate_answer")
@@ -409,6 +421,21 @@ def attach_profile_result(
     result["profile_metadata"] = {
         "profile_model": model,
         "profile_raw_response": raw_response,
+    }
+    result["profile_source"] = {
+        "answer_source": (
+            "representative_round0_answer"
+            if isinstance(item.get("representative_round0_answer"), dict)
+            and isinstance(item["representative_round0_answer"].get("candidate_answer"), str)
+            and item["representative_round0_answer"].get("candidate_answer").strip()
+            else "scoring_result.candidate_answer"
+        ),
+        "score_source": (
+            "round0_score_summary.stable_score"
+            if isinstance(item.get("round0_score_summary"), dict)
+            and coerce_score_rate(item["round0_score_summary"].get("stable_score")) is not None
+            else "score_rate"
+        ),
     }
     return result
 

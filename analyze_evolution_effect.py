@@ -79,6 +79,12 @@ def records_by_key(records: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any
 def get_score_rate(item: Optional[Dict[str, Any]]) -> Optional[float]:
     if not isinstance(item, dict):
         return None
+    summary = item.get("round0_score_summary")
+    if isinstance(summary, dict):
+        stable_score = _coerce_score_rate(summary.get("stable_score"))
+        if stable_score is not None:
+            return stable_score
+
     top_level_score_rate = _coerce_score_rate(item.get("score_rate"))
     if top_level_score_rate is not None:
         return top_level_score_rate
@@ -94,6 +100,19 @@ def get_score_rate(item: Optional[Dict[str, Any]]) -> Optional[float]:
     if possible <= 0:
         return None
     return max(0.0, min(1.0, awarded / possible))
+
+
+def get_score_source(item: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(item, dict):
+        return "missing"
+    summary = item.get("round0_score_summary")
+    if isinstance(summary, dict) and _coerce_score_rate(summary.get("stable_score")) is not None:
+        return "round0_score_summary.stable_score"
+    if _coerce_score_rate(item.get("score_rate")) is not None:
+        return "score_rate"
+    if isinstance(item.get("scoring_result"), dict):
+        return "scoring_result.total_awarded/total_possible"
+    return "missing"
 
 
 def get_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -142,6 +161,21 @@ def get_score_rate_before(item: Dict[str, Any], previous_item: Optional[Dict[str
             return state_score_rate
 
     return get_score_rate(item)
+
+
+def get_score_rate_before_source(item: Dict[str, Any], previous_item: Optional[Dict[str, Any]]) -> str:
+    metadata = get_metadata(item)
+    if _coerce_score_rate(metadata.get("trigger_score_rate")) is not None:
+        return "question_evolution_metadata.trigger_score_rate"
+    if previous_item is not None and get_score_rate(previous_item) is not None:
+        return get_score_source(previous_item)
+    meta_info = item.get("meta_info")
+    if isinstance(meta_info, dict) and isinstance(meta_info.get("stale_scoring_result"), dict):
+        return "meta_info.stale_scoring_result"
+    state = item.get("evolution_state")
+    if isinstance(state, dict) and _coerce_score_rate(state.get("previous_score_rate")) is not None:
+        return "evolution_state.previous_score_rate"
+    return get_score_source(item)
 
 
 def get_operator_used(item: Dict[str, Any]) -> str:
@@ -353,6 +387,8 @@ def build_effect_analysis(
     return {
         "score_rate_before": score_rate_before,
         "score_rate_after": score_rate_after,
+        "baseline_score_source": get_score_rate_before_source(item, previous_item),
+        "score_after_source": get_score_source(item),
         "delta_score_rate": delta_score_rate,
         "operator_used": get_operator_used(item),
         "question_length": len(_clean_text(item.get("prompt"))),

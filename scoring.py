@@ -181,10 +181,19 @@ class RotatingAPIClient:
 
 class AnswerLLMClient:
     """用于自由配置的待评答案模型。"""
-    def __init__(self, base_url: str, api_key: str, model: str):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ):
         self.base_url = base_url
         self.api_key = api_key if api_key else "EMPTY_KEY"
         self.model = model
+        self.temperature = temperature
+        self.top_p = top_p
         self.client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
@@ -192,11 +201,18 @@ class AnswerLLMClient:
         )
 
     async def generate_answer(self, question: str) -> str:
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
+        request: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [
                 {"role": "user", "content": question}
-            ]
+            ],
+        }
+        if self.temperature is not None:
+            request["temperature"] = self.temperature
+        if self.top_p is not None:
+            request["top_p"] = self.top_p
+        response = await self.client.chat.completions.create(
+            **request
         )
         return extract_answer(response)
 
@@ -382,13 +398,17 @@ class ScoringProcessor:
         max_concurrent: int = 20,
         max_retries: int = 3,
         answer_client: Optional[AnswerLLMClient] = None,
-        answer_model_name: str = ""
+        answer_model_name: str = "",
+        force_generate_answer: bool = False,
+        judge_temperature: float = 0.0,
     ):
         self.judge_client = judge_client
         self.judge_model = judge_model
         self.answer_mode = answer_mode
         self.answer_client = answer_client
         self.answer_model_name = answer_model_name
+        self.force_generate_answer = force_generate_answer
+        self.judge_temperature = judge_temperature
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.write_lock = asyncio.Lock()
         self.max_retries = max_retries
@@ -459,7 +479,7 @@ class ScoringProcessor:
             messages=[
                 {"role": "user", "content": score_prompt}
             ],
-            temperature=0.0
+            temperature=self.judge_temperature
         )
         content = response.choices[0].message.content or ""
         json_str = extract_json_from_response(content)
@@ -485,6 +505,35 @@ class ScoringProcessor:
                     raise
         raise RuntimeError("评分重试逻辑异常退出")
 
+    async def score_candidate_answer(self, item: Dict[str, Any], candidate_answer: str) -> Dict[str, Any]:
+        score_prompt_template = item.get("score_prompt")
+        rubric = item.get("rubric")
+
+        if not isinstance(score_prompt_template, str) or not score_prompt_template.strip():
+            raise ValueError("输入数据缺少非空 score_prompt")
+        if not isinstance(rubric, list) or not rubric:
+            raise ValueError("输入数据缺少非空 rubric")
+
+        final_prompt = build_scoring_prompt(score_prompt_template, candidate_answer.strip())
+        score_result = await self.score_with_retry(final_prompt)
+        normalized_item_scores, total_awarded = normalize_item_scores(
+            score_result.get("item_scores", []),
+            rubric
+        )
+        total_possible = sum(max(0, int(criterion.get("weight", 0) or 0)) for criterion in rubric)
+
+        return {
+            "answer_mode": self.answer_mode,
+            "answer_model": self.answer_model_name if self.answer_mode == "llm" else "meta_info.references[0]",
+            "candidate_answer": candidate_answer.strip(),
+            "item_scores": normalized_item_scores,
+            "overall_comment": str(score_result.get("overall_comment", "")).strip(),
+            "total_awarded": total_awarded,
+            "total_possible": total_possible,
+            "judge_model": self.judge_model,
+            "judge_raw_response": score_result.get("_raw_response", "")
+        }
+
     async def process_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         async with self.semaphore:
             ensure_sample_identity(item)
@@ -499,43 +548,17 @@ class ScoringProcessor:
                 attach_score_rate(item)
                 return item
 
-            score_prompt_template = item.get("score_prompt")
-            rubric = item.get("rubric")
-
-            if not isinstance(score_prompt_template, str) or not score_prompt_template.strip():
-                raise ValueError("输入数据缺少非空 score_prompt")
-            if not isinstance(rubric, list) or not rubric:
-                raise ValueError("输入数据缺少非空 rubric")
-
             if self.answer_mode == "reference":
                 candidate_answer = self.get_reference_answer(item)
             else:
                 existing_answer = item.get("scoring_result", {}).get("candidate_answer")
-                if isinstance(existing_answer, str) and existing_answer.strip():
+                if not self.force_generate_answer and isinstance(existing_answer, str) and existing_answer.strip():
                     logger.info(f"读取已有 candidate_answer (index={item.get('index')})")
                     candidate_answer = existing_answer.strip()
                 else:
                     candidate_answer = await self.generate_candidate_answer_with_retry(item)
 
-            final_prompt = build_scoring_prompt(score_prompt_template, candidate_answer.strip())
-            score_result = await self.score_with_retry(final_prompt)
-            normalized_item_scores, total_awarded = normalize_item_scores(
-                score_result.get("item_scores", []),
-                rubric
-            )
-            total_possible = sum(max(0, int(criterion.get("weight", 0) or 0)) for criterion in rubric)
-
-            item["scoring_result"] = {
-                "answer_mode": self.answer_mode,
-                "answer_model": self.answer_model_name if self.answer_mode == "llm" else "meta_info.references[0]",
-                "candidate_answer": candidate_answer.strip(),
-                "item_scores": normalized_item_scores,
-                "overall_comment": str(score_result.get("overall_comment", "")).strip(),
-                "total_awarded": total_awarded,
-                "total_possible": total_possible,
-                "judge_model": self.judge_model,
-                "judge_raw_response": score_result.get("_raw_response", "")
-            }
+            item["scoring_result"] = await self.score_candidate_answer(item, candidate_answer)
             attach_score_rate(item)
             return item
 
@@ -667,6 +690,7 @@ async def main():
     parser.add_argument("--judge-model", type=str, default=JUDGE_MODEL, help="评分模型名称")
     parser.add_argument("--judge-base-url", type=str, default=JUDGE_BASE_URL, help="评分模型 OpenAI-compatible base_url")
     parser.add_argument("--judge-api-key", action="append", default=None, help="评分模型 API key；可多次传入。本地 Qwen 服务不需要 key 时可不传。")
+    parser.add_argument("--judge-temperature", type=float, default=0.0, help="评分模型 temperature，默认 0.0")
     parser.add_argument(
         "--answer-mode",
         type=str,
@@ -677,6 +701,13 @@ async def main():
     parser.add_argument("--answer-base-url", type=str, default=ANSWER_BASE_URL, help="待评答案模型的 base_url")
     parser.add_argument("--answer-api-key", type=str, default="", help="待评答案模型的 api_key；本地 Qwen 服务不需要 key 时可为空字符串")
     parser.add_argument("--answer-model", type=str, default=ANSWER_MODEL, help="待评答案模型名称")
+    parser.add_argument(
+        "--force-generate-answer",
+        "--ignore-existing-answer",
+        dest="force_generate_answer",
+        action="store_true",
+        help="answer-mode=llm 时忽略已有 scoring_result.candidate_answer，强制重新生成待评答案",
+    )
     args = parser.parse_args()
 
     if not args.output:
@@ -711,7 +742,9 @@ async def main():
         max_concurrent=args.concurrency,
         max_retries=args.retries,
         answer_client=answer_client,
-        answer_model_name=answer_model_name
+        answer_model_name=answer_model_name,
+        force_generate_answer=args.force_generate_answer,
+        judge_temperature=args.judge_temperature,
     )
 
     await processor.process_file(args.input, args.output)

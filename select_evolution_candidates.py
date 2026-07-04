@@ -49,6 +49,9 @@ STOP_STATUSES = {
     "unanswerable_or_trap_sample",
     "stop_evolution",
 }
+ROUND0_EVOLVE_HIGH_STATUSES = {"stable_high", "unstable_high"}
+ROUND0_BORDERLINE_STATUSES = {"borderline_probe"}
+ROUND0_STOP_STATUSES = {"stable_low", "uncertain_low", "review_needed"}
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
@@ -127,6 +130,56 @@ def _stop_status(item: Dict[str, Any]) -> str:
     return str(state.get("stop_status", "")).strip()
 
 
+def get_round0_summary(item: Dict[str, Any]) -> Dict[str, Any]:
+    summary = item.get("round0_score_summary")
+    return summary if isinstance(summary, dict) else {}
+
+
+def decide_action_from_round0_summary(item: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    summary = get_round0_summary(item)
+    if not summary:
+        return None
+
+    status = str(summary.get("admission_status", "") or "").strip()
+    stable_score = coerce_score_rate(summary.get("stable_score"))
+    admission_score = coerce_score_rate(summary.get("admission_score"))
+    volatility_level = str(summary.get("volatility_level", "") or "").strip()
+    score_bits = []
+    if stable_score is not None:
+        score_bits.append(f"stable_score={stable_score:.4f}")
+    if admission_score is not None:
+        score_bits.append(f"admission_score={admission_score:.4f}")
+    if volatility_level:
+        score_bits.append(f"volatility={volatility_level}")
+    score_text = ", ".join(score_bits) if score_bits else "round0 summary present"
+
+    if status in ROUND0_EVOLVE_HIGH_STATUSES:
+        return EVOLVE_HIGH_SCORE_OVERSCORE, f"round0 admission_status={status} ({score_text}) admits high-score evolution."
+
+    if status in ROUND0_BORDERLINE_STATUSES:
+        return RECONSTRUCT_LOW_SCORE_BOUNDARY, f"round0 admission_status={status} ({score_text}) admits a low-budget boundary probe."
+
+    if status in ROUND0_STOP_STATUSES:
+        return STOP_EVOLUTION, f"round0 admission_status={status} ({score_text}) stops evolution."
+
+    return STOP_EVOLUTION, f"round0 admission_status={status or '<missing>'} ({score_text}) is not recognized; stop for review."
+
+
+def build_evolution_budget(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    summary = get_round0_summary(item)
+    if not summary:
+        return None
+    try:
+        budget = int(summary.get("recommended_evolution_budget") or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    return {
+        "recommended_num_candidates": max(0, budget),
+        "source": "round0_score_summary",
+        "admission_status": str(summary.get("admission_status", "") or ""),
+    }
+
+
 def validate_profiled_record(item: Dict[str, Any]) -> None:
     if not isinstance(item.get("sample_profile"), dict):
         raise ValueError("record missing sample_profile; run profile_samples.py first")
@@ -153,6 +206,10 @@ def decide_evolution_action(
 
     if _has_any_term(diagnosis_text, STOP_TERMS) and not worth_evolving:
         return STOP_EVOLUTION, "diagnosis says the sample is stable or should stop."
+
+    round0_decision = decide_action_from_round0_summary(item)
+    if round0_decision is not None:
+        return round0_decision
 
     if score_rate is None:
         return PASS_THROUGH_OR_SCORING_NOISE, "score_rate is missing or invalid."
@@ -198,6 +255,9 @@ def select_record(
     result = dict(item)
     result["evolution_action"] = action
     result["evolution_action_reason"] = reason
+    evolution_budget = build_evolution_budget(item)
+    if evolution_budget is not None:
+        result["evolution_budget"] = evolution_budget
     return result
 
 

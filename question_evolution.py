@@ -618,6 +618,35 @@ def get_evolution_state(item: Dict[str, Any]) -> Dict[str, Any]:
     return state if isinstance(state, dict) else {}
 
 
+def get_round0_recommended_budget(item: Dict[str, Any]) -> Optional[int]:
+    route = item.get("operator_route")
+    if isinstance(route, dict):
+        try:
+            route_budget = int(route.get("recommended_num_candidates"))
+        except (TypeError, ValueError):
+            route_budget = None
+        if route_budget is not None:
+            return max(0, route_budget)
+
+    evolution_budget = item.get("evolution_budget")
+    if isinstance(evolution_budget, dict):
+        try:
+            budget = int(evolution_budget.get("recommended_num_candidates"))
+        except (TypeError, ValueError):
+            budget = None
+        if budget is not None:
+            return max(0, budget)
+
+    summary = item.get("round0_score_summary")
+    if not isinstance(summary, dict):
+        return None
+    try:
+        budget = int(summary.get("recommended_evolution_budget"))
+    except (TypeError, ValueError):
+        return None
+    return max(0, budget)
+
+
 def get_sample_profile(item: Dict[str, Any]) -> Dict[str, Any]:
     profile = item.get("sample_profile")
     return profile if isinstance(profile, dict) else {}
@@ -731,6 +760,9 @@ def make_passthrough_candidate_record(item: Dict[str, Any], requested_candidates
 
 def should_evolve(item: Dict[str, Any], min_score_rate: float) -> bool:
     if uses_stage_action_contract(item):
+        budget = get_round0_recommended_budget(item)
+        if budget == 0:
+            return False
         return action_requires_evolution(item)
     score_rate = get_score_rate(item)
     if score_rate is None:
@@ -1097,7 +1129,7 @@ class QuestionEvolutionProcessor:
         requested_candidates: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         async with self.semaphore:
-            candidate_count = requested_candidates or self.num_candidates
+            candidate_count = self.num_candidates if requested_candidates is None else requested_candidates
             if not should_evolve(item, self.min_score_rate):
                 return [make_passthrough_candidate_record(item, candidate_count)]
 
@@ -1155,6 +1187,10 @@ class QuestionEvolutionProcessor:
             invalid_count = 0
         if invalid_count >= 2 or previous_effect in {"invalid_complexity", "no_clear_effect"}:
             count = max(count, 3)
+
+        round0_budget = get_round0_recommended_budget(item)
+        if round0_budget is not None and round0_budget > 0:
+            count = min(count, round0_budget)
 
         return max(1, min(self.num_candidates, count))
 

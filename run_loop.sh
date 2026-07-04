@@ -7,6 +7,20 @@
 set -euo pipefail
 
 # ===================== 可配置参数 =====================
+read_config_value() {
+    python -c "import sys; from local_api_config import get_config_value; print(get_config_value(*sys.argv[1:-1], default=sys.argv[-1]))" "$@"
+}
+
+CONFIG_BASE_URL=$(read_config_value BASE_URL OPENAI_BASE_URL "")
+CONFIG_GPT_MODEL=$(read_config_value GPT_MODEL QA_MODEL "gpt-5.4")
+CONFIG_QWEN_BASE_URL=$(read_config_value QWEN_BASE_URL "$CONFIG_BASE_URL")
+CONFIG_QWEN_API_KEY=$(read_config_value QWEN_API_KEY "")
+CONFIG_QWEN_MODEL=$(read_config_value QWEN_MODEL GPT_MODEL "hjl_Qwen3.6-27B")
+CONFIG_PROFILE_MODEL=$(read_config_value PROFILE_MODEL EVOLVE_MODEL QA_MODEL GPT_MODEL "$CONFIG_GPT_MODEL")
+CONFIG_EVOLVE_MODEL=$(read_config_value EVOLVE_MODEL QA_MODEL GPT_MODEL "$CONFIG_GPT_MODEL")
+CONFIG_ANSWER_MODEL=$(read_config_value ANSWER_MODEL QA_MODEL GPT_MODEL "$CONFIG_GPT_MODEL")
+CONFIG_RUBRIC_MODEL=$(read_config_value RUBRIC_MODEL QA_MODEL GPT_MODEL "$CONFIG_GPT_MODEL")
+
 MAX_ROUNDS=${MAX_ROUNDS:-5}                      # 最大迭代轮数
 EARLY_STOP_RATE=${EARLY_STOP_RATE:-0.5}          # 平均得分率低于该值时停止
 NO_INFO_STOP_ROUNDS=${NO_INFO_STOP_ROUNDS:-2}    # 连续多少轮无新信息时停止
@@ -15,24 +29,34 @@ MIN_SCORE_RATE=${MIN_SCORE_RATE:-0.8}            # legacy question_evolution 触
 NUM_CANDIDATES=${NUM_CANDIDATES:-2}              # 每条待进化样本最多生成候选数，范围 1-4
 MAX_CANDIDATE_BUDGET=${MAX_CANDIDATE_BUDGET:-0}  # 单轮候选总预算；0 表示待进化样本数 * 2
 VALIDATION_RETRIES=${VALIDATION_RETRIES:-1}      # validate-retry 次数；当前最多 1 次
+ROUND0_INITIAL_TRIALS=${ROUND0_INITIAL_TRIALS:-3}
+ROUND0_EXTRA_TRIALS=${ROUND0_EXTRA_TRIALS:-2}
+ROUND0_MAX_TRIALS=${ROUND0_MAX_TRIALS:-5}
+ROUND0_EDGE_LOW=${ROUND0_EDGE_LOW:-0.72}
+ROUND0_EDGE_HIGH=${ROUND0_EDGE_HIGH:-0.83}
+ROUND0_STRONG_HIGH_RATE=${ROUND0_STRONG_HIGH_RATE:-0.85}
+ROUND0_ANSWER_TEMPERATURE=${ROUND0_ANSWER_TEMPERATURE:-0.7}
+ROUND0_ANSWER_TOP_P=${ROUND0_ANSWER_TOP_P:-0.95}
+ROUND0_ANSWER_SEED_BASE=${ROUND0_ANSWER_SEED_BASE:-20260704}
+ROUND0_JUDGE_TEMPERATURE=${ROUND0_JUDGE_TEMPERATURE:-0.0}
 
-DEFAULT_INPUT_FILE="data/data.jsonl"
+DEFAULT_INPUT_FILE="admitted_seed_samples.jsonl"
 LEGACY_INPUT_FILE="data/data.jsonl"
 INPUT_FILE=${INPUT_FILE:-$DEFAULT_INPUT_FILE}    # 推荐输入：已完成准入的种子样本
 EXP_ROOT=${EXP_ROOT:-"experiments"}              # 实验结果根目录
 
 # Qwen（候选模型 / 评分模型）配置
-QWEN_BASE_URL=${QWEN_BASE_URL:-"http://127.0.0.1:18011/v1"}
-QWEN_API_KEY=${QWEN_API_KEY:-""}
-QWEN_MODEL=${QWEN_MODEL:-"hjl_Qwen3.6-27B"}
+QWEN_BASE_URL=${QWEN_BASE_URL:-$CONFIG_QWEN_BASE_URL}
+QWEN_API_KEY=${QWEN_API_KEY:-$CONFIG_QWEN_API_KEY}
+QWEN_MODEL=${QWEN_MODEL:-$CONFIG_QWEN_MODEL}
 
 # GPT / OpenAI-compatible 配置。API key 优先使用各脚本支持的环境变量：
 # PROFILE_API_KEYS、EVOLVE_API_KEYS、OPENAI_API_KEYS 或 OPENAI_API_KEY。
-GPT_MODEL=${GPT_MODEL:-"gpt-5.4"}
-OPENAI_BASE_URL=${OPENAI_BASE_URL:-""}
-PROFILE_MODEL=${PROFILE_MODEL:-$GPT_MODEL}
+GPT_MODEL=${GPT_MODEL:-$CONFIG_GPT_MODEL}
+OPENAI_BASE_URL=${OPENAI_BASE_URL:-$CONFIG_BASE_URL}
+PROFILE_MODEL=${PROFILE_MODEL:-$CONFIG_PROFILE_MODEL}
 PROFILE_BASE_URL=${PROFILE_BASE_URL:-$OPENAI_BASE_URL}
-EVOLVE_MODEL=${EVOLVE_MODEL:-$GPT_MODEL}
+EVOLVE_MODEL=${EVOLVE_MODEL:-$CONFIG_EVOLVE_MODEL}
 EVOLVE_BASE_URL=${EVOLVE_BASE_URL:-$OPENAI_BASE_URL}
 ANSWER_BASE_URL=${ANSWER_BASE_URL:-$OPENAI_BASE_URL}
 RUBRIC_BASE_URL=${RUBRIC_BASE_URL:-$OPENAI_BASE_URL}
@@ -102,24 +126,9 @@ run_if_missing() {
 # 辅助函数：计算 jsonl 的平均得分率
 compute_avg_score_rate() {
     local scored_file="$1"
-    python - "$scored_file" <<'PY'
-import json, sys
-path = sys.argv[1]
-rates = []
-with open(path, "r", encoding="utf-8") as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        item = json.loads(line)
-        sr = item.get("scoring_result", {})
-        awarded = sr.get("total_awarded", 0) or 0
-        possible = sr.get("total_possible", 0) or 0
-        if possible > 0:
-            rates.append(awarded / possible)
-avg = sum(rates) / len(rates) if rates else 0.0
-print(f"{avg:.4f}")
-PY
+    python -c "import json, sys; rates=[]; f=open(sys.argv[1], encoding='utf-8'); \
+[rates.append((item.get('scoring_result',{}).get('total_awarded',0) or 0)/(item.get('scoring_result',{}).get('total_possible',0) or 1)) for item in (json.loads(line) for line in f if line.strip()) if (item.get('scoring_result',{}).get('total_possible',0) or 0) > 0]; \
+print(f'{(sum(rates)/len(rates) if rates else 0.0):.4f}')" "$scored_file"
 }
 
 # 辅助函数：比较两个浮点数，输出 true/false
@@ -133,21 +142,9 @@ abs_diff_float() {
 
 extract_effect_count() {
     local analyzed_file="$1"
-    python - "$analyzed_file" <<'PY'
-import json, sys
-path = sys.argv[1]
-count = 0
-with open(path, "r", encoding="utf-8") as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        item = json.loads(line)
-        effect = item.get("effect_analysis", {})
-        if isinstance(effect, dict) and effect.get("effect_label") == "effective_boundary_probe":
-            count += 1
-print(count)
-PY
+    python -c "import json, sys; count=0; f=open(sys.argv[1], encoding='utf-8'); \
+[globals().__setitem__('count', count + 1) for item in (json.loads(line) for line in f if line.strip()) if isinstance(item.get('effect_analysis', {}), dict) and item.get('effect_analysis', {}).get('effect_label') == 'effective_boundary_probe']; \
+print(count)" "$analyzed_file"
 }
 
 SUMMARY_FILE="$EXP_DIR/summary.txt"
@@ -180,8 +177,8 @@ echo "========================================"
 run_if_missing "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 0/2: 准备 baseline input" \
     cp "$INPUT_FILE" "$ROUND_DIR/input.jsonl"
 
-run_if_missing "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 1/2: scoring.py baseline" \
-    python scoring.py \
+run_if_missing "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 1/2: round0_stability_probe.py baseline" \
+    python round0_stability_probe.py \
         --input "$ROUND_DIR/input.jsonl" \
         --output "$ROUND_DIR/scored.jsonl" \
         --answer-mode llm \
@@ -191,7 +188,20 @@ run_if_missing "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 1/2: scoring.py ba
         --judge-base-url "$QWEN_BASE_URL" \
         --judge-api-key "$QWEN_API_KEY" \
         --judge-model "$QWEN_MODEL" \
-        --concurrency "$SCORING_CONCURRENCY"
+        --max-concurrent "$SCORING_CONCURRENCY" \
+        --initial-trials "$ROUND0_INITIAL_TRIALS" \
+        --extra-trials "$ROUND0_EXTRA_TRIALS" \
+        --max-trials "$ROUND0_MAX_TRIALS" \
+        --answer-temperature "$ROUND0_ANSWER_TEMPERATURE" \
+        --answer-top-p "$ROUND0_ANSWER_TOP_P" \
+        --answer-seed-base "$ROUND0_ANSWER_SEED_BASE" \
+        --judge-temperature "$ROUND0_JUDGE_TEMPERATURE" \
+        --score-threshold "$MIN_SCORE_RATE" \
+        --strong-high-threshold "$ROUND0_STRONG_HIGH_RATE" \
+        --edge-low "$ROUND0_EDGE_LOW" \
+        --edge-high "$ROUND0_EDGE_HIGH" \
+        --cache-dir "$ROUND_DIR/round0_cache" \
+        --report-output "$ROUND_DIR/round0_stability_report.json"
 
 AVG_RATE=$(compute_avg_score_rate "$ROUND_DIR/scored.jsonl")
 echo "Round $ROUND 平均得分率: $AVG_RATE"
