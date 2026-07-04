@@ -40,6 +40,8 @@ NON_EVOLUTION_ACTIONS = {
     PASS_THROUGH_OR_SCORING_NOISE,
     STOP_EVOLUTION,
 }
+NO_AVAILABLE_OPERATOR_STATUS = "no_available_operator"
+GENERATION_FAILED_STATUS = "generation_failed_pass_through"
 
 
 logging.basicConfig(
@@ -718,9 +720,31 @@ def resolve_candidate_operator_ids(item: Dict[str, Any], max_candidates: int) ->
     return candidates
 
 
-def make_passthrough_record(item: Dict[str, Any]) -> Dict[str, Any]:
+def classify_generation_failure(error: Exception) -> str:
+    error_text = str(error)
+    no_operator_markers = (
+        "operator_route",
+        "primary_operator",
+        "可用候选算子",
+        "does not require operator evolution",
+    )
+    if any(marker in error_text for marker in no_operator_markers):
+        return NO_AVAILABLE_OPERATOR_STATUS
+    return GENERATION_FAILED_STATUS
+
+
+def make_passthrough_record(
+    item: Dict[str, Any],
+    *,
+    generation_status: Optional[str] = None,
+    failure_reason: Optional[str] = None,
+) -> Dict[str, Any]:
     result = dict(item)
     result["question_evolved"] = False
+    if generation_status:
+        result["question_evolution_status"] = generation_status
+    if failure_reason:
+        result["question_evolution_error"] = failure_reason
 
     meta_info = result.get("meta_info")
     if not isinstance(meta_info, dict):
@@ -738,24 +762,65 @@ def make_passthrough_record(item: Dict[str, Any]) -> Dict[str, Any]:
     score_rate = get_score_rate(item)
     if score_rate is not None:
         metadata.setdefault("trigger_score_rate", score_rate)
+    if generation_status:
+        metadata["question_evolution_status"] = generation_status
+    if failure_reason:
+        metadata["question_evolution_error"] = failure_reason
 
     meta_info["question_evolution_metadata"] = metadata
     result["meta_info"] = meta_info
     return result
 
 
-def make_passthrough_candidate_record(item: Dict[str, Any], requested_candidates: int) -> Dict[str, Any]:
-    result = make_passthrough_record(item)
+def make_passthrough_candidate_record(
+    item: Dict[str, Any],
+    requested_candidates: int,
+    *,
+    generation_status: Optional[str] = None,
+    failure_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    result = make_passthrough_record(
+        item,
+        generation_status=generation_status,
+        failure_reason=failure_reason,
+    )
     group_id = get_candidate_group_id(item)
+    candidate_suffix = generation_status or "pass_through"
     result["candidate_group_id"] = group_id
-    result["candidate_id"] = f"{group_id}::pass_through"
+    result["candidate_id"] = f"{group_id}::{candidate_suffix}"
     result["candidate_generation"] = {
         "candidate_index": 0,
         "num_candidates_requested": requested_candidates,
         "operator_id": None,
         "operator_source": "pass_through",
+        "generation_status": generation_status or "pass_through",
     }
+    if failure_reason:
+        result["candidate_generation"]["failure_reason"] = failure_reason
     return result
+
+
+def make_generation_failure_passthrough_record(item: Dict[str, Any], error: Exception) -> Dict[str, Any]:
+    status = classify_generation_failure(error)
+    return make_passthrough_record(
+        item,
+        generation_status=status,
+        failure_reason=str(error),
+    )
+
+
+def make_generation_failure_passthrough_candidate_record(
+    item: Dict[str, Any],
+    requested_candidates: int,
+    error: Exception,
+) -> Dict[str, Any]:
+    status = classify_generation_failure(error)
+    return make_passthrough_candidate_record(
+        item,
+        requested_candidates,
+        generation_status=status,
+        failure_reason=str(error),
+    )
 
 
 def should_evolve(item: Dict[str, Any], min_score_rate: float) -> bool:
@@ -1120,8 +1185,15 @@ class QuestionEvolutionProcessor:
                 return make_passthrough_record(item)
 
             score_rate = get_score_rate(item)
-            evolved = await self.evolve_with_retry(item)
-            return make_evolved_record(item, evolved, score_rate, self.model)
+            try:
+                evolved = await self.evolve_with_retry(item)
+                return make_evolved_record(item, evolved, score_rate, self.model)
+            except Exception as e:
+                logger.error(
+                    f"question 进化失败，改为透传 index={item.get('index')} "
+                    f"prompt={str(item.get('prompt', ''))[:80]} error={e}"
+                )
+                return make_generation_failure_passthrough_record(item, e)
 
     async def process_item_candidates(
         self,
@@ -1134,25 +1206,51 @@ class QuestionEvolutionProcessor:
                 return [make_passthrough_candidate_record(item, candidate_count)]
 
             score_rate = get_score_rate(item)
-            if uses_stage_action_contract(item):
-                operator_ids = resolve_candidate_operator_ids(item, candidate_count)
-            else:
-                operator_ids = [None]
+            try:
+                if uses_stage_action_contract(item):
+                    operator_ids = resolve_candidate_operator_ids(item, candidate_count)
+                else:
+                    operator_ids = [None]
+            except Exception as e:
+                logger.error(
+                    f"候选算子解析失败，改为透传 index={item.get('index')} "
+                    f"prompt={str(item.get('prompt', ''))[:80]} error={e}"
+                )
+                return [make_generation_failure_passthrough_candidate_record(item, candidate_count, e)]
 
             candidates: List[Dict[str, Any]] = []
+            generation_errors: List[str] = []
             for candidate_index, operator_id in enumerate(operator_ids, start=1):
-                evolved = await self.evolve_with_retry(item, operator_id=operator_id)
-                candidates.append(
-                    make_evolved_candidate_record(
-                        item,
-                        evolved,
-                        score_rate,
-                        self.model,
-                        candidate_index=candidate_index,
-                        requested_candidates=candidate_count,
-                        operator_id=operator_id,
+                try:
+                    evolved = await self.evolve_with_retry(item, operator_id=operator_id)
+                    candidates.append(
+                        make_evolved_candidate_record(
+                            item,
+                            evolved,
+                            score_rate,
+                            self.model,
+                            candidate_index=candidate_index,
+                            requested_candidates=candidate_count,
+                            operator_id=operator_id,
+                        )
                     )
+                except Exception as e:
+                    logger.error(
+                        f"候选生成失败 index={item.get('index')} "
+                        f"operator={operator_id or '<legacy>'} error={e}"
+                    )
+                    generation_errors.append(f"{operator_id or '<legacy>'}: {e}")
+                    continue
+            if not candidates:
+                error_text = "所有候选生成失败"
+                if generation_errors:
+                    error_text += "；" + "；".join(generation_errors[:3])
+                error = RuntimeError(error_text)
+                logger.error(
+                    f"所有候选生成失败，改为透传 index={item.get('index')} "
+                    f"prompt={str(item.get('prompt', ''))[:80]}"
                 )
+                return [make_generation_failure_passthrough_candidate_record(item, candidate_count, error)]
             return candidates
 
     def recommended_candidate_count(self, item: Dict[str, Any]) -> int:
@@ -1264,11 +1362,26 @@ class QuestionEvolutionProcessor:
             except Exception as e:
                 failed_item = dict(item)
                 failed_item["question_evolution_error"] = str(e)
+                requested_candidates = (
+                    candidate_counts.get(get_item_key(item), 1)
+                    if self.num_candidates > 1
+                    else 1
+                )
+                if self.num_candidates > 1:
+                    fallback_item = make_generation_failure_passthrough_candidate_record(
+                        item,
+                        requested_candidates,
+                        e,
+                    )
+                else:
+                    fallback_item = make_generation_failure_passthrough_record(item, e)
                 logger.error(
-                    f"question 进化失败 index={item.get('index')} "
+                    f"question 进化失败 index={item.get('index')}，已写入透传 fallback "
                     f"prompt={str(item.get('prompt', ''))[:80]} error={e}"
                 )
                 async with self.write_lock:
+                    out_f.write(json.dumps(fallback_item, ensure_ascii=False) + "\n")
+                    out_f.flush()
                     fail_f.write(json.dumps(failed_item, ensure_ascii=False) + "\n")
                     fail_f.flush()
 

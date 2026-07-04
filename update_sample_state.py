@@ -92,6 +92,11 @@ def _validation(item: Dict[str, Any]) -> Dict[str, Any]:
     return validation if isinstance(validation, dict) else {}
 
 
+def _difficulty_gain_validation(item: Dict[str, Any]) -> Dict[str, Any]:
+    validation = item.get("difficulty_gain_validation")
+    return validation if isinstance(validation, dict) else {}
+
+
 def _previous_state(item: Dict[str, Any]) -> Dict[str, Any]:
     state = item.get("evolution_state")
     return dict(state) if isinstance(state, dict) else {}
@@ -106,6 +111,22 @@ def _append_unique(items: List[str], values: Sequence[str]) -> List[str]:
 
 
 def sample_signature(item: Dict[str, Any]) -> Dict[str, str]:
+    profile = item.get("sample_profile")
+    diagnosis = item.get("overscore_diagnosis")
+    profile = profile if isinstance(profile, dict) else {}
+    diagnosis = diagnosis if isinstance(diagnosis, dict) else {}
+    return {
+        "core_capability": _clean_text(profile.get("core_capability")),
+        "claim_level": _clean_text(profile.get("claim_level")),
+        "problem_shape": _clean_text(profile.get("problem_shape")),
+        "candidate_overscore_cause": _clean_text(diagnosis.get("candidate_overscore_cause")),
+    }
+
+
+def _sample_signature_from_invalid_case(item: Dict[str, Any]) -> Dict[str, Any]:
+    signature = item.get("sample_signature")
+    if isinstance(signature, dict):
+        return signature
     profile = item.get("sample_profile")
     diagnosis = item.get("overscore_diagnosis")
     profile = profile if isinstance(profile, dict) else {}
@@ -295,6 +316,67 @@ def build_invalid_generation_case(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def normalize_preselection_invalid_case(item: Dict[str, Any]) -> Dict[str, Any]:
+    failure_memory = item.get("failure_memory_candidate")
+    failure_memory = failure_memory if isinstance(failure_memory, dict) else {}
+    difficulty_validation = _difficulty_gain_validation(item)
+    risk_tags = item.get("risk_tags")
+    if not isinstance(risk_tags, list):
+        risk_tags = difficulty_validation.get("risk_tags", [])
+    return {
+        "sample_id": _sample_id(item),
+        "round": _round_value(item, {}),
+        "operator_used": _clean_text(item.get("operator_used") or failure_memory.get("operator_id")),
+        "invalid_type": _clean_text(item.get("invalid_type") or difficulty_validation.get("difficulty_gain_label")) or "difficulty_gain_validation_failed",
+        "reason": _clean_text(item.get("reason") or failure_memory.get("reject_reason") or difficulty_validation.get("reject_reason")),
+        "suggested_operator": _clean_text(item.get("suggested_operator") or failure_memory.get("recommended_retry_strategy")),
+        "sample_signature": _sample_signature_from_invalid_case(item),
+        "difficulty_gain_validation": difficulty_validation,
+        "risk_tags": risk_tags if isinstance(risk_tags, list) else [],
+        "failure_memory_candidate": failure_memory,
+        "source_stage": "candidate_selection",
+    }
+
+
+def build_preselection_failure_memory_entry(item: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = normalize_preselection_invalid_case(item)
+    failure_memory = normalized.get("failure_memory_candidate")
+    failure_memory = failure_memory if isinstance(failure_memory, dict) else {}
+    risk_tags = normalized.get("risk_tags")
+    risk_tags = risk_tags if isinstance(risk_tags, list) else []
+    retry_strategy = _clean_text(failure_memory.get("recommended_retry_strategy") or normalized.get("suggested_operator"))
+    return {
+        "sample_id": normalized["sample_id"],
+        "round": normalized["round"],
+        "sample_signature": normalized.get("sample_signature", {}),
+        "operator_used": _clean_text(failure_memory.get("operator_id") or normalized.get("operator_used")),
+        "score_rate_before": None,
+        "score_rate_after": None,
+        "failure_type": _clean_text(failure_memory.get("failure_type") or normalized.get("invalid_type")),
+        "failure_reason": _clean_text(failure_memory.get("reject_reason") or normalized.get("reason")),
+        "avoid_note": (
+            "难度收益验证失败，建议策略：" + retry_strategy
+            if retry_strategy
+            else "难度收益验证失败，建议切换候选生成策略。"
+        ),
+        "risk_tags": risk_tags,
+        "source_stage": "difficulty_gain_validation",
+    }
+
+
+def classify_preselection_invalid_cases(
+    records: Sequence[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    invalid_entries = [normalize_preselection_invalid_case(record) for record in records]
+    failure_entries = [
+        build_preselection_failure_memory_entry(record)
+        for record in records
+        if isinstance(record.get("failure_memory_candidate"), dict)
+        or isinstance(record.get("difficulty_gain_validation"), dict)
+    ]
+    return failure_entries, invalid_entries
+
+
 def classify_memory_entries(
     records: Sequence[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -321,6 +403,12 @@ def update_records(records: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, An
     return updated, operator_entries, failure_entries, invalid_entries
 
 
+def load_optional_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
+    if not input_path or not os.path.exists(input_path) or os.path.getsize(input_path) == 0:
+        return []
+    return load_json_or_jsonl(input_path)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Update evolution_state and append Stage 5 memory-bank entries.")
     parser.add_argument("--input", required=True, help="Input analyzed JSON/JSONL path.")
@@ -329,6 +417,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--operator-memory", default=None, help="Override operator memory output path.")
     parser.add_argument("--failure-memory", default=None, help="Override failure memory output path.")
     parser.add_argument("--invalid-output", default=None, help="Override invalid generation case output path.")
+    parser.add_argument(
+        "--preselection-invalid-input",
+        default=None,
+        help="Optional candidate_selection invalid_generation_cases.jsonl to append into memory banks.",
+    )
     parser.add_argument("--no-memory-output", action="store_true", help="Do not append memory-bank entries.")
     return parser.parse_args()
 
@@ -337,6 +430,11 @@ def main() -> None:
     args = parse_args()
     records = load_json_or_jsonl(args.input)
     updated, operator_entries, failure_entries, invalid_entries = update_records(records)
+    preselection_invalid_cases = load_optional_json_or_jsonl(args.preselection_invalid_input)
+    if preselection_invalid_cases:
+        preselection_failure_entries, preselection_invalid_entries = classify_preselection_invalid_cases(preselection_invalid_cases)
+        failure_entries.extend(preselection_failure_entries)
+        invalid_entries.extend(preselection_invalid_entries)
     write_jsonl(updated, args.output)
 
     if args.no_memory_output:

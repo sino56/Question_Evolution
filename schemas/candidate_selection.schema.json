@@ -3,13 +3,36 @@
   "title": "Candidate Selection",
   "type": "object",
   "additionalProperties": true,
-  "required": ["selected_candidate_id", "selected_operator", "selection_reason"],
+  "required": ["selection_reason"],
   "properties": {
+    "selected": {
+      "type": "boolean"
+    },
     "selected_candidate_id": {
       "type": "string"
     },
     "selected_operator": {
       "type": "string"
+    },
+    "selection_status": {
+      "type": "string"
+    },
+    "selection_score": {
+      "type": "number"
+    },
+    "difficulty_gain_score": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "difficulty_gain_label": {
+      "type": ["string", "null"]
+    },
+    "risk_tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     },
     "selection_reason": {
       "type": "string"

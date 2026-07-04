@@ -79,38 +79,47 @@ def records_by_key(records: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any
 def get_score_rate(item: Optional[Dict[str, Any]]) -> Optional[float]:
     if not isinstance(item, dict):
         return None
-    summary = item.get("round0_score_summary")
-    if isinstance(summary, dict):
-        stable_score = _coerce_score_rate(summary.get("stable_score"))
-        if stable_score is not None:
-            return stable_score
 
     top_level_score_rate = _coerce_score_rate(item.get("score_rate"))
     if top_level_score_rate is not None:
         return top_level_score_rate
 
     scoring_result = item.get("scoring_result")
-    if not isinstance(scoring_result, dict):
-        return None
-    try:
-        awarded = float(scoring_result.get("total_awarded", 0) or 0)
-        possible = float(scoring_result.get("total_possible", 0) or 0)
-    except (TypeError, ValueError):
-        return None
-    if possible <= 0:
-        return None
-    return max(0.0, min(1.0, awarded / possible))
+    if isinstance(scoring_result, dict):
+        try:
+            awarded = float(scoring_result.get("total_awarded", 0) or 0)
+            possible = float(scoring_result.get("total_possible", 0) or 0)
+        except (TypeError, ValueError):
+            possible = 0
+            awarded = 0
+        if possible > 0:
+            return max(0.0, min(1.0, awarded / possible))
+
+    summary = item.get("round0_score_summary")
+    if isinstance(summary, dict):
+        stable_score = _coerce_score_rate(summary.get("stable_score"))
+        if stable_score is not None:
+            return stable_score
+    return None
 
 
 def get_score_source(item: Optional[Dict[str, Any]]) -> str:
     if not isinstance(item, dict):
         return "missing"
+    if _coerce_score_rate(item.get("score_rate")) is not None:
+        return "score_rate"
+    scoring_result = item.get("scoring_result")
+    if isinstance(scoring_result, dict):
+        try:
+            possible = float(scoring_result.get("total_possible", 0) or 0)
+        except (TypeError, ValueError):
+            possible = 0
+        if possible > 0:
+            return "scoring_result.total_awarded/total_possible"
     summary = item.get("round0_score_summary")
     if isinstance(summary, dict) and _coerce_score_rate(summary.get("stable_score")) is not None:
         return "round0_score_summary.stable_score"
-    if _coerce_score_rate(item.get("score_rate")) is not None:
-        return "score_rate"
-    if isinstance(item.get("scoring_result"), dict):
+    if isinstance(scoring_result, dict):
         return "scoring_result.total_awarded/total_possible"
     return "missing"
 

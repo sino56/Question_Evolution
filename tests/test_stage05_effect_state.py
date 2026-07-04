@@ -8,7 +8,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from analyze_evolution_effect import analyze_records, build_effect_matrix
-from update_sample_state import update_records
+from update_sample_state import classify_preselection_invalid_cases, update_records
 
 
 def load_jsonl(path: Path):
@@ -39,6 +39,84 @@ def test_effect_analysis_labels_drop_full_invalid_and_review_cases():
     assert effects["stage05-review"]["hit_confidence"] == "low"
     assert effects["stage05-review"]["needs_manual_review"] is True
     assert effects["stage05-review"]["focus_answer_alignment"]["matches"] is True
+
+
+def test_score_rate_after_prefers_current_scoring_over_round0_summary():
+    previous = [
+        {
+            "sample_id": "score-source",
+            "prompt": "previous prompt",
+            "scoring_result": {"candidate_answer": "old answer", "total_awarded": 10, "total_possible": 10},
+            "score_rate": 1.0,
+        }
+    ]
+    current = [
+        {
+            "sample_id": "score-source",
+            "prompt": "current prompt",
+            "question_evolved": True,
+            "round0_score_summary": {"stable_score": 1.0},
+            "meta_info": {
+                "question_evolution_metadata": {
+                    "question_evolved": True,
+                    "operator_used": "O1_gap_choice",
+                    "expected_evaluation_focus": ["minimal missing premise"],
+                }
+            },
+            "validation_result": {"passed": True, "repeat_pattern_risk": "low"},
+            "scoring_result": {
+                "candidate_answer": "new answer misses the target premise",
+                "total_awarded": 4,
+                "total_possible": 10,
+            },
+            "score_rate": 0.4,
+        }
+    ]
+
+    analyzed = analyze_records(current, previous_records=previous)
+    effect = analyzed[0]["effect_analysis"]
+
+    assert effect["score_rate_after"] == 0.4
+    assert effect["score_after_source"] == "score_rate"
+    assert round(effect["delta_score_rate"], 2) == -0.6
+
+
+def test_score_rate_after_uses_scoring_result_before_round0_summary():
+    previous = [
+        {
+            "sample_id": "score-result-source",
+            "prompt": "previous prompt",
+            "scoring_result": {"candidate_answer": "old answer", "total_awarded": 10, "total_possible": 10},
+            "score_rate": 1.0,
+        }
+    ]
+    current = [
+        {
+            "sample_id": "score-result-source",
+            "prompt": "current prompt",
+            "question_evolved": True,
+            "round0_score_summary": {"stable_score": 1.0},
+            "meta_info": {
+                "question_evolution_metadata": {
+                    "question_evolved": True,
+                    "operator_used": "O1_gap_choice",
+                    "expected_evaluation_focus": ["minimal missing premise"],
+                }
+            },
+            "validation_result": {"passed": True, "repeat_pattern_risk": "low"},
+            "scoring_result": {
+                "candidate_answer": "new answer misses the target premise",
+                "total_awarded": 4,
+                "total_possible": 10,
+            },
+        }
+    ]
+
+    analyzed = analyze_records(current, previous_records=previous)
+    effect = analyzed[0]["effect_analysis"]
+
+    assert effect["score_rate_after"] == 0.4
+    assert effect["score_after_source"] == "scoring_result.total_awarded/total_possible"
 
 
 def test_focus_mismatch_does_not_become_effective_boundary_probe():
@@ -123,6 +201,43 @@ def test_state_update_and_memory_entries_cover_success_failure_invalid_review():
     assert invalid_memory[0]["invalid_type"] == "format_difficulty_dominant"
 
 
+def test_preselection_difficulty_gain_failures_feed_memory_entries():
+    invalid_case = {
+        "sample_id": "dg-memory",
+        "round": 1,
+        "candidate_id": "dg-memory::cand_1",
+        "operator_used": "O1_gap_choice",
+        "invalid_type": "leakage_or_simplification",
+        "reason": "候选题直接泄漏关键缺口。",
+        "sample_signature": {"core_capability": "证据链补强"},
+        "risk_tags": ["missing_premise_named"],
+        "difficulty_gain_validation": {
+            "passed": False,
+            "difficulty_gain_label": "leakage_or_simplification",
+            "difficulty_gain_score": 0.3,
+            "risk_tags": ["missing_premise_named"],
+            "recommended_action": "reject_candidate",
+            "reject_reason": "候选题直接泄漏关键缺口。",
+        },
+        "failure_memory_candidate": {
+            "operator_id": "O1_gap_choice",
+            "failure_type": "leakage_or_simplification",
+            "risk_tags": ["missing_premise_named"],
+            "reject_reason": "候选题直接泄漏关键缺口。",
+            "recommended_retry_strategy": "switch_operator_family",
+        },
+    }
+
+    failure_entries, invalid_entries = classify_preselection_invalid_cases([invalid_case])
+
+    assert invalid_entries[0]["source_stage"] == "candidate_selection"
+    assert invalid_entries[0]["risk_tags"] == ["missing_premise_named"]
+    assert failure_entries[0]["source_stage"] == "difficulty_gain_validation"
+    assert failure_entries[0]["score_rate_before"] is None
+    assert failure_entries[0]["failure_type"] == "leakage_or_simplification"
+    assert failure_entries[0]["risk_tags"] == ["missing_premise_named"]
+
+
 def test_full_score_after_operator_switch_can_stop_as_stable_high_score():
     record = {
         "sample_id": "stable-stop",
@@ -152,8 +267,11 @@ def test_full_score_after_operator_switch_can_stop_as_stable_high_score():
 
 if __name__ == "__main__":
     test_effect_analysis_labels_drop_full_invalid_and_review_cases()
+    test_score_rate_after_prefers_current_scoring_over_round0_summary()
+    test_score_rate_after_uses_scoring_result_before_round0_summary()
     test_focus_mismatch_does_not_become_effective_boundary_probe()
     test_effect_matrix_summarizes_sample_type_by_operator()
     test_state_update_and_memory_entries_cover_success_failure_invalid_review()
+    test_preselection_difficulty_gain_failures_feed_memory_entries()
     test_full_score_after_operator_switch_can_stop_as_stable_high_score()
     print("stage05 effect analysis and state update checks passed")

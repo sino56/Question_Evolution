@@ -17,6 +17,11 @@ CONFIG_QWEN_BASE_URL=$(read_config_value QWEN_BASE_URL "$CONFIG_BASE_URL")
 CONFIG_QWEN_API_KEY=$(read_config_value QWEN_API_KEY "")
 CONFIG_QWEN_MODEL=$(read_config_value QWEN_MODEL GPT_MODEL "hjl_Qwen3.6-27B")
 CONFIG_PROFILE_MODEL=$(read_config_value PROFILE_MODEL EVOLVE_MODEL QA_MODEL GPT_MODEL "$CONFIG_GPT_MODEL")
+CONFIG_DIFFICULTY_GAIN_MODEL=$(read_config_value DIFFICULTY_GAIN_MODEL PROFILE_MODEL EVOLVE_MODEL QA_MODEL GPT_MODEL "$CONFIG_PROFILE_MODEL")
+CONFIG_DIFFICULTY_GAIN_BASE_URL=$(read_config_value DIFFICULTY_GAIN_BASE_URL PROFILE_BASE_URL EVOLVE_BASE_URL BASE_URL OPENAI_BASE_URL "$CONFIG_BASE_URL")
+CONFIG_WEAK_ANSWER_MODEL=$(read_config_value WEAK_ANSWER_MODEL QWEN_MODEL GPT_MODEL "$CONFIG_QWEN_MODEL")
+CONFIG_WEAK_ANSWER_BASE_URL=$(read_config_value WEAK_ANSWER_BASE_URL QWEN_BASE_URL BASE_URL OPENAI_BASE_URL "$CONFIG_QWEN_BASE_URL")
+CONFIG_WEAK_ANSWER_API_KEY=$(read_config_value WEAK_ANSWER_API_KEY QWEN_API_KEY "")
 CONFIG_EVOLVE_MODEL=$(read_config_value EVOLVE_MODEL QA_MODEL GPT_MODEL "$CONFIG_GPT_MODEL")
 CONFIG_ANSWER_MODEL=$(read_config_value ANSWER_MODEL QA_MODEL GPT_MODEL "$CONFIG_GPT_MODEL")
 CONFIG_RUBRIC_MODEL=$(read_config_value RUBRIC_MODEL QA_MODEL GPT_MODEL "$CONFIG_GPT_MODEL")
@@ -29,6 +34,12 @@ MIN_SCORE_RATE=${MIN_SCORE_RATE:-0.8}            # legacy question_evolution 触
 NUM_CANDIDATES=${NUM_CANDIDATES:-2}              # 每条待进化样本最多生成候选数，范围 1-4
 MAX_CANDIDATE_BUDGET=${MAX_CANDIDATE_BUDGET:-0}  # 单轮候选总预算；0 表示待进化样本数 * 2
 VALIDATION_RETRIES=${VALIDATION_RETRIES:-1}      # validate-retry 次数；当前最多 1 次
+MIN_DIFFICULTY_GAIN_SCORE=${MIN_DIFFICULTY_GAIN_SCORE:-0.75}
+BORDERLINE_DIFFICULTY_GAIN_SCORE=${BORDERLINE_DIFFICULTY_GAIN_SCORE:-0.65}
+MIN_COMPETITIVE_JUDGMENT_SCORE=${MIN_COMPETITIVE_JUDGMENT_SCORE:-0.60}
+DIFFICULTY_GAIN_ALLOW_BORDERLINE=${DIFFICULTY_GAIN_ALLOW_BORDERLINE:-false}
+DIFFICULTY_GAIN_ENABLE_WEAK_PROBE=${DIFFICULTY_GAIN_ENABLE_WEAK_PROBE:-false}
+WEAK_PROBE_MODE=${WEAK_PROBE_MODE:-light}
 ROUND0_INITIAL_TRIALS=${ROUND0_INITIAL_TRIALS:-3}
 ROUND0_EXTRA_TRIALS=${ROUND0_EXTRA_TRIALS:-2}
 ROUND0_MAX_TRIALS=${ROUND0_MAX_TRIALS:-5}
@@ -56,6 +67,11 @@ GPT_MODEL=${GPT_MODEL:-$CONFIG_GPT_MODEL}
 OPENAI_BASE_URL=${OPENAI_BASE_URL:-$CONFIG_BASE_URL}
 PROFILE_MODEL=${PROFILE_MODEL:-$CONFIG_PROFILE_MODEL}
 PROFILE_BASE_URL=${PROFILE_BASE_URL:-$OPENAI_BASE_URL}
+DIFFICULTY_GAIN_MODEL=${DIFFICULTY_GAIN_MODEL:-$CONFIG_DIFFICULTY_GAIN_MODEL}
+DIFFICULTY_GAIN_BASE_URL=${DIFFICULTY_GAIN_BASE_URL:-$CONFIG_DIFFICULTY_GAIN_BASE_URL}
+WEAK_ANSWER_MODEL=${WEAK_ANSWER_MODEL:-$CONFIG_WEAK_ANSWER_MODEL}
+WEAK_ANSWER_BASE_URL=${WEAK_ANSWER_BASE_URL:-$CONFIG_WEAK_ANSWER_BASE_URL}
+WEAK_ANSWER_API_KEY=${WEAK_ANSWER_API_KEY:-$CONFIG_WEAK_ANSWER_API_KEY}
 EVOLVE_MODEL=${EVOLVE_MODEL:-$CONFIG_EVOLVE_MODEL}
 EVOLVE_BASE_URL=${EVOLVE_BASE_URL:-$OPENAI_BASE_URL}
 ANSWER_BASE_URL=${ANSWER_BASE_URL:-$OPENAI_BASE_URL}
@@ -64,6 +80,7 @@ RUBRIC_BASE_URL=${RUBRIC_BASE_URL:-$OPENAI_BASE_URL}
 # 并发数
 SCORING_CONCURRENCY=${SCORING_CONCURRENCY:-10}
 PROFILE_CONCURRENCY=${PROFILE_CONCURRENCY:-5}
+DIFFICULTY_GAIN_CONCURRENCY=${DIFFICULTY_GAIN_CONCURRENCY:-$PROFILE_CONCURRENCY}
 EVO_CONCURRENCY=${EVO_CONCURRENCY:-10}
 ANSWER_CONCURRENCY=${ANSWER_CONCURRENCY:-10}
 RUBRIC_CONCURRENCY=${RUBRIC_CONCURRENCY:-10}
@@ -78,6 +95,24 @@ if [ ! -f "$INPUT_FILE" ]; then
     echo "输入文件不存在: $INPUT_FILE"
     echo "请设置 INPUT_FILE 指向 admitted_seed_samples.jsonl 或其他已准入 JSONL。"
     exit 1
+fi
+
+DIFFICULTY_GAIN_ALLOW_BORDERLINE_ARGS=()
+if [ "$DIFFICULTY_GAIN_ALLOW_BORDERLINE" = "true" ]; then
+    DIFFICULTY_GAIN_ALLOW_BORDERLINE_ARGS=(--allow-borderline)
+fi
+
+DIFFICULTY_GAIN_WEAK_PROBE_ARGS=()
+if [ "$DIFFICULTY_GAIN_ENABLE_WEAK_PROBE" = "true" ]; then
+    DIFFICULTY_GAIN_WEAK_PROBE_ARGS=(
+        --enable-weak-probe
+        --weak-probe-mode "$WEAK_PROBE_MODE"
+        --weak-answer-model "$WEAK_ANSWER_MODEL"
+        --weak-answer-base-url "$WEAK_ANSWER_BASE_URL"
+    )
+    if [ -n "$WEAK_ANSWER_API_KEY" ]; then
+        DIFFICULTY_GAIN_WEAK_PROBE_ARGS+=(--weak-answer-api-key "$WEAK_ANSWER_API_KEY")
+    fi
 fi
 
 # 为当天运行自动选择实验目录：
@@ -147,6 +182,48 @@ extract_effect_count() {
 print(count)" "$analyzed_file"
 }
 
+validate_candidate_coverage() {
+    local input_file="$1"
+    local candidates_file="$2"
+    python -c '
+import json
+import sys
+
+def load(path):
+    content = open(path, encoding="utf-8").read().strip()
+    if not content:
+        return []
+    if content.startswith("["):
+        data = json.loads(content)
+        if not isinstance(data, list):
+            raise ValueError(f"{path} must be a JSON array or JSONL")
+        return data
+    return [json.loads(line) for line in content.splitlines() if line.strip()]
+
+def group_key(item):
+    for field in ("candidate_group_id", "sample_id", "index"):
+        value = item.get(field)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    meta_info = item.get("meta_info")
+    if isinstance(meta_info, dict):
+        prompt_old = meta_info.get("prompt_old")
+        if isinstance(prompt_old, str) and prompt_old.strip():
+            return prompt_old.strip()
+    return str(item.get("prompt", "") or "").strip()
+
+inputs = [group_key(item) for item in load(sys.argv[1])]
+outputs = {group_key(item) for item in load(sys.argv[2])}
+missing = [key for key in inputs if key and key not in outputs]
+if missing:
+    print(
+        "candidate coverage check failed; missing groups: " + ", ".join(missing[:20]),
+        file=sys.stderr,
+    )
+    sys.exit(1)
+' "$input_file" "$candidates_file"
+}
+
 SUMMARY_FILE="$EXP_DIR/summary.txt"
 echo "Question Evolution Loop Summary" > "$SUMMARY_FILE"
 echo "================================" >> "$SUMMARY_FILE"
@@ -160,6 +237,11 @@ echo "Evolution trigger rate: $MIN_SCORE_RATE" >> "$SUMMARY_FILE"
 echo "Num candidates: $NUM_CANDIDATES" >> "$SUMMARY_FILE"
 echo "Max candidate budget: $MAX_CANDIDATE_BUDGET" >> "$SUMMARY_FILE"
 echo "Validation retries: $VALIDATION_RETRIES" >> "$SUMMARY_FILE"
+echo "Min difficulty gain score: $MIN_DIFFICULTY_GAIN_SCORE" >> "$SUMMARY_FILE"
+echo "Borderline difficulty gain score: $BORDERLINE_DIFFICULTY_GAIN_SCORE" >> "$SUMMARY_FILE"
+echo "Min competitive judgment score: $MIN_COMPETITIVE_JUDGMENT_SCORE" >> "$SUMMARY_FILE"
+echo "Difficulty gain allow borderline: $DIFFICULTY_GAIN_ALLOW_BORDERLINE" >> "$SUMMARY_FILE"
+echo "Difficulty gain weak probe: $DIFFICULTY_GAIN_ENABLE_WEAK_PROBE" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
 echo "Round | Avg Score Rate | Status" >> "$SUMMARY_FILE"
 echo "------|----------------|--------" >> "$SUMMARY_FILE"
@@ -222,13 +304,13 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
     echo "Round $ROUND: Question Evolution"
     echo "========================================"
 
-    run_if_missing "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 0/11: 复制上一轮 scored/state 输入" \
+    run_if_missing "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 0/12: 复制上一轮 scored/state 输入" \
         cp "$PREV_SCORED" "$ROUND_DIR/input.jsonl"
 
     if [ -f "$ROUND_DIR/scored.jsonl" ] && [ -s "$ROUND_DIR/scored.jsonl" ]; then
         echo "检测到已存在 $ROUND_DIR/scored.jsonl，跳过本轮生成闭环"
     else
-        run_if_missing "$ROUND_DIR/profiled.jsonl" "[Round $ROUND] Step 1/11: profile_samples.py" \
+        run_if_missing "$ROUND_DIR/profiled.jsonl" "[Round $ROUND] Step 1/12: profile_samples.py" \
             python profile_samples.py \
                 --input "$ROUND_DIR/input.jsonl" \
                 --output "$ROUND_DIR/profiled.jsonl" \
@@ -236,19 +318,19 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --base-url "$PROFILE_BASE_URL" \
                 --concurrency "$PROFILE_CONCURRENCY"
 
-        run_if_missing "$ROUND_DIR/profiled_candidates.jsonl" "[Round $ROUND] Step 2/11: select_evolution_candidates.py" \
+        run_if_missing "$ROUND_DIR/profiled_candidates.jsonl" "[Round $ROUND] Step 2/12: select_evolution_candidates.py" \
             python select_evolution_candidates.py \
                 --input "$ROUND_DIR/profiled.jsonl" \
                 --output "$ROUND_DIR/profiled_candidates.jsonl" \
                 --high-score-threshold "$MIN_SCORE_RATE"
 
-        run_if_missing "$ROUND_DIR/routed.jsonl" "[Round $ROUND] Step 3/11: operator_router.py" \
+        run_if_missing "$ROUND_DIR/routed.jsonl" "[Round $ROUND] Step 3/12: operator_router.py" \
             python operator_router.py \
                 --input "$ROUND_DIR/profiled_candidates.jsonl" \
                 --output "$ROUND_DIR/routed.jsonl" \
                 --memory-dir "$MEMORY_DIR"
 
-        run_if_missing "$ROUND_DIR/candidates.jsonl" "[Round $ROUND] Step 4/11: question_evolution.py" \
+        run_if_missing "$ROUND_DIR/candidates.jsonl" "[Round $ROUND] Step 4/12: question_evolution.py" \
             python question_evolution.py \
                 --input "$ROUND_DIR/routed.jsonl" \
                 --output "$ROUND_DIR/candidates.jsonl" \
@@ -259,19 +341,34 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --num-candidates "$NUM_CANDIDATES" \
                 --max-candidate-budget "$MAX_CANDIDATE_BUDGET" \
                 --validation-retries "$VALIDATION_RETRIES"
+        validate_candidate_coverage "$ROUND_DIR/routed.jsonl" "$ROUND_DIR/candidates.jsonl"
 
-        run_if_missing "$ROUND_DIR/validated_candidates.jsonl" "[Round $ROUND] Step 5/11: validate_evolved_question.py" \
+        run_if_missing "$ROUND_DIR/validated_candidates.jsonl" "[Round $ROUND] Step 5/12: validate_evolved_question.py" \
             python validate_evolved_question.py \
                 --input "$ROUND_DIR/candidates.jsonl" \
                 --output "$ROUND_DIR/validated_candidates.jsonl"
 
-        run_if_missing "$ROUND_DIR/evolved.jsonl" "[Round $ROUND] Step 6/11: candidate_selection.py" \
-            python candidate_selection.py \
+        run_if_missing "$ROUND_DIR/difficulty_validated_candidates.jsonl" "[Round $ROUND] Step 6/12: validate_difficulty_gain.py" \
+            python validate_difficulty_gain.py \
                 --input "$ROUND_DIR/validated_candidates.jsonl" \
+                --output "$ROUND_DIR/difficulty_validated_candidates.jsonl" \
+                --report-output "$ROUND_DIR/difficulty_gain_report.json" \
+                --model "$DIFFICULTY_GAIN_MODEL" \
+                --base-url "$DIFFICULTY_GAIN_BASE_URL" \
+                --concurrency "$DIFFICULTY_GAIN_CONCURRENCY" \
+                --min-gain-score "$MIN_DIFFICULTY_GAIN_SCORE" \
+                --borderline-gain-score "$BORDERLINE_DIFFICULTY_GAIN_SCORE" \
+                --min-competitive-judgment-score "$MIN_COMPETITIVE_JUDGMENT_SCORE" \
+                "${DIFFICULTY_GAIN_ALLOW_BORDERLINE_ARGS[@]}" \
+                "${DIFFICULTY_GAIN_WEAK_PROBE_ARGS[@]}"
+
+        run_if_missing "$ROUND_DIR/evolved.jsonl" "[Round $ROUND] Step 7/12: candidate_selection.py" \
+            python candidate_selection.py \
+                --input "$ROUND_DIR/difficulty_validated_candidates.jsonl" \
                 --output "$ROUND_DIR/evolved.jsonl" \
                 --invalid-output "$ROUND_DIR/invalid_generation_cases.jsonl"
 
-        run_if_missing "$ROUND_DIR/with_answers.jsonl" "[Round $ROUND] Step 7/11: collect_answers.py" \
+        run_if_missing "$ROUND_DIR/with_answers.jsonl" "[Round $ROUND] Step 8/12: collect_answers.py" \
             python collect_answers.py \
                 --input "$ROUND_DIR/evolved.jsonl" \
                 --output "$ROUND_DIR/with_answers.jsonl" \
@@ -280,7 +377,7 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --model "$GPT_MODEL" \
                 --base-url "$ANSWER_BASE_URL"
 
-        run_if_missing "$ROUND_DIR/rubric.jsonl" "[Round $ROUND] Step 8/11: gen_rubric.py" \
+        run_if_missing "$ROUND_DIR/rubric.jsonl" "[Round $ROUND] Step 9/12: gen_rubric.py" \
             python gen_rubric.py \
                 --input "$ROUND_DIR/with_answers.jsonl" \
                 --output "$ROUND_DIR/rubric.jsonl" \
@@ -288,7 +385,7 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --model "$GPT_MODEL" \
                 --base-url "$RUBRIC_BASE_URL"
 
-        run_if_missing "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 9/11: scoring.py" \
+        run_if_missing "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 10/12: scoring.py" \
             python scoring.py \
                 --input "$ROUND_DIR/rubric.jsonl" \
                 --output "$ROUND_DIR/scored.jsonl" \
@@ -302,18 +399,19 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --concurrency "$SCORING_CONCURRENCY"
     fi
 
-    run_if_missing "$ROUND_DIR/effect_analysis.jsonl" "[Round $ROUND] Step 10/11: analyze_evolution_effect.py" \
+    run_if_missing "$ROUND_DIR/effect_analysis.jsonl" "[Round $ROUND] Step 11/12: analyze_evolution_effect.py" \
         python analyze_evolution_effect.py \
             --before "$PREV_SCORED" \
             --input "$ROUND_DIR/scored.jsonl" \
             --output "$ROUND_DIR/effect_analysis.jsonl" \
             --matrix-output "$ROUND_DIR/effect_matrix.jsonl"
 
-    run_if_missing "$ROUND_DIR/state_updated.jsonl" "[Round $ROUND] Step 11/11: update_sample_state.py" \
+    run_if_missing "$ROUND_DIR/state_updated.jsonl" "[Round $ROUND] Step 12/12: update_sample_state.py" \
         python update_sample_state.py \
             --input "$ROUND_DIR/effect_analysis.jsonl" \
             --output "$ROUND_DIR/state_updated.jsonl" \
-            --memory-dir "$MEMORY_DIR"
+            --memory-dir "$MEMORY_DIR" \
+            --preselection-invalid-input "$ROUND_DIR/invalid_generation_cases.jsonl"
 
     # 计算本轮平均得分率
     AVG_RATE=$(compute_avg_score_rate "$ROUND_DIR/scored.jsonl")

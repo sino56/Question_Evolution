@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Difficulty Gain Validation",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "passed",
+    "difficulty_gain_label",
+    "difficulty_gain_score",
+    "risk_tags",
+    "recommended_action"
+  ],
+  "properties": {
+    "passed": {
+      "type": "boolean"
+    },
+    "difficulty_gain_label": {
+      "enum": [
+        "clear_gain",
+        "probable_gain",
+        "weak_gain",
+        "no_gain",
+        "leakage_or_simplification",
+        "format_complexity_only",
+        "axis_shift",
+        "unanswerable_or_external",
+        "needs_manual_review",
+        "not_applicable"
+      ]
+    },
+    "difficulty_gain_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "axis_consistency_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "no_leakage_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "competitive_judgment_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "anti_clarity_trap_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "answerability_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "format_complexity_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "risk_tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reject_reason": {
+      "type": "string"
+    },
+    "recommended_action": {
+      "type": "string"
+    },
+    "validator_model": {
+      "type": "string"
+    },
+    "weak_probe": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "probe_answer": {
+          "type": "string"
+        },
+        "probe_failure_detected": {
+          "type": "boolean"
+        },
+        "target_failure_match": {
+          "type": "boolean"
+        },
+        "probe_judgment": {
+          "type": "string"
+        },
+        "probe_reason": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

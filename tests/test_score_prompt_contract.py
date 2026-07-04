@@ -43,6 +43,32 @@ def test_score_prompt_placeholder_contract_is_shared():
     assert "候选答案" in rendered
 
 
+def test_item_score_title_matching_tolerates_quote_style_drift():
+    install_dependency_stubs()
+    from scoring import normalize_item_scores
+
+    rubric = [
+        {
+            "title": "法律研判深度与“排除合理怀疑”原则",
+            "description": "测试标题标点漂移。",
+            "weight": 10,
+        }
+    ]
+    item_scores = [
+        {
+            "title": "法律研判深度与‘排除合理怀疑’原则",
+            "awarded": 8,
+            "brief_reason": "同一 rubric 标题，仅引号样式不同。",
+        }
+    ]
+
+    normalized_scores, total_awarded = normalize_item_scores(item_scores, rubric)
+
+    assert total_awarded == 8
+    assert normalized_scores[0]["title"] == "法律研判深度与“排除合理怀疑”原则"
+
+
 if __name__ == "__main__":
     test_score_prompt_placeholder_contract_is_shared()
+    test_item_score_title_matching_tolerates_quote_style_drift()
     print("score prompt placeholder contract checks passed")

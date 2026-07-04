@@ -12,6 +12,7 @@ from candidate_selection import select_candidates
 from operator_router import route_records
 from question_evolution import QuestionEvolutionProcessor
 from validate_evolved_question import attach_validation_result
+from validate_difficulty_gain import normalize_difficulty_gain_result
 
 
 def load_jsonl(path: Path):
@@ -128,6 +129,42 @@ def make_candidate(sample_id, candidate_id, prompt, validation=None, *, operator
     if validation is not None:
         record["validation_result"] = validation
     return record
+
+
+def make_difficulty_gain(passed=True):
+    if passed:
+        return normalize_difficulty_gain_result(
+            {
+                "difficulty_gain_label": "probable_gain",
+                "dimension_scores": {
+                    "axis_consistency_score": 0.9,
+                    "no_leakage_score": 0.86,
+                    "competitive_judgment_score": 0.82,
+                    "anti_clarity_trap_score": 0.78,
+                    "answerability_score": 0.9,
+                    "format_complexity_score": 0.95,
+                },
+                "risk_tags": [],
+                "expected_qwen_failure_match": True,
+            },
+            validator_model="mock-validator",
+        )
+    return normalize_difficulty_gain_result(
+        {
+            "difficulty_gain_label": "leakage_or_simplification",
+            "dimension_scores": {
+                "axis_consistency_score": 0.9,
+                "no_leakage_score": 0.35,
+                "competitive_judgment_score": 0.5,
+                "anti_clarity_trap_score": 0.4,
+                "answerability_score": 0.9,
+                "format_complexity_score": 0.95,
+            },
+            "risk_tags": ["missing_premise_named"],
+            "reject_reason": "泄漏关键前提",
+        },
+        validator_model="mock-validator",
+    )
 
 
 def test_question_evolution_can_emit_primary_and_backup_candidates():
@@ -310,11 +347,14 @@ def test_candidate_selection_selects_valid_candidate_and_records_rejections():
             "invalid_type": "format_difficulty_dominant",
         },
     )
+    valid["difficulty_gain_validation"] = make_difficulty_gain(True)
+    invalid["difficulty_gain_validation"] = make_difficulty_gain(False)
 
     selected, invalid_cases = select_candidates([invalid, valid])
 
     assert len(selected) == 1
     assert selected[0]["candidate_selection"]["selected_candidate_id"] == "stage04-select::cand_1"
+    assert selected[0]["candidate_selection"]["selection_status"] == "selected_after_difficulty_gain_validation"
     assert selected[0]["candidate_selection"]["rejected_candidates"]
     assert invalid_cases
     assert invalid_cases[0]["invalid_type"] == "format_difficulty_dominant"

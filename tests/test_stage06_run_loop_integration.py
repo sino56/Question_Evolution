@@ -23,17 +23,18 @@ def test_run_loop_uses_stage06_full_pipeline_order():
     assert_in_order(
         RUN_LOOP,
         [
-            "Step 1/11: profile_samples.py",
-            "Step 2/11: select_evolution_candidates.py",
-            "Step 3/11: operator_router.py",
-            "Step 4/11: question_evolution.py",
-            "Step 5/11: validate_evolved_question.py",
-            "Step 6/11: candidate_selection.py",
-            "Step 7/11: collect_answers.py",
-            "Step 8/11: gen_rubric.py",
-            "Step 9/11: scoring.py",
-            "Step 10/11: analyze_evolution_effect.py",
-            "Step 11/11: update_sample_state.py",
+            "Step 1/12: profile_samples.py",
+            "Step 2/12: select_evolution_candidates.py",
+            "Step 3/12: operator_router.py",
+            "Step 4/12: question_evolution.py",
+            "Step 5/12: validate_evolved_question.py",
+            "Step 6/12: validate_difficulty_gain.py",
+            "Step 7/12: candidate_selection.py",
+            "Step 8/12: collect_answers.py",
+            "Step 9/12: gen_rubric.py",
+            "Step 10/12: scoring.py",
+            "Step 11/12: analyze_evolution_effect.py",
+            "Step 12/12: update_sample_state.py",
         ],
     )
 
@@ -44,7 +45,11 @@ def test_run_loop_carries_state_forward_and_guards_memory_writes():
     assert 'ROUND_OUTPUT_FOR_NEXT="$ROUND_DIR/state_updated.jsonl"' in RUN_LOOP
     assert 'PREV_SCORED="$ROUND_OUTPUT_FOR_NEXT"' in RUN_LOOP
     assert '--memory-dir "$MEMORY_DIR"' in RUN_LOOP
+    assert '--preselection-invalid-input "$ROUND_DIR/invalid_generation_cases.jsonl"' in RUN_LOOP
     assert '--invalid-output "$ROUND_DIR/invalid_generation_cases.jsonl"' in RUN_LOOP
+    assert 'validate_candidate_coverage "$ROUND_DIR/routed.jsonl" "$ROUND_DIR/candidates.jsonl"' in RUN_LOOP
+    assert 'difficulty_validated_candidates.jsonl' in RUN_LOOP
+    assert 'difficulty_gain_report.json' in RUN_LOOP
 
 
 def test_run_loop_defaults_to_admitted_samples_with_legacy_fallback():
@@ -60,6 +65,12 @@ def test_run_loop_uses_existing_stage_cli_flags():
     assert "--num-candidates \"$NUM_CANDIDATES\"" in RUN_LOOP
     assert "--max-candidate-budget \"$MAX_CANDIDATE_BUDGET\"" in RUN_LOOP
     assert "--validation-retries \"$VALIDATION_RETRIES\"" in RUN_LOOP
+    assert "--min-gain-score \"$MIN_DIFFICULTY_GAIN_SCORE\"" in RUN_LOOP
+    assert "--borderline-gain-score \"$BORDERLINE_DIFFICULTY_GAIN_SCORE\"" in RUN_LOOP
+    assert "--min-competitive-judgment-score \"$MIN_COMPETITIVE_JUDGMENT_SCORE\"" in RUN_LOOP
+    assert "--enable-weak-probe" in RUN_LOOP
+    assert "--weak-answer-model \"$WEAK_ANSWER_MODEL\"" in RUN_LOOP
+    assert "--weak-answer-base-url \"$WEAK_ANSWER_BASE_URL\"" in RUN_LOOP
     assert "--judge-base-url \"$QWEN_BASE_URL\"" in RUN_LOOP
     assert "--judge-api-key \"$QWEN_API_KEY\"" in RUN_LOOP
     assert "--base-url \"$ANSWER_BASE_URL\"" in RUN_LOOP
@@ -74,7 +85,7 @@ def test_run_loop_uses_existing_stage_cli_flags():
 
 def test_run_loop_keeps_rubric_and_scoring_as_closed_loop_steps_only():
     rubric_call_start = RUN_LOOP.find("python gen_rubric.py")
-    scoring_call_start = RUN_LOOP.find("Step 9/11: scoring.py")
+    scoring_call_start = RUN_LOOP.find("Step 10/12: scoring.py")
     assert rubric_call_start != -1
     assert scoring_call_start != -1
     assert rubric_call_start < scoring_call_start

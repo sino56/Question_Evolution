@@ -8,8 +8,6 @@
     "round",
     "sample_signature",
     "operator_used",
-    "score_rate_before",
-    "score_rate_after",
     "failure_type",
     "failure_reason"
   ],
@@ -29,10 +27,10 @@
       "type": "string"
     },
     "score_rate_before": {
-      "type": "number"
+      "type": ["number", "null"]
     },
     "score_rate_after": {
-      "type": "number"
+      "type": ["number", "null"]
     },
     "failure_type": {
       "type": "string"
@@ -42,6 +40,15 @@
     },
     "avoid_note": {
       "type": "string"
+    },
+    "source_stage": {
+      "type": "string"
+    },
+    "risk_tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     }
   }
 }

@@ -15,6 +15,9 @@
     "operator_used": {
       "type": "string"
     },
+    "candidate_id": {
+      "type": "string"
+    },
     "invalid_type": {
       "type": "string"
     },
@@ -22,6 +25,19 @@
       "type": "string"
     },
     "suggested_operator": {
+      "type": "string"
+    },
+    "sample_signature": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "risk_tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "source_stage": {
       "type": "string"
     }
   }

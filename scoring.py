@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
@@ -265,6 +266,32 @@ def _rubric_title(rubric_item: Dict[str, Any], index: int) -> str:
     return title.strip()
 
 
+TITLE_QUOTE_TRANSLATION = str.maketrans({
+    "“": '"',
+    "”": '"',
+    "„": '"',
+    "＂": '"',
+    "‘": '"',
+    "’": '"',
+    "‚": '"',
+    "＇": '"',
+    "'": '"',
+    "`": '"',
+    "´": '"',
+    "«": '"',
+    "»": '"',
+    "「": '"',
+    "」": '"',
+    "『": '"',
+    "』": '"',
+})
+
+
+def _canonical_title_for_matching(title: str) -> str:
+    normalized = unicodedata.normalize("NFKC", title).translate(TITLE_QUOTE_TRANSLATION)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
 def _parse_awarded_score(awarded_raw: Any) -> int:
     try:
         if isinstance(awarded_raw, bool):
@@ -282,11 +309,19 @@ def _validate_rubric_titles(rubric: List[Dict[str, Any]]) -> List[str]:
     duplicate_titles = sorted({title for title in titles if titles.count(title) > 1})
     if duplicate_titles:
         raise ValueError(f"rubric 存在重复 title，无法按 title 安全对齐: {duplicate_titles}")
+    canonical_titles = [_canonical_title_for_matching(title) for title in titles]
+    duplicate_canonical_titles = sorted({
+        titles[index]
+        for index, canonical_title in enumerate(canonical_titles)
+        if canonical_titles.count(canonical_title) > 1
+    })
+    if duplicate_canonical_titles:
+        raise ValueError(f"rubric 存在规范化后重复 title，无法按 title 安全对齐: {duplicate_canonical_titles}")
     return titles
 
 
 def normalize_item_scores(item_scores: Any, rubric: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
-    """按 rubric title 严格校验并清洗 item_scores，计算总分。"""
+    """按 rubric title 校验并清洗 item_scores，计算总分。"""
     if not isinstance(item_scores, list):
         raise ValueError("评分结果中的 item_scores 必须为数组")
 
@@ -295,6 +330,7 @@ def normalize_item_scores(item_scores: Any, rubric: List[Dict[str, Any]]) -> Tup
         raise ValueError(f"评分结果 item_scores 数量为 {len(item_scores)}，rubric 数量为 {len(rubric)}")
 
     score_by_title: Dict[str, Dict[str, Any]] = {}
+    raw_score_title_by_key: Dict[str, str] = {}
     for index, raw_item in enumerate(item_scores):
         if not isinstance(raw_item, dict):
             raise ValueError(f"评分结果 item_scores[{index}] 必须为对象")
@@ -302,14 +338,24 @@ def normalize_item_scores(item_scores: Any, rubric: List[Dict[str, Any]]) -> Tup
         if not isinstance(title, str) or not title.strip():
             raise ValueError(f"评分结果 item_scores[{index}] 缺少非空 title")
         title = title.strip()
-        if title in score_by_title:
+        canonical_title = _canonical_title_for_matching(title)
+        if canonical_title in score_by_title:
             raise ValueError(f"评分结果存在重复 title: {title}")
-        score_by_title[title] = raw_item
+        score_by_title[canonical_title] = raw_item
+        raw_score_title_by_key[canonical_title] = title
 
-    expected_titles = set(rubric_titles)
-    actual_titles = set(score_by_title)
-    missing_titles = [title for title in rubric_titles if title not in actual_titles]
-    extra_titles = [title for title in score_by_title if title not in expected_titles]
+    expected_title_keys = {_canonical_title_for_matching(title) for title in rubric_titles}
+    actual_title_keys = set(score_by_title)
+    missing_titles = [
+        title
+        for title in rubric_titles
+        if _canonical_title_for_matching(title) not in actual_title_keys
+    ]
+    extra_titles = [
+        raw_score_title_by_key[title_key]
+        for title_key in actual_title_keys
+        if title_key not in expected_title_keys
+    ]
     if missing_titles or extra_titles:
         raise ValueError(
             "评分结果 title 与 rubric 不一致: "
@@ -322,7 +368,7 @@ def normalize_item_scores(item_scores: Any, rubric: List[Dict[str, Any]]) -> Tup
     for index, rubric_item in enumerate(rubric):
         title = rubric_titles[index]
         weight = int(rubric_item.get("weight", 0) or 0)
-        raw_item = score_by_title[title]
+        raw_item = score_by_title[_canonical_title_for_matching(title)]
         awarded_raw = raw_item.get("awarded", 0)
         brief_reason = raw_item.get("brief_reason", "")
 

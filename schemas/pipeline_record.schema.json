@@ -106,6 +106,13 @@
     "validation_result": {
       "$ref": "validation_result.schema.json"
     },
+    "difficulty_gain_validation": {
+      "$ref": "difficulty_gain_validation.schema.json"
+    },
+    "failure_memory_candidate": {
+      "type": "object",
+      "additionalProperties": true
+    },
     "candidate_selection": {
       "$ref": "candidate_selection.schema.json"
     },

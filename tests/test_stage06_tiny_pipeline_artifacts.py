@@ -18,6 +18,7 @@ from question_evolution import QuestionEvolutionProcessor
 from select_evolution_candidates import process_records as select_evolution_records
 from update_sample_state import update_records
 from validate_evolved_question import attach_validation_result
+from validate_difficulty_gain import validate_records_rule_only
 
 
 class FakeMessage:
@@ -225,7 +226,10 @@ async def run_tiny_pipeline(exp_dir: Path):
     validated = [attach_validation_result(candidate) for candidate in candidates]
     write_jsonl(round1 / "validated_candidates.jsonl", validated)
 
-    evolved, invalid_cases = select_candidates(validated)
+    difficulty_validated = validate_records_rule_only(validated)
+    write_jsonl(round1 / "difficulty_validated_candidates.jsonl", difficulty_validated)
+
+    evolved, invalid_cases = select_candidates(difficulty_validated)
     write_jsonl(round1 / "evolved.jsonl", evolved)
     write_jsonl(round1 / "invalid_generation_cases.jsonl", invalid_cases)
 
@@ -274,6 +278,7 @@ def test_tiny_pipeline_writes_stage06_artifacts_without_external_api():
             "round_1/routed.jsonl",
             "round_1/candidates.jsonl",
             "round_1/validated_candidates.jsonl",
+            "round_1/difficulty_validated_candidates.jsonl",
             "round_1/evolved.jsonl",
             "round_1/with_answers.jsonl",
             "round_1/rubric.jsonl",
@@ -294,6 +299,8 @@ def test_tiny_pipeline_writes_stage06_artifacts_without_external_api():
         assert evolved[0]["question_evolved"] is True
         assert evolved[0]["candidate_selection"]["selected_operator"]
         assert evolved[0]["validation_result"]["passed"] is True
+        assert evolved[0]["difficulty_gain_validation"]["passed"] is True
+        assert evolved[0]["candidate_selection"]["selection_status"] == "selected_after_difficulty_gain_validation"
 
         analyzed = read_jsonl(exp_dir / "round_1" / "effect_analysis.jsonl")
         effect = analyzed[0]["effect_analysis"]

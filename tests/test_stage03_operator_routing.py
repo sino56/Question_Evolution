@@ -55,6 +55,15 @@ class FakeEvolutionClient:
         return FakeResponse(content)
 
 
+class FailingEvolutionClient:
+    def __init__(self):
+        self.calls = []
+
+    async def chat_completions_create(self, **kwargs):
+        self.calls.append(kwargs)
+        raise RuntimeError("mock generation failed")
+
+
 def test_operator_registry_covers_o1_to_o9():
     assert len(OPERATOR_SPECS) == 9
     for index in range(1, 10):
@@ -107,8 +116,63 @@ def test_question_evolution_uses_route_and_skips_passthrough():
     assert len(fake_client.calls) == 1
 
 
+def test_candidate_generation_falls_back_when_no_operator_available():
+    records = load_jsonl(ROOT / "tests" / "fixtures" / "stage03_routing_input.jsonl")
+    routed = route_records(records)
+    by_id = {record["sample_id"]: record for record in routed}
+    item = dict(by_id["stage03-o1"])
+    route = dict(item["operator_route"])
+    route["avoid_operators"] = [route["primary_operator"]] + list(route.get("backup_operators", []))
+    route["backup_operators"] = []
+    item["operator_route"] = route
+    fake_client = FakeEvolutionClient()
+    processor = QuestionEvolutionProcessor(
+        fake_client,
+        model="mock-evolution-model",
+        max_concurrent=1,
+        max_retries=0,
+        num_candidates=2,
+    )
+
+    candidates = asyncio.run(processor.process_item_candidates(item, requested_candidates=2))
+    fallback = candidates[0]
+
+    assert len(candidates) == 1
+    assert fallback["question_evolved"] is False
+    assert fallback["question_evolution_status"] == "no_available_operator"
+    assert fallback["candidate_generation"]["generation_status"] == "no_available_operator"
+    assert fallback["candidate_id"].endswith("::no_available_operator")
+    assert len(fake_client.calls) == 0
+
+
+def test_candidate_generation_failure_returns_passthrough_candidate():
+    records = load_jsonl(ROOT / "tests" / "fixtures" / "stage03_routing_input.jsonl")
+    routed = route_records(records)
+    by_id = {record["sample_id"]: record for record in routed}
+    fake_client = FailingEvolutionClient()
+    processor = QuestionEvolutionProcessor(
+        fake_client,
+        model="mock-evolution-model",
+        max_concurrent=1,
+        max_retries=0,
+        num_candidates=2,
+    )
+
+    candidates = asyncio.run(processor.process_item_candidates(by_id["stage03-o1"], requested_candidates=2))
+    fallback = candidates[0]
+
+    assert len(candidates) == 1
+    assert fallback["question_evolved"] is False
+    assert fallback["question_evolution_status"] == "generation_failed_pass_through"
+    assert fallback["candidate_generation"]["generation_status"] == "generation_failed_pass_through"
+    assert fallback["candidate_group_id"] == "stage03-o1"
+    assert len(fake_client.calls) >= 1
+
+
 if __name__ == "__main__":
     test_operator_registry_covers_o1_to_o9()
     test_router_covers_representative_stage03_paths()
     test_question_evolution_uses_route_and_skips_passthrough()
+    test_candidate_generation_falls_back_when_no_operator_available()
+    test_candidate_generation_failure_returns_passthrough_candidate()
     print("stage03 operator routing checks passed")

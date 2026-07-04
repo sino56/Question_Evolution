@@ -20,12 +20,12 @@ Stage 0: data.jsonl
 Stage 1: scoring.py -> round_0/scored.jsonl
 Stage 2: profile_samples.py -> select_evolution_candidates.py
 Stage 3: operator_router.py -> question_evolution.py
-Stage 4: validate_evolved_question.py -> candidate_selection.py
+Stage 4: validate_evolved_question.py -> validate_difficulty_gain.py -> candidate_selection.py
 Stage 5: collect_answers.py -> gen_rubric.py -> scoring.py
          -> analyze_evolution_effect.py -> update_sample_state.py
 ```
 
-从 Round 1 开始，每轮 11 个步骤与 `run_loop.sh` 保持一致：
+从 Round 1 开始，每轮 12 个步骤与 `run_loop.sh` 保持一致：
 
 | 步骤 | 脚本 | 产物 |
 | --- | --- | --- |
@@ -35,14 +35,15 @@ Stage 5: collect_answers.py -> gen_rubric.py -> scoring.py
 | 3 | `operator_router.py` | `routed.jsonl` |
 | 4 | `question_evolution.py` | `candidates.jsonl` |
 | 5 | `validate_evolved_question.py` | `validated_candidates.jsonl` |
-| 6 | `candidate_selection.py` | `evolved.jsonl` |
-| 7 | `collect_answers.py` | `with_answers.jsonl` |
-| 8 | `gen_rubric.py` | `rubric.jsonl` |
-| 9 | `scoring.py` | `scored.jsonl` |
-| 10 | `analyze_evolution_effect.py` | `effect_analysis.jsonl`, `effect_matrix.jsonl` |
-| 11 | `update_sample_state.py` | `state_updated.jsonl`, memory bank |
+| 6 | `validate_difficulty_gain.py` | `difficulty_validated_candidates.jsonl`, `difficulty_gain_report.json` |
+| 7 | `candidate_selection.py` | `evolved.jsonl` |
+| 8 | `collect_answers.py` | `with_answers.jsonl` |
+| 9 | `gen_rubric.py` | `rubric.jsonl` |
+| 10 | `scoring.py` | `scored.jsonl` |
+| 11 | `analyze_evolution_effect.py` | `effect_analysis.jsonl`, `effect_matrix.jsonl` |
+| 12 | `update_sample_state.py` | `state_updated.jsonl`, memory bank |
 
-`question_evolution.py` 的 legacy 单脚本路径仍可用于兼容旧数据或局部调试，但不再是推荐主流程。推荐路径必须经过画像、分流、路由、复杂度/可回答性校验、候选选择、效果统计和状态更新。
+`question_evolution.py` 的 legacy 单脚本路径仍可用于兼容旧数据或局部调试，但不再是推荐主流程。推荐路径必须经过画像、分流、路由、复杂度/可回答性校验、难度收益验证、候选选择、效果统计和状态更新。
 
 ### 流程图
 ```text
@@ -89,8 +90,12 @@ Round N 输入
         |                        -> 校验复杂度 / 可答性 / 重复题型
         |                              |
         |                              v
+        |                        validate_difficulty_gain.py
+        |                        -> 校验是否有真实难度收益 / 无线索泄漏
+        |                              |
+        |                              v
         |                        candidate_selection.py
-        |                        -> 每组候选选 1 条主链题
+        |                        -> 只在通过门禁的候选中选 1 条主链题
         |                              |
         |                +-------------+-------------+
         |                |                           |
@@ -147,7 +152,8 @@ Round N 输入
 | `operator_router.py` | 根据画像、状态和 memory 选择 operator | `profiled_candidates.jsonl` | `routed.jsonl` |
 | `question_evolution.py` | 按 operator 生成 1-4 个候选题，支持 validate-retry | `routed.jsonl` | `candidates.jsonl` |
 | `validate_evolved_question.py` | 校验复杂度、可回答性、重复题型和格式风险 | `candidates.jsonl` | `validated_candidates.jsonl` |
-| `candidate_selection.py` | 从局部树状探索候选中选择主链题目 | `validated_candidates.jsonl` | `evolved.jsonl` |
+| `validate_difficulty_gain.py` | 校验候选题是否有真实难度收益、无线索泄漏且不靠格式变难 | `validated_candidates.jsonl` | `difficulty_validated_candidates.jsonl`, `difficulty_gain_report.json` |
+| `candidate_selection.py` | 从通过复杂度和难度收益验证的候选中选择主链题目 | `difficulty_validated_candidates.jsonl` | `evolved.jsonl` |
 | `collect_answers.py` | 调用强模型为题目生成参考答案 | `*.jsonl` | `*_with_answers.jsonl` |
 | `gen_rubric.py` | 根据题目和参考答案生成 rubric 与 score_prompt | `*_with_answers.jsonl` | `*_rubric.jsonl` |
 | `analyze_evolution_effect.py` | 统计轻量边界命中和 operator 效果矩阵 | `*_scored.jsonl` | `effect_analysis.jsonl` |
@@ -586,13 +592,38 @@ python validate_evolved_question.py \
   --output round_1_validated_candidates.jsonl \
   --validate-schema
 
-# Step 6：候选选择
-python candidate_selection.py \
+# Step 6：难度收益验证
+python validate_difficulty_gain.py \
   --input round_1_validated_candidates.jsonl \
+  --output round_1_difficulty_validated_candidates.jsonl \
+  --report-output round_1_difficulty_gain_report.json \
+  --model "$DIFFICULTY_GAIN_MODEL" \
+  --base-url "$DIFFICULTY_GAIN_BASE_URL" \
+  --concurrency 5 \
+  --min-gain-score 0.75 \
+  --borderline-gain-score 0.65 \
+  --min-competitive-judgment-score 0.60
+
+# 可选：开启弱模型 light probe
+python validate_difficulty_gain.py \
+  --input round_1_validated_candidates.jsonl \
+  --output round_1_difficulty_validated_candidates.jsonl \
+  --report-output round_1_difficulty_gain_report.json \
+  --model "$DIFFICULTY_GAIN_MODEL" \
+  --base-url "$DIFFICULTY_GAIN_BASE_URL" \
+  --enable-weak-probe \
+  --weak-probe-mode light \
+  --weak-answer-model "$WEAK_ANSWER_MODEL" \
+  --weak-answer-base-url "$WEAK_ANSWER_BASE_URL" \
+  --weak-answer-api-key "$WEAK_ANSWER_API_KEY"
+
+# Step 7：候选选择
+python candidate_selection.py \
+  --input round_1_difficulty_validated_candidates.jsonl \
   --output round_1_evolved.jsonl \
   --invalid-output round_1_invalid_generation_cases.jsonl
 
-# Step 7：采集参考答案
+# Step 8：采集参考答案
 python collect_answers.py \
   --input round_1_evolved.jsonl \
   --output round_1_with_answers.jsonl \
@@ -600,14 +631,14 @@ python collect_answers.py \
   --model "$GPT_MODEL" \
   --base-url "$ANSWER_BASE_URL"
 
-# Step 8：重新生成 rubric
+# Step 9：重新生成 rubric
 python gen_rubric.py \
   --input round_1_with_answers.jsonl \
   --output round_1_rubric.jsonl \
   --model "$GPT_MODEL" \
   --base-url "$RUBRIC_BASE_URL"
 
-# Step 9：再次评分
+# Step 10：再次评分
 python scoring.py \
   --input round_1_rubric.jsonl \
   --output round_1_scored.jsonl \
@@ -619,18 +650,19 @@ python scoring.py \
   --judge-api-key "$QWEN_API_KEY" \
   --judge-model "$QWEN_MODEL"
 
-# Step 10：效果统计
+# Step 11：效果统计
 python analyze_evolution_effect.py \
   --before round_0_scored.jsonl \
   --input round_1_scored.jsonl \
   --output round_1_effect_analysis.jsonl \
   --matrix-output round_1_effect_matrix.jsonl
 
-# Step 11：状态更新和 memory bank 写入
+# Step 12：状态更新和 memory bank 写入
 python update_sample_state.py \
   --input round_1_effect_analysis.jsonl \
   --output round_1_state_updated.jsonl \
-  --memory-dir memory
+  --memory-dir memory \
+  --preselection-invalid-input round_1_invalid_generation_cases.jsonl
 ```
 
 ---
@@ -739,7 +771,8 @@ python question_evolution.py \
 
 ```bash
 python validate_evolved_question.py --input candidates.jsonl --output validated_candidates.jsonl --validate-schema
-python candidate_selection.py --input validated_candidates.jsonl --output evolved.jsonl --invalid-output invalid_generation_cases.jsonl
+python validate_difficulty_gain.py --input validated_candidates.jsonl --output difficulty_validated_candidates.jsonl --report-output difficulty_gain_report.json
+python candidate_selection.py --input difficulty_validated_candidates.jsonl --output evolved.jsonl --invalid-output invalid_generation_cases.jsonl
 ```
 
 ### collect_answers.py
