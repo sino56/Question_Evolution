@@ -25,10 +25,14 @@ Stage 0-5 question evolution pipeline.
 - `validation_result` is produced by `validate_evolved_question.py`.
   The script can optionally run `--validate-schema` to check pipeline records
   against these local schemas.
-- `candidate_selection` is produced by `candidate_selection.py` on the selected
-  main-chain record.
+- `candidate_selection` is produced by `candidate_selection.py`. It keeps the
+  legacy selected fields and also records `candidate_flow` plus
+  `selected_for_exploration` so weak candidates can be scored under the
+  bounded exploration budget without being treated as main-chain successes.
 - `effect_analysis` is produced by `analyze_evolution_effect.py` after the
-  standard scoring loop has produced a new scored record.
+  standard scoring loop has produced a new scored record. It marks
+  `score_increased_after_evolution=true` when an evolved question raises the
+  score beyond the configured increase threshold.
 
 ## Pass-Through Semantics
 

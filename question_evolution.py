@@ -955,7 +955,7 @@ def enrich_evolution_result_with_operator(
     route = get_operator_route(item)
     diagnosis = get_overscore_diagnosis(item)
     enriched = dict(evolved)
-    enriched.setdefault("operator_used", operator_id)
+    enriched["operator_used"] = operator_id
     enriched.setdefault("ability_axis", spec.ability_axis)
 
     target_failure = str(diagnosis.get("target_failure_mode", "") or "").strip()
@@ -1044,9 +1044,20 @@ def make_evolved_candidate_record(
 ) -> Dict[str, Any]:
     result = make_evolved_record(item, evolved, score_rate, model)
     group_id = get_candidate_group_id(item)
+    candidate_operator = operator_id or evolved.get("operator_used")
+    candidate_operator = candidate_operator.strip() if isinstance(candidate_operator, str) else ""
     result["candidate_group_id"] = group_id
     result["candidate_id"] = f"{group_id}::cand_{candidate_index}"
-    result["candidate_operator"] = operator_id or evolved.get("operator_used")
+    result["candidate_operator"] = candidate_operator
+    if candidate_operator:
+        meta_info = result.get("meta_info")
+        meta_info = dict(meta_info) if isinstance(meta_info, dict) else {}
+        metadata = meta_info.get("question_evolution_metadata")
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        metadata["operator_used"] = candidate_operator
+        metadata["question_evolved"] = True
+        meta_info["question_evolution_metadata"] = metadata
+        result["meta_info"] = meta_info
     result["candidate_generation"] = {
         "candidate_index": candidate_index,
         "num_candidates_requested": requested_candidates,

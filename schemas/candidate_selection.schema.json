@@ -17,6 +17,17 @@
     "selection_status": {
       "type": "string"
     },
+    "candidate_flow": {
+      "enum": [
+        "main_chain_candidate",
+        "exploration_candidate",
+        "hard_reject",
+        "pass_through_candidate"
+      ]
+    },
+    "selected_for_exploration": {
+      "type": "boolean"
+    },
     "selection_score": {
       "type": "number"
     },
@@ -49,6 +60,12 @@
           },
           "reject_reason": {
             "type": "string"
+          },
+          "candidate_flow": {
+            "type": "string"
+          },
+          "selected_for_exploration": {
+            "type": "boolean"
           }
         }
       }

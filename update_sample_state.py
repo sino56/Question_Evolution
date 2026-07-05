@@ -21,7 +21,6 @@ FAILURE_EFFECT_LABELS = {
 TERMINAL_STOP_STATUSES = {
     "effective_boundary_sample",
     "stable_high_score_stop",
-    "validated_high_score_sample",
     "invalid_complexity_sample",
     "unanswerable_or_trap_sample",
 }
@@ -171,7 +170,7 @@ def _stop_status(
     if label == "pass_through":
         return previous_stop or "continue"
     if label == "score_increased":
-        return "validated_high_score_sample"
+        return "continue_with_new_operator"
     if label == "full_score_no_drop":
         if full_score_count >= 2 and operator_switched_after_full_score:
             return "stable_high_score_stop"
@@ -187,8 +186,6 @@ def _stop_status(
 
 def _recommended_next_methods(operator_used: str, label: str, full_score_count: int) -> List[str]:
     if label == "effective_boundary_probe":
-        return []
-    if label == "score_increased":
         return []
     hints = list(NEXT_OPERATOR_HINTS.get(operator_used, []))
     if full_score_count >= 2 and "O4_near_level_ranking" not in hints:
@@ -220,7 +217,7 @@ def build_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
         _append_unique(avoid_methods, OPERATOR_AVOID_METHODS.get(operator_used, []))
 
     recommended = _recommended_next_methods(operator_used, label, full_score_count)
-    if not recommended and label not in {"effective_boundary_probe", "score_increased"}:
+    if not recommended and label != "effective_boundary_probe":
         recommended = list(previous_state.get("recommended_next_methods") or [])
 
     stop_status = _stop_status(

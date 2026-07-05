@@ -188,19 +188,21 @@ def get_score_rate_before_source(item: Dict[str, Any], previous_item: Optional[D
 
 
 def get_operator_used(item: Dict[str, Any]) -> str:
+    selection = item.get("candidate_selection")
+    if isinstance(selection, dict):
+        selected_operator = _clean_text(selection.get("selected_operator"))
+        if selected_operator or selection.get("candidate_flow") == "pass_through_candidate" or selection.get("selected") is False:
+            return selected_operator
+
     metadata = get_metadata(item)
     for value in (
-        metadata.get("operator_used"),
         item.get("candidate_operator"),
         item.get("operator_used"),
+        metadata.get("operator_used"),
     ):
         text = _clean_text(value)
         if text:
             return text
-
-    selection = item.get("candidate_selection")
-    if isinstance(selection, dict):
-        return _clean_text(selection.get("selected_operator"))
     return ""
 
 
@@ -344,6 +346,7 @@ def build_effect_analysis(
     full_score_broken = score_rate_before >= full_score_threshold and score_rate_after < full_score_threshold
     strong_drop = score_drop >= score_drop_threshold
     review_drop = score_drop >= review_drop_threshold
+    score_increased_after_evolution = evolved and delta_score_rate > score_increase_threshold
 
     lightweight_boundary_hit = (
         evolved
@@ -383,6 +386,9 @@ def build_effect_analysis(
     elif evolved and complexity_passed and (strong_drop or full_score_broken or review_drop) and (not focus_present or not focus_matches):
         effect_label = "needs_manual_review"
         reason = _clean_text(focus_alignment.get("reason")) or "分数下降但无法确认错误方向压中预期 focus。"
+    elif score_increased_after_evolution:
+        effect_label = "score_increased"
+        reason = "score rate increased after evolution; current rewrite did not expose a clearer boundary."
     elif is_full_score:
         effect_label = "full_score_no_drop"
         reason = "新一轮评分仍为满分，当前算子未形成有效压测。"
@@ -402,6 +408,7 @@ def build_effect_analysis(
         "operator_used": get_operator_used(item),
         "question_length": len(_clean_text(item.get("prompt"))),
         "is_full_score": is_full_score,
+        "score_increased_after_evolution": score_increased_after_evolution,
         "complexity_passed": complexity_passed,
         "repeated_pattern_with_previous_round": repeated,
         "lightweight_boundary_hit": lightweight_boundary_hit,
@@ -518,6 +525,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--full-score-threshold", type=float, default=DEFAULT_FULL_SCORE_THRESHOLD)
     parser.add_argument("--score-drop-threshold", type=float, default=DEFAULT_SCORE_DROP_THRESHOLD)
     parser.add_argument("--review-drop-threshold", type=float, default=DEFAULT_REVIEW_DROP_THRESHOLD)
+    parser.add_argument("--score-increase-threshold", type=float, default=DEFAULT_SCORE_INCREASE_THRESHOLD)
     return parser.parse_args()
 
 
@@ -531,6 +539,7 @@ def main() -> None:
         full_score_threshold=args.full_score_threshold,
         score_drop_threshold=args.score_drop_threshold,
         review_drop_threshold=args.review_drop_threshold,
+        score_increase_threshold=args.score_increase_threshold,
     )
     write_jsonl(analyzed, args.output)
     if args.matrix_output:

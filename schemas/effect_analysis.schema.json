@@ -36,6 +36,9 @@
     "is_full_score": {
       "type": "boolean"
     },
+    "score_increased_after_evolution": {
+      "type": "boolean"
+    },
     "complexity_passed": {
       "type": "boolean"
     },
