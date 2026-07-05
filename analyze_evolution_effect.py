@@ -462,6 +462,8 @@ def build_effect_matrix(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
             "sample_count": 0,
             "delta_score_rate_sum": 0.0,
             "lightweight_boundary_hit_count": 0,
+            "effective_boundary_probe_count": 0,
+            "score_increased_after_evolution_count": 0,
             "full_score_count": 0,
             "invalid_complexity_count": 0,
             "repeated_pattern_count": 0,
@@ -482,6 +484,10 @@ def build_effect_matrix(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
         bucket["delta_score_rate_sum"] += float(effect.get("delta_score_rate", 0) or 0)
         if effect.get("lightweight_boundary_hit"):
             bucket["lightweight_boundary_hit_count"] += 1
+        if effect.get("effect_label") == "effective_boundary_probe":
+            bucket["effective_boundary_probe_count"] += 1
+        if effect.get("score_increased_after_evolution"):
+            bucket["score_increased_after_evolution_count"] += 1
         if effect.get("is_full_score"):
             bucket["full_score_count"] += 1
         if not effect.get("complexity_passed"):
@@ -508,6 +514,8 @@ def build_effect_matrix(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
                 "avg_delta_score_rate": bucket["delta_score_rate_sum"] / sample_count if sample_count else 0,
                 "lightweight_boundary_hit_count": hit_count,
                 "lightweight_boundary_hit_rate": hit_count / sample_count if sample_count else 0,
+                "effective_boundary_probe_count": bucket["effective_boundary_probe_count"],
+                "score_increased_after_evolution_count": bucket["score_increased_after_evolution_count"],
                 "full_score_count": bucket["full_score_count"],
                 "invalid_complexity_count": bucket["invalid_complexity_count"],
                 "repeated_pattern_count": bucket["repeated_pattern_count"],

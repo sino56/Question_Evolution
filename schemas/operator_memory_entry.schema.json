@@ -31,6 +31,9 @@
     "operator_used": {
       "type": "string"
     },
+    "surface_form_family": {
+      "type": "string"
+    },
     "expected_qwen_failure": {
       "type": "string"
     },

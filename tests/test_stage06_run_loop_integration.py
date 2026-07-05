@@ -23,18 +23,19 @@ def test_run_loop_uses_stage06_full_pipeline_order():
     assert_in_order(
         RUN_LOOP,
         [
-            "Step 1/12: profile_samples.py",
-            "Step 2/12: select_evolution_candidates.py",
-            "Step 3/12: operator_router.py",
-            "Step 4/12: question_evolution.py",
-            "Step 5/12: validate_evolved_question.py",
-            "Step 6/12: validate_difficulty_gain.py",
-            "Step 7/12: candidate_selection.py",
-            "Step 8/12: collect_answers.py",
-            "Step 9/12: gen_rubric.py",
-            "Step 10/12: scoring.py",
-            "Step 11/12: analyze_evolution_effect.py",
-            "Step 12/12: update_sample_state.py",
+            "Step 1/13: profile_samples.py",
+            "Step 2/13: select_evolution_candidates.py",
+            "Step 3/13: operator_router.py",
+            "Step 4/13: question_evolution.py",
+            "Step 5/13: validate_evolved_question.py",
+            "Step 6/13: light_factual_check.py",
+            "Step 7/13: validate_difficulty_gain.py",
+            "Step 8/13: candidate_selection.py",
+            "Step 9/13: collect_answers.py",
+            "Step 10/13: gen_rubric.py",
+            "Step 11/13: scoring.py",
+            "Step 12/13: analyze_evolution_effect.py",
+            "Step 13/13: update_sample_state.py",
         ],
     )
 
@@ -50,6 +51,11 @@ def test_run_loop_carries_state_forward_and_guards_memory_writes():
     assert 'validate_candidate_coverage "$ROUND_DIR/routed.jsonl" "$ROUND_DIR/candidates.jsonl"' in RUN_LOOP
     assert 'difficulty_validated_candidates.jsonl' in RUN_LOOP
     assert 'difficulty_gain_report.json' in RUN_LOOP
+    assert 'light_factual_checked_candidates.jsonl' in RUN_LOOP
+    assert 'light_factual_report.json' in RUN_LOOP
+    assert 'candidate_selection_report.json' in RUN_LOOP
+    assert 'operator_router_report.json' in RUN_LOOP
+    assert 'state_update_report.json' in RUN_LOOP
 
 
 def test_run_loop_defaults_to_admitted_samples_with_legacy_fallback():
@@ -61,6 +67,9 @@ def test_run_loop_defaults_to_admitted_samples_with_legacy_fallback():
 
 def test_run_loop_uses_existing_stage_cli_flags():
     assert "--high-score-threshold \"$MIN_SCORE_RATE\"" in RUN_LOOP
+    assert "--enable-uncertain-low-probe" in RUN_LOOP
+    assert "--uncertain-low-probe-min-score \"$UNCERTAIN_LOW_PROBE_MIN_SCORE\"" in RUN_LOOP
+    assert "--failure-memory-window-rounds \"$FAILURE_MEMORY_WINDOW_ROUNDS\"" in RUN_LOOP
     assert "--min-score-rate \"$MIN_SCORE_RATE\"" in RUN_LOOP
     assert "--num-candidates \"$NUM_CANDIDATES\"" in RUN_LOOP
     assert "--max-candidate-budget \"$MAX_CANDIDATE_BUDGET\"" in RUN_LOOP
@@ -85,7 +94,7 @@ def test_run_loop_uses_existing_stage_cli_flags():
 
 def test_run_loop_keeps_rubric_and_scoring_as_closed_loop_steps_only():
     rubric_call_start = RUN_LOOP.find("python gen_rubric.py")
-    scoring_call_start = RUN_LOOP.find("Step 10/12: scoring.py")
+    scoring_call_start = RUN_LOOP.find("Step 11/13: scoring.py")
     assert rubric_call_start != -1
     assert scoring_call_start != -1
     assert rubric_call_start < scoring_call_start

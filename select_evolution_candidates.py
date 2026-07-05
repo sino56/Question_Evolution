@@ -52,6 +52,16 @@ STOP_STATUSES = {
 ROUND0_EVOLVE_HIGH_STATUSES = {"stable_high", "unstable_high"}
 ROUND0_BORDERLINE_STATUSES = {"borderline_probe"}
 ROUND0_STOP_STATUSES = {"stable_low", "uncertain_low", "review_needed"}
+ENABLE_UNCERTAIN_LOW_PROBE = str(os.getenv("ENABLE_UNCERTAIN_LOW_PROBE", "false")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+try:
+    UNCERTAIN_LOW_PROBE_MIN_SCORE = float(os.getenv("UNCERTAIN_LOW_PROBE_MIN_SCORE", "0.55"))
+except ValueError:
+    UNCERTAIN_LOW_PROBE_MIN_SCORE = 0.55
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
@@ -135,7 +145,12 @@ def get_round0_summary(item: Dict[str, Any]) -> Dict[str, Any]:
     return summary if isinstance(summary, dict) else {}
 
 
-def decide_action_from_round0_summary(item: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+def decide_action_from_round0_summary(
+    item: Dict[str, Any],
+    *,
+    enable_uncertain_low_probe: bool = ENABLE_UNCERTAIN_LOW_PROBE,
+    uncertain_low_probe_min_score: float = UNCERTAIN_LOW_PROBE_MIN_SCORE,
+) -> Optional[Tuple[str, str]]:
     summary = get_round0_summary(item)
     if not summary:
         return None
@@ -159,13 +174,33 @@ def decide_action_from_round0_summary(item: Dict[str, Any]) -> Optional[Tuple[st
     if status in ROUND0_BORDERLINE_STATUSES:
         return RECONSTRUCT_LOW_SCORE_BOUNDARY, f"round0 admission_status={status} ({score_text}) admits a low-budget boundary probe."
 
+    if status == "uncertain_low":
+        diagnosis = item.get("overscore_diagnosis")
+        diagnosis = diagnosis if isinstance(diagnosis, dict) else {}
+        if (
+            enable_uncertain_low_probe
+            and bool(diagnosis.get("is_worth_evolving"))
+            and stable_score is not None
+            and stable_score >= uncertain_low_probe_min_score
+        ):
+            return (
+                RECONSTRUCT_LOW_SCORE_BOUNDARY,
+                f"uncertain_low_probe enabled: stable_score={stable_score:.4f} >= {uncertain_low_probe_min_score:.4f}; low-budget probe admitted.",
+            )
+
     if status in ROUND0_STOP_STATUSES:
         return STOP_EVOLUTION, f"round0 admission_status={status} ({score_text}) stops evolution."
 
     return STOP_EVOLUTION, f"round0 admission_status={status or '<missing>'} ({score_text}) is not recognized; stop for review."
 
 
-def build_evolution_budget(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def build_evolution_budget(
+    item: Dict[str, Any],
+    *,
+    action: Optional[str] = None,
+    enable_uncertain_low_probe: bool = ENABLE_UNCERTAIN_LOW_PROBE,
+    uncertain_low_probe_min_score: float = UNCERTAIN_LOW_PROBE_MIN_SCORE,
+) -> Optional[Dict[str, Any]]:
     summary = get_round0_summary(item)
     if not summary:
         return None
@@ -173,10 +208,23 @@ def build_evolution_budget(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         budget = int(summary.get("recommended_evolution_budget") or 0)
     except (TypeError, ValueError):
         budget = 0
+    status = str(summary.get("admission_status", "") or "")
+    stable_score = coerce_score_rate(summary.get("stable_score"))
+    diagnosis = item.get("overscore_diagnosis")
+    diagnosis = diagnosis if isinstance(diagnosis, dict) else {}
+    if (
+        action == RECONSTRUCT_LOW_SCORE_BOUNDARY
+        and status == "uncertain_low"
+        and enable_uncertain_low_probe
+        and bool(diagnosis.get("is_worth_evolving"))
+        and stable_score is not None
+        and stable_score >= uncertain_low_probe_min_score
+    ):
+        budget = max(1, budget)
     return {
         "recommended_num_candidates": max(0, budget),
         "source": "round0_score_summary",
-        "admission_status": str(summary.get("admission_status", "") or ""),
+        "admission_status": status,
     }
 
 
@@ -192,6 +240,8 @@ def decide_evolution_action(
     *,
     high_score_threshold: float = 0.8,
     low_score_threshold: float = 0.6,
+    enable_uncertain_low_probe: bool = ENABLE_UNCERTAIN_LOW_PROBE,
+    uncertain_low_probe_min_score: float = UNCERTAIN_LOW_PROBE_MIN_SCORE,
 ) -> Tuple[str, str]:
     validate_profiled_record(item)
 
@@ -207,7 +257,11 @@ def decide_evolution_action(
     if _has_any_term(diagnosis_text, STOP_TERMS) and not worth_evolving:
         return STOP_EVOLUTION, "diagnosis says the sample is stable or should stop."
 
-    round0_decision = decide_action_from_round0_summary(item)
+    round0_decision = decide_action_from_round0_summary(
+        item,
+        enable_uncertain_low_probe=enable_uncertain_low_probe,
+        uncertain_low_probe_min_score=uncertain_low_probe_min_score,
+    )
     if round0_decision is not None:
         return round0_decision
 
@@ -246,16 +300,25 @@ def select_record(
     *,
     high_score_threshold: float = 0.8,
     low_score_threshold: float = 0.6,
+    enable_uncertain_low_probe: bool = ENABLE_UNCERTAIN_LOW_PROBE,
+    uncertain_low_probe_min_score: float = UNCERTAIN_LOW_PROBE_MIN_SCORE,
 ) -> Dict[str, Any]:
     action, reason = decide_evolution_action(
         item,
         high_score_threshold=high_score_threshold,
         low_score_threshold=low_score_threshold,
+        enable_uncertain_low_probe=enable_uncertain_low_probe,
+        uncertain_low_probe_min_score=uncertain_low_probe_min_score,
     )
     result = dict(item)
     result["evolution_action"] = action
     result["evolution_action_reason"] = reason
-    evolution_budget = build_evolution_budget(item)
+    evolution_budget = build_evolution_budget(
+        item,
+        action=action,
+        enable_uncertain_low_probe=enable_uncertain_low_probe,
+        uncertain_low_probe_min_score=uncertain_low_probe_min_score,
+    )
     if evolution_budget is not None:
         result["evolution_budget"] = evolution_budget
     return result
@@ -266,15 +329,48 @@ def process_records(
     *,
     high_score_threshold: float = 0.8,
     low_score_threshold: float = 0.6,
+    enable_uncertain_low_probe: bool = ENABLE_UNCERTAIN_LOW_PROBE,
+    uncertain_low_probe_min_score: float = UNCERTAIN_LOW_PROBE_MIN_SCORE,
 ) -> List[Dict[str, Any]]:
     return [
         select_record(
             record,
             high_score_threshold=high_score_threshold,
             low_score_threshold=low_score_threshold,
+            enable_uncertain_low_probe=enable_uncertain_low_probe,
+            uncertain_low_probe_min_score=uncertain_low_probe_min_score,
         )
         for record in records
     ]
+
+
+def generate_report(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    uncertain_low_probe_count = 0
+    action_distribution: Dict[str, int] = {}
+    for record in records:
+        action = str(record.get("evolution_action", "") or "")
+        action_distribution[action] = action_distribution.get(action, 0) + 1
+        summary = get_round0_summary(record)
+        if (
+            summary.get("admission_status") == "uncertain_low"
+            and action == RECONSTRUCT_LOW_SCORE_BOUNDARY
+            and "uncertain_low_probe enabled" in str(record.get("evolution_action_reason", ""))
+        ):
+            uncertain_low_probe_count += 1
+    return {
+        "total_records": len(records),
+        "action_distribution": action_distribution,
+        "uncertain_low_probe_count": uncertain_low_probe_count,
+    }
+
+
+def write_json(data: Dict[str, Any], output_path: str) -> None:
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -293,6 +389,19 @@ def parse_args() -> argparse.Namespace:
         default=0.6,
         help="Maximum score_rate for low-score boundary reconstruction.",
     )
+    parser.add_argument(
+        "--enable-uncertain-low-probe",
+        action="store_true",
+        default=ENABLE_UNCERTAIN_LOW_PROBE,
+        help="Allow low-budget probing for uncertain_low round0 samples when they are worth evolving.",
+    )
+    parser.add_argument(
+        "--uncertain-low-probe-min-score",
+        type=float,
+        default=UNCERTAIN_LOW_PROBE_MIN_SCORE,
+        help="Minimum stable_score for uncertain_low_probe when enabled.",
+    )
+    parser.add_argument("--report-output", default=None, help="Optional evolution candidate selection report JSON path.")
     return parser.parse_args()
 
 
@@ -303,8 +412,12 @@ def main() -> None:
         records,
         high_score_threshold=args.high_score_threshold,
         low_score_threshold=args.low_score_threshold,
+        enable_uncertain_low_probe=args.enable_uncertain_low_probe,
+        uncertain_low_probe_min_score=args.uncertain_low_probe_min_score,
     )
     write_jsonl(selected, args.output)
+    if args.report_output:
+        write_json(generate_report(selected), args.report_output)
 
 
 if __name__ == "__main__":

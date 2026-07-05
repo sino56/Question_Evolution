@@ -164,6 +164,50 @@ def test_hard_labels_and_template_simplification_are_rejected():
     assert len(invalid_cases) == 2
 
 
+def test_light_factual_fatal_errors_hard_reject_and_warnings_only_penalize():
+    fatal = make_candidate("flow-factual-fatal", "cand", "clear_gain", passed=True, score=0.86)
+    fatal["light_factual_check"] = {
+        "passed": False,
+        "fatal_errors": ["新增 30分钟 条件"],
+        "warnings": [],
+        "risk_tags": ["numeric_fact_added_or_conflicted"],
+    }
+    warning = make_candidate("flow-factual-warning", "cand", "clear_gain", passed=True, score=0.86)
+    warning["light_factual_check"] = {
+        "passed": True,
+        "fatal_errors": [],
+        "warnings": ["场景收窄"],
+        "risk_tags": ["scenario_narrowing_warning"],
+    }
+
+    fatal_selected, fatal_invalid = select_candidates([fatal])
+    warning_selected, warning_invalid = select_candidates([warning])
+
+    assert selection(fatal_selected[0])["selected"] is False
+    assert selection(fatal_selected[0])["selection_status"] == "no_candidate_passed_difficulty_gain"
+    assert fatal_invalid[0]["candidate_flow"] == "hard_reject"
+    assert selection(warning_selected[0])["candidate_flow"] == "main_chain_candidate"
+    assert selection(warning_selected[0])["light_factual_warning_count"] == 1
+    assert selection(warning_selected[0])["selection_score"] < 0.86
+    assert warning_invalid == []
+
+
+def test_template_risk_is_soft_penalty_and_rubric_risk_is_report_only():
+    base = make_candidate("flow-template-soft", "base", "clear_gain", passed=True, score=0.86)
+    high = make_candidate("flow-template-soft", "high", "clear_gain", passed=True, score=0.86)
+    high["difficulty_gain_validation"]["template_affordance_risk"] = "high"
+    high["difficulty_gain_validation"]["rubric_shortcut_risk"] = "high"
+
+    selected, invalid_cases = select_candidates([base, high])
+    chosen = selection(selected[0])
+    rejected = chosen["rejected_candidates"][0]
+
+    assert chosen["selected_candidate_id"] == "flow-template-soft::base"
+    assert rejected["template_affordance_risk"] == "high"
+    assert rejected["rubric_shortcut_risk"] == "high"
+    assert invalid_cases == []
+
+
 def test_exploration_budget_is_one_per_group_and_five_per_round_by_default():
     records = [
         make_candidate(f"flow-budget-{i}", "cand", "weak_gain", score=0.64)
@@ -193,5 +237,7 @@ if __name__ == "__main__":
     test_no_gain_passes_through_without_invalid_memory_when_it_has_no_exploration_value()
     test_no_gain_with_value_can_enter_exploration_but_hard_risk_still_rejects()
     test_hard_labels_and_template_simplification_are_rejected()
+    test_light_factual_fatal_errors_hard_reject_and_warnings_only_penalize()
+    test_template_risk_is_soft_penalty_and_rubric_risk_is_report_only()
     test_exploration_budget_is_one_per_group_and_five_per_round_by_default()
     print("candidate flow split checks passed")

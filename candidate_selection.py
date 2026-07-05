@@ -1,11 +1,13 @@
 import argparse
 import json
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 RISK_SCORE = {"low": 0, "medium": -5, "high": -25}
+TEMPLATE_RISK_PENALTIES = {"medium": 0.05, "high": 0.10}
+LIGHT_FACTUAL_WARNING_PENALTY = 0.05
 DIFFICULTY_GAIN_HARD_REJECT_TAGS = {
     "missing_premise_named",
     "conclusion_hint_revealed",
@@ -161,6 +163,11 @@ def difficulty_gain_validation(item: Dict[str, Any]) -> Dict[str, Any]:
     return result if isinstance(result, dict) else {}
 
 
+def light_factual_check(item: Dict[str, Any]) -> Dict[str, Any]:
+    result = item.get("light_factual_check")
+    return result if isinstance(result, dict) else {"passed": True, "fatal_errors": [], "warnings": [], "risk_tags": []}
+
+
 def normalized_difficulty_gain_label(validation: Dict[str, Any]) -> str:
     label = _clean_text(validation.get("difficulty_gain_label"))
     return DIFFICULTY_GAIN_LABEL_ALIASES.get(label, label)
@@ -171,6 +178,51 @@ def difficulty_gain_risk_tags(validation: Dict[str, Any]) -> List[str]:
     if not isinstance(tags, list):
         return []
     return [_clean_text(tag) for tag in tags if _clean_text(tag)]
+
+
+def _first_field_value(sources: Sequence[Dict[str, Any]], field: str) -> Any:
+    for source in sources:
+        if isinstance(source, dict) and field in source:
+            return source.get(field)
+    return None
+
+
+def _candidate_generation(item: Dict[str, Any]) -> Dict[str, Any]:
+    generation = item.get("candidate_generation")
+    return generation if isinstance(generation, dict) else {}
+
+
+def _risk_level(value: Any) -> str:
+    text = _clean_text(value).lower()
+    return text if text in {"low", "medium", "high"} else ""
+
+
+def template_affordance_risk(item: Dict[str, Any], validation: Optional[Dict[str, Any]] = None) -> str:
+    validation = validation if isinstance(validation, dict) else difficulty_gain_validation(item)
+    value = _first_field_value(
+        [validation, validation_result(item), _candidate_generation(item), _metadata(item), item],
+        "template_affordance_risk",
+    )
+    return _risk_level(value)
+
+
+def rubric_shortcut_risk(item: Dict[str, Any], validation: Optional[Dict[str, Any]] = None) -> str:
+    validation = validation if isinstance(validation, dict) else difficulty_gain_validation(item)
+    value = _first_field_value(
+        [validation, validation_result(item), _candidate_generation(item), _metadata(item), item],
+        "rubric_shortcut_risk",
+    )
+    return _risk_level(value)
+
+
+def light_factual_fatal_errors(item: Dict[str, Any]) -> List[str]:
+    errors = light_factual_check(item).get("fatal_errors", [])
+    return [_clean_text(error) for error in errors if _clean_text(error)] if isinstance(errors, list) else []
+
+
+def light_factual_warnings(item: Dict[str, Any]) -> List[str]:
+    warnings = light_factual_check(item).get("warnings", [])
+    return [_clean_text(warning) for warning in warnings if _clean_text(warning)] if isinstance(warnings, list) else []
 
 
 def has_hard_risk(validation: Dict[str, Any]) -> bool:
@@ -343,6 +395,17 @@ def candidate_flow_info(
             "score_cap": None,
         }
 
+    factual_errors = light_factual_fatal_errors(item)
+    if factual_errors:
+        return {
+            "candidate_flow": "hard_reject",
+            "selection_status": "hard_reject_light_factual_check",
+            "reason": "light_factual_check fatal errors: " + "; ".join(factual_errors[:3]),
+            "difficulty_gain_label": "",
+            "risk_tags": light_factual_check(item).get("risk_tags", []),
+            "score_cap": None,
+        }
+
     difficulty_validation = difficulty_gain_validation(item)
     if not difficulty_validation:
         if allow_missing_difficulty_gain:
@@ -502,12 +565,23 @@ def score_candidate(item: Dict[str, Any], *, allow_missing_difficulty_gain: bool
     elif probe_score == 0.5:
         reasons.append("weak probe not enabled")
 
+    warnings = light_factual_warnings(item)
+    if warnings:
+        selection_score -= LIGHT_FACTUAL_WARNING_PENALTY
+        reasons.append(f"light_factual_check warning penalty -{LIGHT_FACTUAL_WARNING_PENALTY:.2f}")
+
+    template_risk = template_affordance_risk(item, difficulty_validation)
+    template_penalty = TEMPLATE_RISK_PENALTIES.get(template_risk, 0.0)
+    if template_penalty:
+        selection_score -= template_penalty
+        reasons.append(f"template_affordance_risk={template_risk} penalty -{template_penalty:.2f}")
+
     score_cap = flow.get("score_cap")
     if isinstance(score_cap, float):
         selection_score = min(selection_score, score_cap)
         reasons.append(f"exploration score cap {flow.get('difficulty_gain_label')}<={score_cap:.2f}")
 
-    return round(selection_score, 4), reasons
+    return round(max(0.0, selection_score), 4), reasons
 
 
 def build_rejected_candidate(item: Dict[str, Any], fallback_index: int, *, forced_reason: Optional[str] = None) -> Dict[str, Any]:
@@ -525,6 +599,15 @@ def build_rejected_candidate(item: Dict[str, Any], fallback_index: int, *, force
     }
     if difficulty_validation:
         rejected["difficulty_gain_validation"] = difficulty_validation
+    check = light_factual_check(item)
+    if check:
+        rejected["light_factual_check"] = check
+    template_risk = template_affordance_risk(item, difficulty_validation)
+    if template_risk:
+        rejected["template_affordance_risk"] = template_risk
+    rubric_risk = rubric_shortcut_risk(item, difficulty_validation)
+    if rubric_risk:
+        rejected["rubric_shortcut_risk"] = rubric_risk
     return rejected
 
 
@@ -555,6 +638,15 @@ def build_invalid_case(item: Dict[str, Any], fallback_index: int, *, reason: Opt
     if difficulty_validation:
         invalid_case["difficulty_gain_validation"] = difficulty_validation
         invalid_case["risk_tags"] = difficulty_validation.get("risk_tags", [])
+    check = light_factual_check(item)
+    if check:
+        invalid_case["light_factual_check"] = check
+    template_risk = template_affordance_risk(item, difficulty_validation)
+    if template_risk:
+        invalid_case["template_affordance_risk"] = template_risk
+    rubric_risk = rubric_shortcut_risk(item, difficulty_validation)
+    if rubric_risk:
+        invalid_case["rubric_shortcut_risk"] = rubric_risk
     failure_memory = item.get("failure_memory_candidate")
     if isinstance(failure_memory, dict):
         invalid_case["failure_memory_candidate"] = failure_memory
@@ -661,6 +753,9 @@ def _selection_record(
         "difficulty_gain_score": difficulty_validation.get("difficulty_gain_score"),
         "difficulty_gain_label": difficulty_validation.get("difficulty_gain_label"),
         "risk_tags": difficulty_validation.get("risk_tags", []),
+        "light_factual_warning_count": len(light_factual_warnings(record)),
+        "template_affordance_risk": template_affordance_risk(record, difficulty_validation) or None,
+        "rubric_shortcut_risk": rubric_shortcut_risk(record, difficulty_validation) or None,
         "weak_probe_used": bool(
             isinstance(difficulty_validation.get("weak_probe"), dict)
             and difficulty_validation["weak_probe"].get("enabled")
@@ -899,6 +994,61 @@ def select_candidates(
     return selected_records, invalid_cases
 
 
+def generate_report(
+    input_records: Sequence[Dict[str, Any]],
+    selected_records: Sequence[Dict[str, Any]],
+    invalid_cases: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    template_distribution: Counter = Counter()
+    rubric_distribution: Counter = Counter()
+    light_factual_fatal_count = 0
+    light_factual_warning_count = 0
+    for record in input_records:
+        check = light_factual_check(record)
+        if light_factual_fatal_errors(record):
+            light_factual_fatal_count += 1
+        if light_factual_warnings(record):
+            light_factual_warning_count += 1
+        template_distribution[template_affordance_risk(record) or "missing"] += 1
+        rubric_distribution[rubric_shortcut_risk(record) or "missing"] += 1
+
+    main_selected = 0
+    exploration_selected = 0
+    scoring_entries = 0
+    for record in selected_records:
+        selection = record.get("candidate_selection")
+        selection = selection if isinstance(selection, dict) else {}
+        if selection.get("selected") is True or selection.get("selected_for_exploration") is True:
+            scoring_entries += 1
+        if selection.get("candidate_flow") == "main_chain_candidate" and selection.get("selected") is True:
+            main_selected += 1
+        if selection.get("selected_for_exploration") is True:
+            exploration_selected += 1
+
+    selected_total = len(selected_records)
+    return {
+        "total_candidates": len(input_records),
+        "selected_record_count": selected_total,
+        "invalid_case_count": len(invalid_cases),
+        "light_factual_fatal_count": light_factual_fatal_count,
+        "light_factual_warning_count": light_factual_warning_count,
+        "template_affordance_risk_distribution": dict(sorted(template_distribution.items())),
+        "rubric_shortcut_risk_distribution": dict(sorted(rubric_distribution.items())),
+        "main_chain_selection_rate": round(main_selected / selected_total, 4) if selected_total else 0.0,
+        "exploration_selection_rate": round(exploration_selected / selected_total, 4) if selected_total else 0.0,
+        "any_scoring_entry_rate": round(scoring_entries / selected_total, 4) if selected_total else 0.0,
+    }
+
+
+def write_json(data: Dict[str, Any], output_path: str) -> None:
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Select one validated evolved-question candidate per sample.")
     parser.add_argument("--input", required=True, help="Input validated candidate JSON/JSONL path.")
@@ -924,6 +1074,7 @@ def parse_args() -> argparse.Namespace:
         default=MAX_EXPLORATION_CANDIDATES_PER_ROUND,
         help="Maximum weak/manual/no-gain exploration candidates selected in one round.",
     )
+    parser.add_argument("--report-output", default=None, help="Optional candidate-selection report JSON path.")
     return parser.parse_args()
 
 
@@ -938,6 +1089,8 @@ def main() -> None:
     write_jsonl(selected, args.output)
     if invalid_cases and not args.no_invalid_output:
         write_jsonl(invalid_cases, args.invalid_output, append=True)
+    if args.report_output:
+        write_json(generate_report(records, selected, invalid_cases), args.report_output)
 
 
 if __name__ == "__main__":

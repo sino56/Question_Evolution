@@ -45,6 +45,16 @@
         "type": "string"
       }
     },
+    "light_factual_warning_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "template_affordance_risk": {
+      "type": ["string", "null"]
+    },
+    "rubric_shortcut_risk": {
+      "type": ["string", "null"]
+    },
     "selection_reason": {
       "type": "string"
     },

@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from select_evolution_candidates import (
@@ -50,6 +51,26 @@ SIGNATURE_FIELDS = (
     "problem_shape",
     "candidate_overscore_cause",
 )
+try:
+    FAILURE_MEMORY_WINDOW_ROUNDS = int(os.getenv("FAILURE_MEMORY_WINDOW_ROUNDS", "3"))
+except ValueError:
+    FAILURE_MEMORY_WINDOW_ROUNDS = 3
+FAILURE_MEMORY_WINDOW_ROUNDS = max(1, FAILURE_MEMORY_WINDOW_ROUNDS)
+
+OPERATOR_SURFACE_FORM_FAMILY = {
+    O1_GAP_CHOICE: "evidence_relation_comparison",
+    O2_SUBCLAIM_LOCALIZATION: "fact_conclusion_support_review",
+    O3_STEP_JUMP: "step_jump_review",
+    O4_NEAR_LEVEL_RANKING: "near_level_comparison",
+    O5_EXTRA_PREMISE_DETECTION: "external_premise_review",
+    O6_SINGLE_VARIABLE_COUNTERFACTUAL: "counterfactual_boundary",
+    O7_FACT_BINDING_CONSTRAINT: "fact_binding_review",
+    O8_DOUBLE_THRESHOLD_CLAIM: "conclusion_strength_boundary",
+    O9_ABNORMAL_CLUE_MAINLINE_SWITCH: "abnormal_mainline_switch",
+}
+FAILURE_MEMORY_WARN_THRESHOLD = 1
+FAILURE_MEMORY_DOWNRANK_THRESHOLD = 2
+FAILURE_MEMORY_AVOID_THRESHOLD = 3
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
@@ -109,6 +130,14 @@ def _normalize_operator(value: Any) -> Optional[str]:
     return text if text in OPERATOR_IDS else None
 
 
+def _read_nonnegative_round(value: Any) -> Optional[int]:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
 def get_evolution_action(item: Dict[str, Any]) -> str:
     return _clean_text(item.get("evolution_action"))
 
@@ -145,6 +174,186 @@ def build_sample_signature(item: Dict[str, Any]) -> Dict[str, str]:
         "problem_shape": _clean_text(profile.get("problem_shape")),
         "candidate_overscore_cause": _clean_text(diagnosis.get("candidate_overscore_cause")),
     }
+
+
+def _sample_signature_from_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    signature = record.get("sample_signature")
+    return signature if isinstance(signature, dict) else {}
+
+
+def _round_value(item: Dict[str, Any]) -> Optional[int]:
+    direct = _read_nonnegative_round(item.get("round"))
+    if direct is not None:
+        return direct
+    state = item.get("evolution_state")
+    if isinstance(state, dict):
+        return _read_nonnegative_round(state.get("round"))
+    return None
+
+
+def _record_round(record: Dict[str, Any]) -> Optional[int]:
+    return _read_nonnegative_round(record.get("round"))
+
+
+def _operator_from_failure_record(record: Dict[str, Any]) -> Optional[str]:
+    for field in ("operator_used", "operator_id", "candidate_operator"):
+        operator = _normalize_operator(record.get(field))
+        if operator:
+            return operator
+    return None
+
+
+def _surface_form_from_record(record: Dict[str, Any], operator: Optional[str] = None, *, use_operator_fallback: bool = True) -> str:
+    for field in ("surface_form_family", "question_surface_form"):
+        value = _clean_text(record.get(field))
+        if value:
+            return value
+    generation = record.get("candidate_generation")
+    if isinstance(generation, dict):
+        for field in ("surface_form_family", "question_surface_form"):
+            value = _clean_text(generation.get(field))
+            if value:
+                return value
+    metadata = record.get("meta_info")
+    if isinstance(metadata, dict):
+        metadata = metadata.get("question_evolution_metadata")
+        if isinstance(metadata, dict):
+            for field in ("surface_form_family", "question_surface_form"):
+                value = _clean_text(metadata.get(field))
+                if value:
+                    return value
+    if operator and use_operator_fallback:
+        return OPERATOR_SURFACE_FORM_FAMILY.get(operator, "unknown")
+    return "unknown"
+
+
+def _failure_type_from_record(record: Dict[str, Any]) -> str:
+    for field in ("failure_type", "effect_label"):
+        value = _clean_text(record.get(field))
+        if value:
+            return value
+    effect = record.get("effect_analysis")
+    if isinstance(effect, dict):
+        return _clean_text(effect.get("effect_label"))
+    return ""
+
+
+def _same_signature(left: Dict[str, Any], right: Dict[str, Any], *, min_similarity: float = 0.75) -> bool:
+    return signature_similarity(left, right) >= min_similarity
+
+
+def build_failure_memory_actions(
+    item: Dict[str, Any],
+    failure_memory: Sequence[Dict[str, Any]],
+    *,
+    window_rounds: int = FAILURE_MEMORY_WINDOW_ROUNDS,
+) -> Dict[str, List[Dict[str, Any]]]:
+    signature = build_sample_signature(item)
+    current_round = _round_value(item)
+    min_round = current_round - window_rounds + 1 if current_round is not None else None
+    grouped: Counter = Counter()
+
+    for record in failure_memory:
+        memory_signature = _sample_signature_from_record(record)
+        if not memory_signature or not _same_signature(signature, memory_signature):
+            continue
+        memory_round = _record_round(record)
+        if min_round is not None and memory_round is not None and memory_round < min_round:
+            continue
+        operator = _operator_from_failure_record(record)
+        if not operator:
+            continue
+        surface_form = _surface_form_from_record(record, operator, use_operator_fallback=False)
+        failure_type = _failure_type_from_record(record)
+        if not surface_form or surface_form == "unknown" or not failure_type:
+            continue
+        grouped[(operator, surface_form, failure_type)] += 1
+
+    warnings: List[Dict[str, Any]] = []
+    downrank: List[Dict[str, Any]] = []
+    avoid: List[Dict[str, Any]] = []
+    for (operator, surface_form, failure_type), count in sorted(grouped.items()):
+        entry = {
+            "operator_used": operator,
+            "surface_form_family": surface_form,
+            "failure_type": failure_type,
+            "failure_count": count,
+            "reason": "repeated_negative_gain",
+        }
+        if count >= FAILURE_MEMORY_AVOID_THRESHOLD:
+            avoid.append({**entry, "action": "avoid"})
+        elif count >= FAILURE_MEMORY_DOWNRANK_THRESHOLD:
+            downrank.append({**entry, "action": "downrank"})
+        elif count >= FAILURE_MEMORY_WARN_THRESHOLD:
+            warnings.append({**entry, "action": "warn_only"})
+
+    return {
+        "memory_warnings": warnings,
+        "downrank_operator_surface_forms": downrank,
+        "avoid_operator_surface_forms": avoid,
+    }
+
+
+def _matches_operator_surface(action: Dict[str, Any], operator: Optional[str]) -> bool:
+    if not operator:
+        return False
+    return (
+        _clean_text(action.get("operator_used")) == operator
+        and _clean_text(action.get("surface_form_family")) == OPERATOR_SURFACE_FORM_FAMILY.get(operator, "unknown")
+    )
+
+
+def _apply_surface_form_memory_actions(
+    primary: Optional[str],
+    backups: List[str],
+    memory_actions: Dict[str, List[Dict[str, Any]]],
+) -> Tuple[Optional[str], List[str], List[str]]:
+    reason_parts: List[str] = []
+    avoid_actions = memory_actions.get("avoid_operator_surface_forms", [])
+    downrank_actions = memory_actions.get("downrank_operator_surface_forms", [])
+
+    candidates: List[str] = []
+    _append_unique(candidates, [primary])
+    _append_unique(candidates, backups)
+
+    avoid_pairs = [action for action in avoid_actions if _clean_text(action.get("operator_used"))]
+    if primary and any(_matches_operator_surface(action, primary) for action in avoid_pairs):
+        replacement = next(
+            (
+                operator
+                for operator in candidates
+                if operator != primary and not any(_matches_operator_surface(action, operator) for action in avoid_pairs)
+            ),
+            None,
+        )
+        if replacement:
+            reason_parts.append(
+                f"failure memory avoids surface form {OPERATOR_SURFACE_FORM_FAMILY.get(primary, 'unknown')} for {primary}; using {replacement}."
+            )
+            candidates = [replacement] + [operator for operator in candidates if operator != replacement]
+            primary = replacement
+            backups = [
+                operator
+                for operator in candidates[1:]
+                if operator != primary and not any(_matches_operator_surface(action, operator) for action in avoid_pairs)
+            ]
+        else:
+            reason_parts.append(
+                f"failure memory marks {primary}+{OPERATOR_SURFACE_FORM_FAMILY.get(primary, 'unknown')} as avoid, but no safe backup exists."
+            )
+
+    if primary and any(_matches_operator_surface(action, primary) for action in downrank_actions):
+        replacement = next((operator for operator in backups if operator != primary), None)
+        if replacement:
+            reason_parts.append(
+                f"failure memory downranks surface form {OPERATOR_SURFACE_FORM_FAMILY.get(primary, 'unknown')} for {primary}; using {replacement} first."
+            )
+            backups = [operator for operator in backups if operator != replacement]
+            backups.append(primary)
+            primary = replacement
+
+    backups = _remove_values(backups, [primary] if primary else [])
+    return primary, backups, reason_parts
 
 
 def signature_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
@@ -316,6 +525,7 @@ def build_operator_route(
     operator_memory: Sequence[Dict[str, Any]] = (),
     failure_memory: Sequence[Dict[str, Any]] = (),
     full_score_threshold: float = 0.99,
+    failure_memory_window_rounds: int = FAILURE_MEMORY_WINDOW_ROUNDS,
 ) -> Dict[str, Any]:
     action = get_evolution_action(item)
     if action in NON_EVOLUTION_ACTIONS:
@@ -342,11 +552,11 @@ def build_operator_route(
     signature = build_sample_signature(item)
     operator_matches = find_memory_matches(signature, operator_memory)
     failure_matches = find_memory_matches(signature, failure_memory)
-
-    for match in failure_matches:
-        failed_operator = _normalize_operator(match.get("operator_used"))
-        if failed_operator:
-            _append_unique(avoid, [failed_operator])
+    failure_memory_actions = build_failure_memory_actions(
+        item,
+        failure_memory,
+        window_rounds=failure_memory_window_rounds,
+    )
 
     if operator_matches:
         memory_operator = _normalize_operator(operator_matches[0].get("operator_used"))
@@ -391,6 +601,13 @@ def build_operator_route(
         else:
             primary = O2_SUBCLAIM_LOCALIZATION if O2_SUBCLAIM_LOCALIZATION not in avoid else None
 
+    primary, backups, memory_action_reasons = _apply_surface_form_memory_actions(
+        primary,
+        backups,
+        failure_memory_actions,
+    )
+    reason_parts.extend(memory_action_reasons)
+
     consecutive_full = int(get_evolution_state(item).get("consecutive_full_score_count", 0) or 0)
     should_tree = (
         _is_high_value_sample(item)
@@ -405,6 +622,9 @@ def build_operator_route(
         "routing_reason": " ".join(reason_parts),
         "is_high_value_sample": _is_high_value_sample(item),
         "should_use_local_tree_search": should_tree,
+        "memory_warnings": failure_memory_actions["memory_warnings"],
+        "downrank_operator_surface_forms": failure_memory_actions["downrank_operator_surface_forms"],
+        "avoid_operator_surface_forms": failure_memory_actions["avoid_operator_surface_forms"],
         "memory_matches": {
             "operator": operator_matches[:3],
             "failure": failure_matches[:3],
@@ -418,6 +638,7 @@ def attach_operator_route(
     operator_memory: Sequence[Dict[str, Any]] = (),
     failure_memory: Sequence[Dict[str, Any]] = (),
     full_score_threshold: float = 0.99,
+    failure_memory_window_rounds: int = FAILURE_MEMORY_WINDOW_ROUNDS,
 ) -> Dict[str, Any]:
     result = dict(item)
     result["operator_route"] = build_operator_route(
@@ -425,6 +646,7 @@ def attach_operator_route(
         operator_memory=operator_memory,
         failure_memory=failure_memory,
         full_score_threshold=full_score_threshold,
+        failure_memory_window_rounds=failure_memory_window_rounds,
     )
     return result
 
@@ -435,6 +657,7 @@ def route_records(
     operator_memory: Sequence[Dict[str, Any]] = (),
     failure_memory: Sequence[Dict[str, Any]] = (),
     full_score_threshold: float = 0.99,
+    failure_memory_window_rounds: int = FAILURE_MEMORY_WINDOW_ROUNDS,
 ) -> List[Dict[str, Any]]:
     return [
         attach_operator_route(
@@ -442,9 +665,43 @@ def route_records(
             operator_memory=operator_memory,
             failure_memory=failure_memory,
             full_score_threshold=full_score_threshold,
+            failure_memory_window_rounds=failure_memory_window_rounds,
         )
         for record in records
     ]
+
+
+def build_router_report(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    warn_count = 0
+    downrank_count = 0
+    avoid_count = 0
+    distribution: Counter = Counter()
+    for record in records:
+        route = record.get("operator_route")
+        route = route if isinstance(route, dict) else {}
+        warn_count += len(route.get("memory_warnings") or [])
+        downrank_count += len(route.get("downrank_operator_surface_forms") or [])
+        avoid_count += len(route.get("avoid_operator_surface_forms") or [])
+        for field in ("memory_warnings", "downrank_operator_surface_forms", "avoid_operator_surface_forms"):
+            for action in route.get(field) or []:
+                key = f"{_clean_text(action.get('operator_used'))}+{_clean_text(action.get('surface_form_family'))}+{_clean_text(action.get('failure_type'))}"
+                distribution[key] += 1
+    return {
+        "total_records": len(records),
+        "failure_memory_warn_only_count": warn_count,
+        "failure_memory_downrank_count": downrank_count,
+        "failure_memory_avoid_count": avoid_count,
+        "operator_surface_form_failure_distribution": dict(sorted(distribution.items())),
+    }
+
+
+def write_json(data: Dict[str, Any], output_path: str) -> None:
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -460,6 +717,13 @@ def parse_args() -> argparse.Namespace:
         default=0.99,
         help="Score-rate threshold used by no-repeat rules.",
     )
+    parser.add_argument(
+        "--failure-memory-window-rounds",
+        type=int,
+        default=FAILURE_MEMORY_WINDOW_ROUNDS,
+        help="Recent round window used for operator+surface-form failure memory convergence.",
+    )
+    parser.add_argument("--report-output", default=None, help="Optional operator-router memory action report JSON path.")
     return parser.parse_args()
 
 
@@ -473,8 +737,11 @@ def main() -> None:
         operator_memory=load_jsonl_if_exists(operator_memory_path),
         failure_memory=load_jsonl_if_exists(failure_memory_path),
         full_score_threshold=args.full_score_threshold,
+        failure_memory_window_rounds=max(1, args.failure_memory_window_rounds),
     )
     write_jsonl(routed, args.output)
+    if args.report_output:
+        write_json(build_router_report(routed), args.report_output)
 
 
 if __name__ == "__main__":

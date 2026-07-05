@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
 
 from analyze_evolution_effect import analyze_records, build_effect_matrix
 from candidate_selection import select_candidates
+from light_factual_check import process_records as attach_light_factual_checks
 from operator_router import route_records
 from profile_samples import ProfileProcessor
 from question_evolution import QuestionEvolutionProcessor
@@ -226,7 +227,10 @@ async def run_tiny_pipeline(exp_dir: Path):
     validated = [attach_validation_result(candidate) for candidate in candidates]
     write_jsonl(round1 / "validated_candidates.jsonl", validated)
 
-    difficulty_validated = validate_records_rule_only(validated)
+    factual_checked = attach_light_factual_checks(validated)
+    write_jsonl(round1 / "light_factual_checked_candidates.jsonl", factual_checked)
+
+    difficulty_validated = validate_records_rule_only(factual_checked)
     write_jsonl(round1 / "difficulty_validated_candidates.jsonl", difficulty_validated)
 
     evolved, invalid_cases = select_candidates(difficulty_validated)
@@ -278,6 +282,7 @@ def test_tiny_pipeline_writes_stage06_artifacts_without_external_api():
             "round_1/routed.jsonl",
             "round_1/candidates.jsonl",
             "round_1/validated_candidates.jsonl",
+            "round_1/light_factual_checked_candidates.jsonl",
             "round_1/difficulty_validated_candidates.jsonl",
             "round_1/evolved.jsonl",
             "round_1/with_answers.jsonl",
@@ -299,6 +304,7 @@ def test_tiny_pipeline_writes_stage06_artifacts_without_external_api():
         assert evolved[0]["question_evolved"] is True
         assert evolved[0]["candidate_selection"]["selected_operator"]
         assert evolved[0]["validation_result"]["passed"] is True
+        assert evolved[0]["light_factual_check"]["passed"] is True
         assert evolved[0]["difficulty_gain_validation"]["passed"] is True
         assert evolved[0]["candidate_selection"]["selection_status"] == "selected_after_difficulty_gain_validation"
 

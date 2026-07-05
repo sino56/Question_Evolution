@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from collections import Counter
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from analyze_evolution_effect import (
@@ -48,6 +49,17 @@ NEXT_OPERATOR_HINTS = {
     "O8_double_threshold_claim": ["O2_subclaim_localization", "O4_near_level_ranking"],
     "O9_abnormal_clue_mainline_switch": ["O6_single_variable_counterfactual", "O4_near_level_ranking"],
 }
+OPERATOR_SURFACE_FORM_FAMILY = {
+    "O1_gap_choice": "evidence_relation_comparison",
+    "O2_subclaim_localization": "fact_conclusion_support_review",
+    "O3_step_jump": "step_jump_review",
+    "O4_near_level_ranking": "near_level_comparison",
+    "O5_extra_premise_detection": "external_premise_review",
+    "O6_single_variable_counterfactual": "counterfactual_boundary",
+    "O7_fact_binding_constraint": "fact_binding_review",
+    "O8_double_threshold_claim": "conclusion_strength_boundary",
+    "O9_abnormal_clue_mainline_switch": "abnormal_mainline_switch",
+}
 
 
 def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str, *, append: bool = False) -> None:
@@ -94,6 +106,16 @@ def _validation(item: Dict[str, Any]) -> Dict[str, Any]:
 def _difficulty_gain_validation(item: Dict[str, Any]) -> Dict[str, Any]:
     validation = item.get("difficulty_gain_validation")
     return validation if isinstance(validation, dict) else {}
+
+
+def surface_form_family(item: Dict[str, Any], operator_used: str = "") -> str:
+    for source in (item, item.get("candidate_generation"), get_metadata(item)):
+        if isinstance(source, dict):
+            for field in ("surface_form_family", "question_surface_form"):
+                value = _clean_text(source.get(field))
+                if value:
+                    return value
+    return OPERATOR_SURFACE_FORM_FAMILY.get(operator_used, "unknown")
 
 
 def _previous_state(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -253,6 +275,7 @@ def build_operator_memory_entry(item: Dict[str, Any]) -> Dict[str, Any]:
     effect = _effect(item)
     metadata = get_metadata(item)
     confidence = _clean_text(effect.get("hit_confidence")) or "low"
+    operator_used = _clean_text(effect.get("operator_used"))
     reuse_note = "自动轻量命中，进入下一轮路由前建议人工复核。"
     if confidence == "low":
         reuse_note = "低置信命中，仅供人工复核和后续对照，不应沉淀为强成功经验。"
@@ -260,7 +283,8 @@ def build_operator_memory_entry(item: Dict[str, Any]) -> Dict[str, Any]:
         "sample_id": _sample_id(item),
         "round": _round_value(item, _previous_state(item)),
         "sample_signature": sample_signature(item),
-        "operator_used": _clean_text(effect.get("operator_used")),
+        "operator_used": operator_used,
+        "surface_form_family": surface_form_family(item, operator_used),
         "expected_qwen_failure": _clean_text(metadata.get("expected_qwen_failure")),
         "score_rate_before": effect.get("score_rate_before"),
         "score_rate_after": effect.get("score_rate_after"),
@@ -287,6 +311,7 @@ def build_failure_memory_entry(item: Dict[str, Any]) -> Dict[str, Any]:
         "round": _round_value(item, _previous_state(item)),
         "sample_signature": sample_signature(item),
         "operator_used": operator_used,
+        "surface_form_family": surface_form_family(item, operator_used),
         "score_rate_before": effect.get("score_rate_before"),
         "score_rate_after": effect.get("score_rate_after"),
         "failure_type": _clean_text(effect.get("effect_label")) or "operator_ineffective",
@@ -307,6 +332,7 @@ def build_invalid_generation_case(item: Dict[str, Any]) -> Dict[str, Any]:
         "sample_id": _sample_id(item),
         "round": _round_value(item, _previous_state(item)),
         "operator_used": _clean_text(effect.get("operator_used")),
+        "surface_form_family": surface_form_family(item, _clean_text(effect.get("operator_used"))),
         "invalid_type": _clean_text(validation.get("invalid_type")) or "invalid_complexity",
         "reason": _clean_text(validation.get("reject_reason")) or _clean_text(effect.get("lightweight_hit_reason")),
         "suggested_operator": suggested,
@@ -324,6 +350,7 @@ def normalize_preselection_invalid_case(item: Dict[str, Any]) -> Dict[str, Any]:
         "sample_id": _sample_id(item),
         "round": _round_value(item, {}),
         "operator_used": _clean_text(item.get("operator_used") or failure_memory.get("operator_id")),
+        "surface_form_family": _clean_text(item.get("surface_form_family") or failure_memory.get("surface_form_family")),
         "invalid_type": _clean_text(item.get("invalid_type") or difficulty_validation.get("difficulty_gain_label")) or "difficulty_gain_validation_failed",
         "reason": _clean_text(item.get("reason") or failure_memory.get("reject_reason") or difficulty_validation.get("reject_reason")),
         "suggested_operator": _clean_text(item.get("suggested_operator") or failure_memory.get("recommended_retry_strategy")),
@@ -347,6 +374,11 @@ def build_preselection_failure_memory_entry(item: Dict[str, Any]) -> Dict[str, A
         "round": normalized["round"],
         "sample_signature": normalized.get("sample_signature", {}),
         "operator_used": _clean_text(failure_memory.get("operator_id") or normalized.get("operator_used")),
+        "surface_form_family": _clean_text(
+            failure_memory.get("surface_form_family")
+            or normalized.get("surface_form_family")
+            or OPERATOR_SURFACE_FORM_FAMILY.get(_clean_text(failure_memory.get("operator_id") or normalized.get("operator_used")), "unknown")
+        ),
         "score_rate_before": None,
         "score_rate_after": None,
         "failure_type": _clean_text(failure_memory.get("failure_type") or normalized.get("invalid_type")),
@@ -394,6 +426,29 @@ def classify_memory_entries(
     return operator_entries, failure_entries, invalid_entries
 
 
+def generate_report(
+    updated_records: Sequence[Dict[str, Any]],
+    operator_entries: Sequence[Dict[str, Any]],
+    failure_entries: Sequence[Dict[str, Any]],
+    invalid_entries: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    failure_distribution: Counter = Counter()
+    for entry in failure_entries:
+        key = (
+            f"{_clean_text(entry.get('operator_used'))}+"
+            f"{_clean_text(entry.get('surface_form_family'))}+"
+            f"{_clean_text(entry.get('failure_type'))}"
+        )
+        failure_distribution[key] += 1
+    return {
+        "updated_record_count": len(updated_records),
+        "operator_memory_write_count": len(operator_entries),
+        "failure_memory_write_count": len(failure_entries),
+        "invalid_memory_write_count": len(invalid_entries),
+        "operator_surface_form_failure_distribution": dict(sorted(failure_distribution.items())),
+    }
+
+
 def update_records(records: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     updated = [attach_next_state(record) for record in records]
     operator_entries, failure_entries, invalid_entries = classify_memory_entries(records)
@@ -419,6 +474,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional candidate_selection invalid_generation_cases.jsonl to append into memory banks.",
     )
+    parser.add_argument("--report-output", default=None, help="Optional state-update memory report JSON path.")
     parser.add_argument("--no-memory-output", action="store_true", help="Do not append memory-bank entries.")
     return parser.parse_args()
 
@@ -433,6 +489,13 @@ def main() -> None:
         failure_entries.extend(preselection_failure_entries)
         invalid_entries.extend(preselection_invalid_entries)
     write_jsonl(updated, args.output)
+    if args.report_output:
+        output_dir = os.path.dirname(os.path.abspath(args.report_output))
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        with open(args.report_output, "w", encoding="utf-8") as f:
+            json.dump(generate_report(updated, operator_entries, failure_entries, invalid_entries), f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
 
     if args.no_memory_output:
         return
