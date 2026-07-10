@@ -272,6 +272,10 @@ python update_sample_state.py --input effect_analysis.jsonl --output state_updat
 
 使用环境变量或本地忽略配置文件保存真实配置。分享日志前应隐藏私有 prompt、模型答案、API 报错和密钥信息。
 
+### 11.1 失败输出
+
+`question_evolution.py`、`collect_answers.py`、`gen_rubric.py` 和 `scoring.py` 写入 `*.failed` 后必须以非零状态退出；编排脚本不得让不完整的正式输出进入下一阶段。相同 prompt 的不同样本必须按 `sample_id` 分别保留，不能随机去重。
+
 ## 12. 提交要求
 
 提交信息使用清晰格式，例如：

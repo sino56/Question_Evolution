@@ -7,16 +7,14 @@
 ---
 
 ## 1. 整体流程
-'''
-后续优化：
-1. 当前项目已经实现了“链式主流程 + 单轮局部多候选探索 + 候选选优”，这可以算局部树状探索的第一版；但还没有实现“多层树展开、节点回溯、分支持续搜索”的完整树搜索。
-2. 当前项目是“只要系统判断这个样本已经形成有效边界，或者不值得再进化，就停止继续改题；停止之后，会以透传方式进入下一轮，并复用上一轮评分结果”。进一步优化方向：docs/树状搜索与回溯式多边界探索改造方案.md
-'''
+
+> 当前实现是“跨轮链式主流程 + 单轮局部多候选探索 + 候选选优”，并非完整多层树搜索。形成有效边界或终止状态的样本会在后续轮次透传并复用已有评分结果。
+
 当前推荐主流程由 `run_loop.sh` 编排，入口是已完成准入的
-`data.jsonl`。脚本仍保留旧输入回退，但正式实验应显式使用准入样本。
+`data/data.jsonl`。每次执行都会创建新的实验目录。
 
 ```text
-Stage 0: data.jsonl
+Stage 0: data/data.jsonl
 Stage 1: scoring.py -> round_0/scored.jsonl
 Stage 2: profile_samples.py -> select_evolution_candidates.py
 Stage 3: operator_router.py -> question_evolution.py
@@ -29,7 +27,7 @@ Stage 5: collect_answers.py -> gen_rubric.py -> scoring.py
 
 | 步骤 | 脚本 | 产物 |
 | --- | --- | --- |
-| 0 | 复制上一轮 scored/state 输入 | `round_N/input.jsonl` |
+| 0 | 准备上一轮 scored/state 输入并写入当前 `round` | `round_N/input.jsonl` |
 | 1 | `profile_samples.py` | `profiled.jsonl` |
 | 2 | `select_evolution_candidates.py` | `profiled_candidates.jsonl` |
 | 3 | `operator_router.py` | `routed.jsonl` |
@@ -45,10 +43,15 @@ Stage 5: collect_answers.py -> gen_rubric.py -> scoring.py
 
 `question_evolution.py` 的 legacy 单脚本路径仍可用于兼容旧数据或局部调试，但不再是推荐主流程。推荐路径必须经过画像、分流、路由、复杂度/可回答性校验、难度收益验证、候选选择、效果统计和状态更新。
 
+`question_evolution.py`、`collect_answers.py`、`gen_rubric.py` 和 `scoring.py`
+会把单条失败详情写入对应的 `.failed` 文件，并在本阶段结束后返回非零状态；
+`run_loop.sh` 会立即停止，不允许缺失样本的部分输出继续进入下一阶段。
+Rubric 阶段按样本逐条处理，即使多个样本的 prompt 相同也不会随机删除记录。
+
 ### 流程图
 ```text
 Stage 0 输入
-  data.jsonl
+  data/data.jsonl
         |
         v
 Round 0 baseline
@@ -72,7 +75,7 @@ Round N 输入
         |                              |
         | 不需要进化                   | 需要进化
         | pass_through / stop          | high-score overscore /
-        |                              | low-score boundary reconstruct
+        |                              | low-score reconstruct / middle-score probe
         v                              v
   保留原题                       operator_router.py
   question_evolved=false         -> 选择 primary / backup / avoid operators
@@ -148,7 +151,7 @@ Round N 输入
 | --- | --- | --- | --- |
 | `scoring.py` | 调用候选模型生成答案，并用评分模型按 rubric 打分 | `*.jsonl` | `*_scored.jsonl` |
 | `profile_samples.py` | 生成样本画像和虚高诊断 | `*_scored.jsonl` | `profiled.jsonl` |
-| `select_evolution_candidates.py` | 输出 `evolution_action`，区分进化、低分重构、透传和停止 | `profiled.jsonl` | `profiled_candidates.jsonl` |
+| `select_evolution_candidates.py` | 输出 `evolution_action`，区分高分进化、低分重构、中分探测、透传和停止 | `profiled.jsonl` | `profiled_candidates.jsonl` |
 | `operator_router.py` | 根据画像、状态和 memory 选择 operator | `profiled_candidates.jsonl` | `routed.jsonl` |
 | `question_evolution.py` | 按 operator 生成 1-4 个候选题，支持 validate-retry | `routed.jsonl` | `candidates.jsonl` |
 | `validate_evolved_question.py` | 校验复杂度、可回答性、重复题型和格式风险 | `candidates.jsonl` | `validated_candidates.jsonl` |
@@ -167,7 +170,7 @@ Round N 输入
 
 ### 2.1 阶段 0：原始数据
 
-推荐入口是 `admitted_seed_samples.jsonl`，每行至少包含：
+默认入口是 `data/data.jsonl`，每行至少包含：
 
 ```json
 {
@@ -273,7 +276,17 @@ score_rate = scoring_result.total_awarded / scoring_result.total_possible
 5. `validate_evolved_question.py`：新增 `validation_result`，可包含 LLM/mock 校验字段 `main_axis_clear`、`answerable`、`external_knowledge_required`、`repeated_pattern_with_previous_round`、`format_difficulty_dominant`。
 6. `candidate_selection.py`：在选中记录上新增 `candidate_selection`。
 
+`evolution_action` 共有五类：`evolve_high_score_overscore`、
+`reconstruct_low_score_boundary`、`probe_middle_score_boundary`、
+`pass_through_or_scoring_noise` 和 `stop_evolution`。跨轮状态中的
+`recommended_next_methods`、`rollback_and_reroute` 与局部探索状态优先于当前分数区间，
+避免中间分样本或待换算子的样本被意外透传。
+
 `question_evolution.py` 在需要进化时会把原 `prompt` 移到 `meta_info.prompt_old`，并把旧 `rubric` / `score_prompt` / `scoring_result` 移到 `meta_info.stale_*`；透传样本会保留 `question_evolved=false`。
+
+实现还会写入一层 `meta_info.parent_snapshot`。当所有候选均无效或进化后分数反而升高时，
+流水线据此恢复直接父题的 prompt、reference、rubric、score prompt、评分结果与得分率，
+并在下一轮避开失败算子重新路由；它不会保存或遍历多层祖先分支。
 
 > 为什么要把 rubric/score_prompt/scoring_result 移走？因为 `prompt` 变了，旧的 rubric 和评分结果已经失效，必须重新生成。
 
@@ -348,7 +361,7 @@ score_rate = scoring_result.total_awarded / scoring_result.total_possible
 }
 ```
 
-注意：`collect_answers.py` 的输出只保留 `index`、`prompt`、`meta_info` 三个顶层字段。原来的顶层 `rubric`、`score_prompt`、`scoring_result`、`question_evolved` 会被丢弃（但 `meta_info` 里的历史信息会保留）。
+注意：`collect_answers.py` 保留整条 pipeline record，只更新 `meta_info.references`，并移除采样过程的临时字段。`question_evolved=false` 的透传样本不会重新采集答案。
 
 ---
 
@@ -414,7 +427,7 @@ score_rate = scoring_result.total_awarded / scoring_result.total_possible
 | `scoring_result` | 无 | 新增 | 保留 | 进化题移入 stale | 重新生成 | ✓ |
 | `effect_analysis` / `evolution_state` | 无 | 无 | 可继承上一轮 | 可继承上一轮 | 无 | 新增 |
 
-> 注：标准闭环脚本可能只保留部分顶层字段；需要跨阶段稳定消费的进化信息应读取 `meta_info.question_evolution_metadata`、`validation_result`、`candidate_selection`、`effect_analysis` 和 `evolution_state`。
+> 注：标准闭环脚本保留 pipeline record 的跨阶段字段；进化元数据、候选选择、效果分析和状态更新分别位于 `meta_info.question_evolution_metadata`、`candidate_selection`、`effect_analysis` 和 `evolution_state`。
 
 ---
 
@@ -489,7 +502,7 @@ bash run_loop.sh
 ```text
 experiments/YYYY-MM-DD/exp/
 ├── round_0/
-│   ├── input.jsonl       # 初始输入（从 admitted_seed_samples.jsonl 复制）
+│   ├── input.jsonl       # 初始输入（从 data/data.jsonl 复制并写入 round=0）
 │   └── scored.jsonl      # 初始 baseline 评分结果
 ├── round_1/
 │   ├── input.jsonl
@@ -526,7 +539,7 @@ Round | Avg Score Rate | Status
     2 |         0.4532 | early_stop
 ```
 
-脚本也支持**断点续跑**：如果某轮的 `scored.jsonl` 已存在且非空，则跳过该轮执行，直接读取已有结果进行评估。因此即使中途中断，也可以直接重新运行 `bash run_loop.sh` 继续。
+每次执行都会新建一个 `exp/expN` 目录，不以既有实验目录作为断点续跑目标。若任一 API 阶段存在失败记录，脚本会保留对应 `*.failed` 文件并以非零状态退出；由于 `run_loop.sh` 启用 `set -e`，该次实验不会继续使用不完整产物。
 
 #### 修改循环参数
 
@@ -546,7 +559,7 @@ VALIDATION_RETRIES=1
 ```bash
 # Round 0：baseline 评分
 python scoring.py \
-  --input admitted_seed_samples.jsonl \
+  --input data/data.jsonl \
   --output round_0_scored.jsonl \
   --answer-mode llm \
   --answer-base-url "$QWEN_BASE_URL" \

@@ -45,14 +45,14 @@ class FakeEvolutionClient:
     async def chat_completions_create(self, **kwargs):
         self.calls.append(kwargs)
         prompt = kwargs["messages"][0]["content"]
-        if "O2_subclaim_localization" in prompt:
-            operator = "O2"
+        if "O15_counterfactual_threshold_shift" in prompt:
+            operator = "O15"
             evolved_prompt = (
                 "请只围绕原题结论中的一个子判断作答：现有题干事实已经支持哪一层，"
                 "哪一层仍缺少独立必要事实？请先说明不能成立的具体子判断，再说明最少还缺哪一类事实。"
             )
         else:
-            operator = "O1"
+            operator = "O13"
             evolved_prompt = (
                 "请在原题事实基础上比较两个候选补充事实：A 是否直接决定结论成立，B 是否只是旁证。"
                 "若只能补充一项，哪一项才是最小关键事实？请说明另一个为什么不能单独支撑结论。"
@@ -109,7 +109,7 @@ class FakeValidateRetryClient:
         )
 
 
-def make_candidate(sample_id, candidate_id, prompt, validation=None, *, operator="O1_gap_choice"):
+def make_candidate(sample_id, candidate_id, prompt, validation=None, *, operator="O13_minimal_disqualifier"):
     record = {
         "sample_id": sample_id,
         "candidate_group_id": sample_id,
@@ -184,8 +184,8 @@ def test_question_evolution_can_emit_primary_and_backup_candidates():
 
     assert len(candidates) == 2
     assert [candidate["candidate_operator"] for candidate in candidates] == [
-        "O1_gap_choice",
-        "O2_subclaim_localization",
+        "O13_minimal_disqualifier",
+        "O15_counterfactual_threshold_shift",
     ]
     assert all(candidate["candidate_id"] for candidate in candidates)
     assert len(fake_client.calls) == 2
@@ -208,7 +208,7 @@ def test_validate_retry_reuses_operator_and_includes_reject_reason():
     metadata = evolved["meta_info"]["question_evolution_metadata"]
 
     assert len(fake_client.calls) == 2
-    assert metadata["operator_used"] == "O1_gap_choice"
+    assert metadata["operator_used"] == "O13_minimal_disqualifier"
     assert metadata["validation_retry"]["attempts"] == 1
     assert "完全相同" in metadata["validation_retry"]["first_reject_reason"]
 
@@ -248,8 +248,8 @@ def test_dynamic_candidate_budget_allocates_more_to_priority_samples():
             "scoring_result": {"candidate_answer": "候选答案。", "total_awarded": 9, "total_possible": 10},
             "evolution_action": action,
             "operator_route": {
-                "primary_operator": "O1_gap_choice",
-                "backup_operators": ["O2_subclaim_localization", "O4_near_level_ranking", "O8_double_threshold_claim"],
+                "primary_operator": "O13_minimal_disqualifier",
+                "backup_operators": ["O15_counterfactual_threshold_shift", "O14_information_closure", "O17_action_vs_fact_threshold"],
                 "avoid_operators": [],
                 "is_high_value_sample": high,
                 "should_use_local_tree_search": False,
@@ -360,6 +360,43 @@ def test_candidate_selection_selects_valid_candidate_and_records_rejections():
     assert invalid_cases[0]["invalid_type"] == "format_difficulty_dominant"
 
 
+def test_all_invalid_candidates_restore_parent_snapshot_for_passthrough():
+    invalid = make_candidate(
+        "stage04-rollback",
+        "cand_1",
+        "无效新题",
+        {"passed": False, "reject_reason": "不可回答", "invalid_type": "unanswerable"},
+    )
+    invalid["rubric"] = [{"title": "new"}]
+    invalid["score_prompt"] = "new"
+    invalid["scoring_result"] = {"total_awarded": 9, "total_possible": 10}
+    invalid["meta_info"]["parent_snapshot"] = {
+        "prompt": "父题",
+        "rubric": [{"title": "old"}],
+        "rubric_thought_process": "old thought",
+        "score_prompt": "old score prompt",
+        "scoring_result": {"total_awarded": 6, "total_possible": 10},
+        "score_rate": 0.6,
+        "question_evolved": True,
+        "references": ["父题参考答案"],
+        "prompt_old": "祖父题",
+        "question_evolution_metadata": {"operator_used": "O10_evidence_sufficiency_ladder"},
+    }
+
+    selected, invalid_cases = select_candidates([invalid])
+    restored = selected[0]
+
+    assert restored["prompt"] == "父题"
+    assert restored["rubric"] == [{"title": "old"}]
+    assert restored["score_prompt"] == "old score prompt"
+    assert restored["scoring_result"]["total_awarded"] == 6
+    assert restored["score_rate"] == 0.6
+    assert restored["meta_info"]["references"] == ["父题参考答案"]
+    assert restored["question_evolved"] is False
+    assert restored["candidate_selection"]["selected_operator"] == ""
+    assert invalid_cases
+
+
 if __name__ == "__main__":
     test_question_evolution_can_emit_primary_and_backup_candidates()
     test_validate_retry_reuses_operator_and_includes_reject_reason()
@@ -367,4 +404,5 @@ if __name__ == "__main__":
     test_dynamic_candidate_budget_allocates_more_to_priority_samples()
     test_validation_rejects_overlong_duplicate_multitask_and_accepts_clean_candidate()
     test_candidate_selection_selects_valid_candidate_and_records_rejections()
+    test_all_invalid_candidates_restore_parent_snapshot_for_passthrough()
     print("stage04 complexity validation and candidate selection checks passed")

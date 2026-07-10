@@ -27,27 +27,27 @@ TERMINAL_STOP_STATUSES = {
 }
 
 OPERATOR_AVOID_METHODS = {
-    "O1_gap_choice": [
-        "继续问最少还缺什么",
-        "继续问最小前提",
-        "继续问最小跳步",
-    ],
-    "O2_subclaim_localization": ["继续只定位同一子判断"],
-    "O4_near_level_ranking": ["继续只做判据内外二分"],
-    "O8_double_threshold_claim": ["继续只比较显眼动作层"],
-    "O9_abnormal_clue_mainline_switch": ["继续只问找车还是找人"],
+    "O10_evidence_sufficiency_ladder": ["继续复用同一组近似判断竞争"],
+    "O11_unobserved_state_attribution": ["继续把端点事实直接改写成盲区内状态判断"],
+    "O12_conjunctive_necessity": ["继续用同一强线索替代未闭合门槛"],
+    "O13_minimal_disqualifier": ["继续复用同一新增事实改变原评价的问法"],
+    "O14_information_closure": ["继续显式询问题外前提或信息闭包标签"],
+    "O15_counterfactual_threshold_shift": ["继续改变同一变量做整体保留或整体撤回"],
+    "O16_close_alternative_normalization": ["继续询问正常解释是否排除全部风险"],
+    "O17_action_vs_fact_threshold": ["继续显式标注处置门槛与事实门槛"],
+    "O18_baseline_scope_mismatch": ["继续明示样本口径或基线范围错配"],
 }
 
 NEXT_OPERATOR_HINTS = {
-    "O1_gap_choice": ["O2_subclaim_localization", "O4_near_level_ranking", "O8_double_threshold_claim"],
-    "O2_subclaim_localization": ["O4_near_level_ranking", "O8_double_threshold_claim"],
-    "O3_step_jump": ["O4_near_level_ranking"],
-    "O4_near_level_ranking": ["O5_extra_premise_detection", "O6_single_variable_counterfactual"],
-    "O5_extra_premise_detection": ["O4_near_level_ranking", "O7_fact_binding_constraint"],
-    "O6_single_variable_counterfactual": ["O9_abnormal_clue_mainline_switch", "O4_near_level_ranking"],
-    "O7_fact_binding_constraint": ["O2_subclaim_localization", "O4_near_level_ranking"],
-    "O8_double_threshold_claim": ["O2_subclaim_localization", "O4_near_level_ranking"],
-    "O9_abnormal_clue_mainline_switch": ["O6_single_variable_counterfactual", "O4_near_level_ranking"],
+    "O10_evidence_sufficiency_ladder": ["O17_action_vs_fact_threshold", "O14_information_closure", "O13_minimal_disqualifier"],
+    "O11_unobserved_state_attribution": ["O17_action_vs_fact_threshold", "O16_close_alternative_normalization"],
+    "O12_conjunctive_necessity": ["O17_action_vs_fact_threshold", "O13_minimal_disqualifier"],
+    "O13_minimal_disqualifier": ["O15_counterfactual_threshold_shift", "O16_close_alternative_normalization"],
+    "O14_information_closure": ["O10_evidence_sufficiency_ladder", "O18_baseline_scope_mismatch"],
+    "O15_counterfactual_threshold_shift": ["O16_close_alternative_normalization", "O13_minimal_disqualifier"],
+    "O16_close_alternative_normalization": ["O15_counterfactual_threshold_shift", "O17_action_vs_fact_threshold"],
+    "O17_action_vs_fact_threshold": ["O11_unobserved_state_attribution", "O12_conjunctive_necessity"],
+    "O18_baseline_scope_mismatch": ["O10_evidence_sufficiency_ladder", "O14_information_closure"],
 }
 OPERATOR_SURFACE_FORM_FAMILY = {
     "O1_gap_choice": "evidence_relation_comparison",
@@ -175,7 +175,6 @@ def _stop_status(
     item: Dict[str, Any],
     full_score_count: int,
     same_operator_count: int,
-    operator_switched_after_full_score: bool,
 ) -> str:
     effect = _effect(item)
     label = _clean_text(effect.get("effect_label"))
@@ -192,13 +191,13 @@ def _stop_status(
     if label == "pass_through":
         return previous_stop or "continue"
     if label == "score_increased":
-        return "continue_with_new_operator"
+        return "rollback_and_reroute"
     if label == "full_score_no_drop":
-        if full_score_count >= 2 and operator_switched_after_full_score:
-            return "stable_high_score_stop"
+        if full_score_count >= 2:
+            return "local_tree_search_needed"
         if previous_recommended:
             return "continue_with_new_operator"
-        return "local_tree_search_needed" if full_score_count >= 2 else "continue_with_new_operator"
+        return "continue_with_new_operator"
     if label == "repeated_pattern":
         return "stable_high_score_stop" if same_operator_count >= 2 else "continue_with_new_operator"
     if label in {"needs_manual_review", "no_clear_effect", "score_increased"}:
@@ -210,8 +209,8 @@ def _recommended_next_methods(operator_used: str, label: str, full_score_count: 
     if label == "effective_boundary_probe":
         return []
     hints = list(NEXT_OPERATOR_HINTS.get(operator_used, []))
-    if full_score_count >= 2 and "O4_near_level_ranking" not in hints:
-        hints.append("O4_near_level_ranking")
+    if full_score_count >= 2 and "O10_evidence_sufficiency_ladder" not in hints:
+        hints.append("O10_evidence_sufficiency_ladder")
     return hints
 
 
@@ -225,13 +224,6 @@ def build_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
     current_full = bool(effect.get("is_full_score"))
     full_score_count = previous_full_count + 1 if current_full else 0
     same_operator_count = previous_same_count + 1 if operator_used and operator_used == previous_operator else (1 if operator_used else 0)
-    operator_switched_after_full_score = (
-        current_full
-        and previous_full_count >= 1
-        and bool(operator_used)
-        and bool(previous_operator)
-        and operator_used != previous_operator
-    )
     label = _clean_text(effect.get("effect_label"))
 
     avoid_methods = list(previous_state.get("avoid_methods") or [])
@@ -246,7 +238,6 @@ def build_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
         item,
         full_score_count,
         same_operator_count,
-        operator_switched_after_full_score,
     )
     if stop_status in TERMINAL_STOP_STATUSES:
         recommended = []
@@ -254,7 +245,11 @@ def build_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "round": _round_value(item, previous_state),
         "previous_operator": operator_used or None,
-        "previous_score_rate": effect.get("score_rate_after"),
+        "previous_score_rate": (
+            effect.get("score_rate_before")
+            if label == "score_increased"
+            else effect.get("score_rate_after")
+        ),
         "previous_effect_status": label or None,
         "previous_failure_mode": _expected_failure_mode(item) or None,
         "consecutive_full_score_count": full_score_count,
@@ -262,12 +257,66 @@ def build_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
         "avoid_methods": avoid_methods,
         "recommended_next_methods": recommended,
         "stop_status": stop_status,
+        "rollback_applied": label == "score_increased",
     }
 
 
-def attach_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
+def _restore_parent_after_score_increase(item: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(item)
-    result["evolution_state"] = build_next_state(item)
+    meta_info = result.get("meta_info")
+    meta_info = dict(meta_info) if isinstance(meta_info, dict) else {}
+    snapshot = meta_info.get("parent_snapshot")
+
+    if isinstance(snapshot, dict):
+        if snapshot.get("prompt"):
+            result["prompt"] = snapshot.get("prompt")
+        for field in ("rubric", "rubric_thought_process", "score_prompt", "scoring_result"):
+            if snapshot.get(field) is None:
+                result.pop(field, None)
+            else:
+                result[field] = snapshot.get(field)
+        if snapshot.get("references") is not None:
+            meta_info["references"] = snapshot.get("references")
+        if snapshot.get("prompt_old") is None:
+            meta_info.pop("prompt_old", None)
+        else:
+            meta_info["prompt_old"] = snapshot.get("prompt_old")
+        if snapshot.get("question_evolution_metadata") is None:
+            meta_info.pop("question_evolution_metadata", None)
+        else:
+            meta_info["question_evolution_metadata"] = snapshot.get("question_evolution_metadata")
+    else:
+        old_prompt = meta_info.get("prompt_old")
+        if isinstance(old_prompt, str) and old_prompt.strip():
+            result["prompt"] = old_prompt.strip()
+        stale_fields = {
+            "rubric": "stale_rubric",
+            "rubric_thought_process": "stale_rubric_thought_process",
+            "score_prompt": "stale_score_prompt",
+            "scoring_result": "stale_scoring_result",
+        }
+        for field, stale_field in stale_fields.items():
+            if stale_field in meta_info:
+                result[field] = meta_info.get(stale_field)
+        if "stale_references" in meta_info:
+            meta_info["references"] = meta_info.get("stale_references")
+
+    effect = _effect(item)
+    result["score_rate"] = effect.get("score_rate_before")
+    result["question_evolved"] = False
+    meta_info.pop("parent_snapshot", None)
+    result["meta_info"] = meta_info
+    return result
+
+
+def attach_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
+    state = build_next_state(item)
+    result = (
+        _restore_parent_after_score_increase(item)
+        if state.get("rollback_applied")
+        else dict(item)
+    )
+    result["evolution_state"] = state
     return result
 
 
@@ -416,7 +465,7 @@ def classify_memory_entries(
     for record in records:
         effect = _effect(record)
         label = _clean_text(effect.get("effect_label"))
-        if effect.get("lightweight_boundary_hit") and effect.get("complexity_passed") and is_question_evolved(record):
+        if label == "effective_boundary_probe" and effect.get("complexity_passed") and is_question_evolved(record):
             operator_entries.append(build_operator_memory_entry(record))
         if label in FAILURE_EFFECT_LABELS and effect.get("complexity_passed") and is_question_evolved(record):
             failure_entries.append(build_failure_memory_entry(record))

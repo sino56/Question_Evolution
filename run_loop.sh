@@ -90,13 +90,12 @@ RUBRIC_CONCURRENCY=${RUBRIC_CONCURRENCY:-10}
 # ======================================================
 
 if [ ! -f "$INPUT_FILE" ] && [ "$INPUT_FILE" = "$DEFAULT_INPUT_FILE" ] && [ -f "$LEGACY_INPUT_FILE" ]; then
-    echo "未找到 $DEFAULT_INPUT_FILE，回退到旧输入文件: $LEGACY_INPUT_FILE"
     INPUT_FILE="$LEGACY_INPUT_FILE"
 fi
 
 if [ ! -f "$INPUT_FILE" ]; then
     echo "输入文件不存在: $INPUT_FILE"
-    echo "请设置 INPUT_FILE 指向 admitted_seed_samples.jsonl 或其他已准入 JSONL。"
+    echo "请设置 INPUT_FILE 指向 data/data.jsonl 或其他有效 JSONL。"
     exit 1
 fi
 
@@ -156,6 +155,34 @@ done
 echo "本次实验目录: $EXP_DIR"
 echo "Memory 目录: $MEMORY_DIR"
 
+prepare_round_input() {
+    local source_file="$1"
+    local output_file="$2"
+    local round_number="$3"
+    python - "$source_file" "$output_file" "$round_number" <<'PY'
+import json
+import os
+import sys
+
+source_path, output_path, round_text = sys.argv[1:]
+round_number = int(round_text)
+temp_path = output_path + ".tmp"
+
+with open(source_path, "r", encoding="utf-8") as source, \
+     open(temp_path, "w", encoding="utf-8") as target:
+    for line_number, line in enumerate(source, start=1):
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        if not isinstance(item, dict):
+            raise ValueError(f"{source_path}:{line_number} must be a JSON object")
+        item["round"] = round_number
+        target.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+os.replace(temp_path, output_path)
+PY
+}
+
 run_if_missing() {
     local output_file="$1"
     local step_label="$2"
@@ -172,9 +199,28 @@ run_if_missing() {
 # 辅助函数：计算 jsonl 的平均得分率
 compute_avg_score_rate() {
     local scored_file="$1"
-    python -c "import json, sys; rates=[]; f=open(sys.argv[1], encoding='utf-8'); \
-[rates.append((item.get('scoring_result',{}).get('total_awarded',0) or 0)/(item.get('scoring_result',{}).get('total_possible',0) or 1)) for item in (json.loads(line) for line in f if line.strip()) if (item.get('scoring_result',{}).get('total_possible',0) or 0) > 0]; \
-print(f'{(sum(rates)/len(rates) if rates else 0.0):.4f}')" "$scored_file"
+    python - "$scored_file" <<'PY'
+import json, sys
+path = sys.argv[1]
+rates = []
+with open(path, "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        item = json.loads(line)
+        top_level = item.get("score_rate")
+        if isinstance(top_level, (int, float)) and 0 <= top_level <= 1:
+            rates.append(float(top_level))
+            continue
+        sr = item.get("scoring_result", {})
+        awarded = sr.get("total_awarded", 0) or 0
+        possible = sr.get("total_possible", 0) or 0
+        if possible > 0:
+            rates.append(awarded / possible)
+avg = sum(rates) / len(rates) if rates else 0.0
+print(f"{avg:.4f}")
+PY
 }
 
 # 辅助函数：比较两个浮点数，输出 true/false
@@ -235,6 +281,26 @@ if missing:
 ' "$input_file" "$candidates_file"
 }
 
+extract_continue_count() {
+    local state_file="$1"
+    python - "$state_file" <<'PY'
+import json, sys
+active = {"continue_with_new_operator", "local_tree_search_needed", "rollback_and_reroute"}
+count = 0
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    for line in f:
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        state = item.get("evolution_state", {})
+        status = state.get("stop_status") if isinstance(state, dict) else None
+        recommended = state.get("recommended_next_methods", []) if isinstance(state, dict) else []
+        if status in active or recommended:
+            count += 1
+print(count)
+PY
+}
+
 SUMMARY_FILE="$EXP_DIR/summary.txt"
 echo "Question Evolution Loop Summary" > "$SUMMARY_FILE"
 echo "================================" >> "$SUMMARY_FILE"
@@ -270,7 +336,7 @@ echo "Round $ROUND: 初始评分（baseline）"
 echo "========================================"
 
 run_if_missing "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 0/2: 准备 baseline input" \
-    cp "$INPUT_FILE" "$ROUND_DIR/input.jsonl"
+    prepare_round_input "$INPUT_FILE" "$ROUND_DIR/input.jsonl" "$ROUND"
 
 run_if_missing "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 1/2: round0_stability_probe.py baseline" \
     python round0_stability_probe.py \
@@ -304,7 +370,6 @@ printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "baseline" >> "$SUMMARY_FILE"
 
 PREV_SCORED="$ROUND_DIR/scored.jsonl"
 PREV_AVG_RATE="$AVG_RATE"
-PREV_EFFECT_COUNT=0
 NO_INFO_STREAK=0
 
 # ===================== Round 1..N: 循环进化 =====================
@@ -318,7 +383,7 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
     echo "========================================"
 
     run_if_missing "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 0/13: 复制上一轮 scored/state 输入" \
-        cp "$PREV_SCORED" "$ROUND_DIR/input.jsonl"
+        prepare_round_input "$PREV_SCORED" "$ROUND_DIR/input.jsonl" "$ROUND"
 
     if [ -f "$ROUND_DIR/scored.jsonl" ] && [ -s "$ROUND_DIR/scored.jsonl" ]; then
         echo "检测到已存在 $ROUND_DIR/scored.jsonl，跳过本轮生成闭环"
@@ -438,16 +503,17 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
             --preselection-invalid-input "$ROUND_DIR/invalid_generation_cases.jsonl" \
             --report-output "$ROUND_DIR/state_update_report.json"
 
-    # 计算本轮平均得分率
-    AVG_RATE=$(compute_avg_score_rate "$ROUND_DIR/scored.jsonl")
-    echo "Round $ROUND 平均得分率: $AVG_RATE"
-    EFFECT_COUNT=$(extract_effect_count "$ROUND_DIR/effect_analysis.jsonl")
-    AVG_DELTA=$(abs_diff_float "$AVG_RATE" "$PREV_AVG_RATE")
-
     ROUND_OUTPUT_FOR_NEXT="$ROUND_DIR/scored.jsonl"
     if [ -f "$ROUND_DIR/state_updated.jsonl" ] && [ -s "$ROUND_DIR/state_updated.jsonl" ]; then
         ROUND_OUTPUT_FOR_NEXT="$ROUND_DIR/state_updated.jsonl"
     fi
+
+    # 必须基于状态更新后的结果计算；score_increased 样本已在其中回滚到父题分数。
+    AVG_RATE=$(compute_avg_score_rate "$ROUND_OUTPUT_FOR_NEXT")
+    echo "Round $ROUND 回滚后有效平均得分率: $AVG_RATE"
+    EFFECT_COUNT=$(extract_effect_count "$ROUND_DIR/effect_analysis.jsonl")
+    CONTINUE_COUNT=$(extract_continue_count "$ROUND_OUTPUT_FOR_NEXT")
+    AVG_DELTA=$(abs_diff_float "$AVG_RATE" "$PREV_AVG_RATE")
 
     # 检查提前停止条件
     SHOULD_STOP=$(lt_float "$AVG_RATE" "$EARLY_STOP_RATE")
@@ -458,14 +524,14 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
         break
     fi
 
-    if [ "$EFFECT_COUNT" -eq 0 ] && [ "$(lt_float "$AVG_DELTA" "$NO_INFO_MIN_DELTA")" = "true" ]; then
+    if [ "$EFFECT_COUNT" -eq 0 ] && [ "$CONTINUE_COUNT" -eq 0 ] && [ "$(lt_float "$AVG_DELTA" "$NO_INFO_MIN_DELTA")" = "true" ]; then
         NO_INFO_STREAK=$((NO_INFO_STREAK + 1))
     else
         NO_INFO_STREAK=0
     fi
 
     if [ "$NO_INFO_STREAK" -ge "$NO_INFO_STOP_ROUNDS" ]; then
-        echo "提前停止：连续 $NO_INFO_STREAK 轮无新信息（effect_count=0 且 avg_delta=$AVG_DELTA < $NO_INFO_MIN_DELTA）"
+        echo "提前停止：连续 $NO_INFO_STREAK 轮无新信息（effect_count=0、continue_count=0 且 avg_delta=$AVG_DELTA < $NO_INFO_MIN_DELTA）"
         printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "no_info_stop" >> "$SUMMARY_FILE"
         PREV_SCORED="$ROUND_OUTPUT_FOR_NEXT"
         break
@@ -475,7 +541,6 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
 
     PREV_SCORED="$ROUND_OUTPUT_FOR_NEXT"
     PREV_AVG_RATE="$AVG_RATE"
-    PREV_EFFECT_COUNT="$EFFECT_COUNT"
 done
 
 # ===================== 保存最终结果 =====================

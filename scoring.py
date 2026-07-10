@@ -693,8 +693,10 @@ class ScoringProcessor:
         failed_path = output_path + ".failed"
         file_mode = "a" if processed_keys else "w"
         results: List[Dict[str, Any]] = []
+        failed_count = 0
 
         async def run_one(item: Dict[str, Any], out_f, fail_f):
+            nonlocal failed_count
             try:
                 processed_item = await self.process_item(item)
                 async with self.write_lock:
@@ -708,6 +710,7 @@ class ScoringProcessor:
                 async with self.write_lock:
                     fail_f.write(json.dumps(failed_item, ensure_ascii=False) + "\n")
                     fail_f.flush()
+                    failed_count += 1
 
         with open(output_path, file_mode, encoding="utf-8") as out_f, \
              open(failed_path, file_mode, encoding="utf-8") as fail_f:
@@ -725,6 +728,12 @@ class ScoringProcessor:
             os.remove(failed_path)
         elif os.path.exists(failed_path):
             logger.warning(f"存在失败数据，已保存至: {failed_path}")
+
+        if failed_count:
+            raise RuntimeError(
+                f"scoring 阶段有 {failed_count}/{len(items)} 条记录失败；"
+                f"失败详情见 {failed_path}，已停止后续流水线。"
+            )
 
 
 async def main():

@@ -4,8 +4,6 @@ import asyncio
 import aiofiles
 import logging
 import re
-import random
-from collections import defaultdict
 from typing import Any, Dict, List
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm_asyncio
@@ -120,7 +118,7 @@ class RotatingAPIClient:
                 if self._is_token_exhausted_error(e):
                     logger.warning(f"API Key [{self.current_key_index + 1}] 额度用尽: {str(e)[:100]}")
                     if await self.switch_to_next_key():
-                        logger.info(f"已切换到下一个 API Key，重试请求...")
+                        logger.info("已切换到下一个 API Key，重试请求...")
                         continue
                     else:
                         raise Exception("所有 API Key 额度已用尽") from e
@@ -745,41 +743,10 @@ async def process_item(item, client: RotatingAPIClient, model, writer_queue, fai
         failed_item = dict(item)
         failed_item["rubric_generation_error"] = str(e)
         await failed_queue.put(failed_item)
-        try:
-            logger.error(f"处理索引 {item['index']} 时出错，已转入失败文件: {str(e)}")
-        except Exception:
-            logger.error(f"处理索引 {item['meta_data']['script_id']} 时出错，已转入失败文件: {str(e)}")
+        item_id = item.get("index", item.get("sample_id", "unknown"))
+        logger.error(f"处理索引 {item_id} 时出错，已转入失败文件: {str(e)}")
     finally:
         progress_bar.update(1)
-
-def deduplicate_by_prompt(items):
-    """
-    根据prompt字段去重，从相同prompt的条目中随机选择一条
-
-    Args:
-        items: 原始数据列表
-
-    Returns:
-        去重后的数据列表
-    """
-    # 按prompt分组
-    prompt_groups = defaultdict(list)
-    for item in items:
-        if 'prompt' in item and item['prompt'] is not None:
-            prompt_groups[item['prompt']].append(item)
-        else:
-            logger.warning(f"发现没有prompt字段或prompt为空的条目: {item}")
-
-    # 从每组中随机选择一条
-    deduplicated_items = []
-    for prompt, group in prompt_groups.items():
-        selected_item = random.choice(group)
-        deduplicated_items.append(selected_item)
-        if len(group) > 1:
-            logger.info(f"Prompt '{prompt[:30]}...' 有 {len(group)} 条重复数据，已随机选择一条")
-
-    logger.info(f"去重前: {len(items)} 条，去重后: {len(deduplicated_items)} 条")
-    return deduplicated_items
 
 async def writer_worker(writer_queue, failed_queue, output_file, file_mode='a'):
     """
@@ -804,10 +771,8 @@ async def writer_worker(writer_queue, failed_queue, output_file, file_mode='a'):
                 failed_item = dict(item)
                 failed_item["rubric_generation_error"] = f"写入前校验失败: {e}"
                 await failed_queue.put(failed_item)
-                try:
-                    logger.error(f"写入索引 {item['index']} 时出错，已转入失败文件: {str(e)}")
-                except Exception:
-                    logger.error(f"写入索引 {item['meta_data']['script_id']} 时出错，已转入失败文件: {str(e)}")
+                item_id = item.get("index", item.get("sample_id", "unknown"))
+                logger.error(f"写入索引 {item_id} 时出错，已转入失败文件: {str(e)}")
             finally:
                 writer_queue.task_done()
 
@@ -816,12 +781,14 @@ async def failed_writer_worker(failed_queue, failed_file, file_mode='a'):
     """
     异步失败写入工作者，确保失败记录也能安全落盘。
     """
+    failed_count = 0
     async with aiofiles.open(failed_file, file_mode, encoding='utf-8') as f:
         while True:
             item = await failed_queue.get()
             if item is None:  # 退出信号
                 break
 
+            failed_count += 1
             try:
                 line = json.dumps(item, ensure_ascii=False) + '\n'
                 await f.write(line)
@@ -830,6 +797,7 @@ async def failed_writer_worker(failed_queue, failed_file, file_mode='a'):
                 logger.error(f"写入失败文件时出错: {str(e)}")
             finally:
                 failed_queue.task_done()
+    return failed_count
 
 async def main(
     input_file,
@@ -885,9 +853,6 @@ async def main(
     items = [item for item in items if item.get("prompt") not in existing_prompts]
     logger.info(f"跳过 {original_count - len(items)} 个已处理的条目，剩余 {len(items)} 条需要处理")
 
-    # 去重处理
-    items = deduplicate_by_prompt(items)
-
     # 失败文件路径与打开模式
     failed_path = output_file + ".failed"
     file_mode = 'a' if existing_prompts else 'w'
@@ -925,7 +890,7 @@ async def main(
 
     await failed_queue.join()
     await failed_queue.put(None)
-    await failed_writer_task
+    failed_count = await failed_writer_task
 
     # 关闭客户端
     await client.close()
@@ -937,6 +902,12 @@ async def main(
         os.remove(failed_path)
     elif os.path.exists(failed_path):
         logger.warning(f"存在失败的数据，已保存至: {failed_path}")
+
+    if failed_count:
+        raise RuntimeError(
+            f"rubric generation 阶段有 {failed_count}/{len(items)} 条记录失败；"
+            f"失败详情见 {failed_path}，已停止后续流水线。"
+        )
 
     logger.info("所有任务完成")
 

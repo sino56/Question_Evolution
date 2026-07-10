@@ -11,6 +11,7 @@ from prompts.operators import build_operator_prompt, get_operator_spec
 from select_evolution_candidates import (
     EVOLVE_HIGH_SCORE_OVERSCORE,
     PASS_THROUGH_OR_SCORING_NOISE,
+    PROBE_MIDDLE_SCORE_BOUNDARY,
     RECONSTRUCT_LOW_SCORE_BOUNDARY,
     STOP_EVOLUTION,
 )
@@ -35,6 +36,7 @@ DEFAULT_MAX_VALIDATION_RETRIES = 1
 EVOLUTION_REQUIRED_ACTIONS = {
     EVOLVE_HIGH_SCORE_OVERSCORE,
     RECONSTRUCT_LOW_SCORE_BOUNDARY,
+    PROBE_MIDDLE_SCORE_BOUNDARY,
 }
 NON_EVOLUTION_ACTIONS = {
     PASS_THROUGH_OR_SCORING_NOISE,
@@ -137,113 +139,161 @@ V1版本的原始prompt：
 
 QUESTION_EVOLUTION_PROMPT_TEMPLATE_V1 = """
 # 角色
-你是一位负责“能力边界定向压测”的评测题目设计专家。你的任务不是把题目机械改难，也不是把题目改成长、多步骤、强格式的结构题，而是要把原题升级成一道：
+你是一位负责“当前弱模型判断弱点发现”的评测题目设计专家。
+你的任务不是把题目机械改难，也不是把题目改成长、多步骤、强格式的结构题，而是要把原题升级成一道：
 1. 单主轴；
 2. 可回答；
 3. 可稳定评分；
-4. 能让模型在一个可归因的关键判断点上暴露错误
+4. 能让当前弱模型在一个可归因的关键判断点上暴露错误；
+5. 能让强模型凭借更精确地区分相近业务表述、处置结论或评价保留范围而答对
 的新题。
-
+当前阶段的重点不是复用旧题型模板，而是发现当前弱模型的新 failure modes。
+# 背景判断
+已有实验显示，当前弱模型已经明显改善了以下旧弱点：
+1. 普通两层拆分；
+2. 显式“哪一层成立 / 哪一层不成立”判断；
+3. 显式“最小缺口是什么”追问；
+4. 常规“线索不能直接推出结论”的判断；
+5. 明确提示“不要展开题外流程 / 不要补充题外事实”后的事实绑定。
+因此，除非原题确实只能这样进化，否则不要优先生成这些旧式题型。
 # 核心目标
 请分析原题、参考答案、候选答案和现有评分标准，生成一道升级后的新题，使其满足：
 1. 仍然考查原题的核心领域、核心事实和核心能力，不改变题目主题；
 2. 新题的主要失分点集中在 1 个关键判断上，而不是因为任务太多、格式太复杂、篇幅太长而失分；
-3. 新题优先考以下几类真实短板，而不是泛泛增加复杂度：
-   - 分不清“已经异常”与“已经能写成结论”；
-   - 分不清两个都像有用的补强事实里，哪一个才真正推动结论上升一层；
-   - 抓住了显眼事实，但漏掉真正决定定性的那一步；
-   - 看起来知道“不够”，但说不准最少到底缺哪一条；
-   - 把“看起来像闭环”误当成“已经形成闭环”；
-4. 后续 judge 能根据 rubric 稳定判断对错，而不是靠术语密度、结构完整性或格式服从度打分。
-
-# 第零步：先判断这道题下一步该往哪种失误点上压
-在内部先做判断，但不要把全部中间推理输出：
-
-1. 先判断原题当前更像哪一类：
-   - 开放题太散，模型靠泛泛扩写保分；
-   - 边界已经比较清楚，但模型还没被逼到真正关键缺口；
-   - 题目如果继续“讲清楚”，反而会更容易答；
-   - 题目已经能稳定暴露边界，继续改信息增量很低。
-
-2. 再判断这道题当前最值得压的主错误是哪一种，只能选 1 个：
-   - A. 泛泛罗列，缺少题干事实绑定；
-   - B. 只会说大方向，不会指出真正关键缺口；
-   - C. 混淆层级，把线索/异常/嫌疑直接上推成结论成立；
-   - D. 把两个都重要的补强事实，错认成同等关键；
-   - E. 把“看起来像闭环”误当成“已经排他成立”；
-   - F. 被显眼信息带偏，漏掉真正决定结论的主轴。
-
-3. 如果你发现“把题改得更清楚”会让候选答案更容易顺着答对，那么禁止继续沿着“先承认第一层，再问还缺什么”的方式改写，必须换题型。
-
-# 第一步：先拆结论，再决定是否继续考这一层
-1. 如果原题目标结论可以拆成 2-3 个相邻层级，先拆开。
-2. 只能选择其中 1 个最值得压测的相邻层级差异作为主轴。
-3. 如果候选答案已经能稳定回答“哪一层成立、哪一层不成立”，本轮不得继续复用同类问法，必须改成更细的比较题。
-4. 如果新题会把真正难点提前说破，只剩一个显而易见的缺口可答，则这次改写无效，必须重做。
-
-# 第二步：题型选择
-从下面题型里只选 1 种主方式；如必须组合，只允许“1 个主方式 + 1 个轻量辅助方式”。
-
-1. 候选缺口二选一
-   适用：模型已经知道“大方向还不够”，但分不清哪个补强事实才是真正关键。
-   目标：逼它在两个都像有帮助的补强事实里，选出真正推动结论上升一层的那一个。
-
-2. 子判断定位
-   适用：模型容易把“已支持层”和“未支持层”混在一起。
-   目标：逼它指出到底是哪一个子判断还不能成立，以及最少还缺什么。
-
-3. 近似项分层
-   适用：模型会做粗分层，但不会分更细的相邻层级。
-   目标：给 2-3 个都“看起来不能直接下结论”的近似项，要求继续分高低，而不是只做可写/不可写二分。
-
-4. 伪闭环识别
-   适用：模型容易把“局部成立”误写成“整体连续成立”。
-   目标：让模型区分“局部画面已成立”“连续性仍未闭环”“排他性仍未闭环”。
-
-5. 补强项升级判断
-   适用：模型知道某事实会让异常更强，但不会分“更异常”和“结论上升一层”。
-   目标：让模型判断哪个补充事实只是让原判断更稳，哪个才真正改变结论层级。
-
-6. 单变量反事实
-   适用：只差一条条件变化就能看出模型会不会重新排列判断顺序。
-   目标：只改 1 个变量，逼模型说明哪一层变化、哪一层不变。
-
-# 第三步：反复题型与“讲清楚反而变简单”检查
-生成新题前必须逐项自检：
-
-1. 这次新题是否仍然只是“哪一层成立 + 还缺什么”的换壳版本？
-   如果是，且候选答案已经能稳定处理这一类题，则必须换题型。
-
-2. 这次新题是否把真正难点提前说破了？
-   如果候选答案只要顺着题面复述“第一层成立、第二层不成立、缺连续性/缺直接状态/缺排他闭环”就容易拿高分，则必须重做。
-
-3. 这次新题是否只是把题面写得更标准、更聚焦，但没有制造两个足够接近的竞争判断？
-   如果是，这种改写大概率只会让题更容易答，不应采用。
-
-4. 如果存在两个以上都说得通的最小缺口，不得做开放式“还缺什么”，必须改成候选项区分题。
-
-# 第四步：复杂度预算
-1. 新题必须只有 1 个清晰主轴。读者应能用一句话说清“本题到底考什么”。
-2. 新增事实或场景条件最多 3 条。
-3. 输出任务最多 2 个，优先 1 个。
-4. 候选项最多 3 个；如果是缺口比较题，优先 2 个近似候选。
-5. 不得要求大表格、多层标签体系、固定句数、复杂编号系统。
-6. 不得把难度主要建立在长篇格式、繁琐约束、复杂任务编排上。
-7. 如果上一轮已经很长，本轮优先收主轴，不要继续加材料。
-
-# 第五步：可回答性与唯一失分点检查
+3. 新题能压测当前弱模型仍可能不稳的具体判断点；
+4. 后续 judge 能根据 rubric 稳定判断对错，而不是靠术语密度、结构完整性或格式服从度打分；
+5. 新题不能因为把难点讲得过清楚而让弱模型顺着题面复述拿高分。
+# 第零步：先判断旧题型是否已经不够
+在内部先做判断，但不要输出完整中间推理。
+请先判断候选答案是否已经基本能处理以下旧式问题：
+1. 能否承认“当前事实还不足”；
+2. 能否说出大致还缺关键事实；
+3. 能否区分线索、异常、嫌疑与最终结论；
+4. 能否在题面明确提示时遵守“只根据题干事实”；
+5. 能否复述“第一层成立、第二层未成立”的结构。
+如果候选答案已经能处理上述旧式问题，本轮不得继续生成普通两层拆分题、显式最小缺口题或显式线索/结论区分题，必须切换到新的题面竞争点。
+# 第一步：选择当前最值得压测的题面竞争点
+只能选择 1 个主竞争点作为本题主轴。算子类型只用于内部选题和 metadata，不得把算子定义、解题标签或评分关注点搬进 evolved_prompt。
+优先把题面写成“业务判断竞争”，而不是“材料分类题”。推荐题面形态按优先级为：
+1. 在两个或三个报告表述之间选择更稳妥的一项；
+2. 判断新增一个事实后原评价是否仍可保留；
+3. 判断一个处置结论是否仍可执行、哪种表述需要降级；
+4. 只在原题确实需要时才比较候选事实，但不得要求作答者给证据分层。
+各算子的成题规则如下：
+- O10：只能生成同主体、同场景、同目标结论的近似判断竞争；不得生成材料分层题或让作答者比较材料强弱。
+- O11：只给不可见区间的端点事实、时间事实、进入前动作和未出现事实；任务只能比较处置或报告表述，不得直接问能否证明不可见区间内发生了什么。
+- O12：只给一个强线索和两个业务判断竞争；不得明说还缺哪类统计、记录、阈值、条件清单或待补条件。
+- O13：先给原评价，再问新增事实后原评价是否仍可保留；不得问“哪个最会迫使下调 / 哪个直接推翻”。
+- O14：只比较两个看似都来自题干的业务表述；不得要求识别抽象推理标签。
+- O15：只改变一个核心事实，并明说其他关键事实保持不变；任务是判断原风险判断哪部分保留、哪部分降级或撤回。
+- O16：只新增一个相近正常解释；正确竞争点必须是“异常强度下降但风险未必消失”，不得把题面写成正常解释是否排除风险。
+- O17：只比较两个报告或处置表述；不得使用“应急核查 / 事实定性 / 处置门槛 / 事实门槛”等标签。
+- O18：只给两个同域统计或基线来源；不得明说“样本口径错配 / 基准范围不一致”，让模型通过业务表述竞争自行识别。
+- O9+：只在原题确有反常事实时使用；不得要求模型列主线切换步骤，只能让它比较哪种研判方向或报告表述更稳妥。
+# 第二步：旧题型降权规则
+以下题型只能在确有必要时使用，不能作为默认选择：
+1. 普通两层拆分：
+“哪一层已经成立，哪一层还不成立？”
+2. 显式最小缺口：
+“还缺的最小关键事实是什么？”
+3. 常规线索/结论区分：
+“该事实最多只能说明异常，不能直接推出结论。”
+4. 显式题外补设识别：
+“哪一步引入了题干外前提？”
+如果必须使用上述题型，必须进一步改造成一个业务判断竞争：
+- 多个近似报告表述竞争；
+- 两个看似合理的处置结论竞争；
+- 一个单变量事实改变原评价保留范围；
+- 一个新增事实改变原评价是否保留；
+- 一个看似题干内的表述实际需要题面没有给出的连接；
+- 一个反常事实导致研判方向表述发生变化。
+# 第三步：避免“讲清楚反而变简单”
+生成新题前必须逐项自检；任一项失败都必须重写 evolved_prompt：
+1. 新题是否只是“第一层成立、第二层不成立、还缺什么”的换壳？
+如果是，且候选答案已经能处理这一类题，必须重做。
+2. 新题是否把真正难点提前说破？
+如果弱模型只要复述题面中的“缺某阈值 / 缺某记录 / 不能定性 / 需要人工确认 / 还不能推出”等句式就能高分，必须重做。
+3. 新题是否缺少足够接近的竞争判断？
+如果没有至少两个看似都有道理但实际层级不同的候选判断，必须重做。
+4. 新题是否只是更清楚、更聚焦，但没有改变竞争点？
+如果是，这种改写很可能会让题更容易，不应采用。
+5. 新题是否主要依靠复杂格式压分？
+如果是，必须重做。
+6. 正确项是否独占同主体、同地点、同时间尺度、同判断对象四个优势？
+如果是，说明干扰项只是陪跑项，必须重做。
+7. 新题是否在问材料分类，而不是问业务判断？
+如果作答任务要求比较材料强弱、材料用途或材料类别，必须改写成报告表述、处置结论或原评价保留判断。
+# evolved_prompt 题面泄漏限制
+以下约束只针对 evolved_prompt。边界类型、评分关注点和答案标签只能写入 metadata 字段，不能写进题面。
+evolved_prompt 禁止出现以下黑名单内容。黑名单例句只能用于本段自检，不得复制到 evolved_prompt：
+1. operator 名称、O10/O11/O12/O13/O14/O15/O16/O17/O18/O9+、算子能力名称；
+2. 答案标签，例如“直接支撑 / 补强线索 / 更低层结论 / 方向错误 / 共同必要条件 / 信息闭包 / 题外前提 / 最小缺口 / 已支持层 / 未支持层”等；
+3. 同义泄漏句式，例如“尚未建立统计阈值 / 没有均值 / 没有标准差 / 缺正常分布 / 缺分级阈值 / 缺基准样本 / 直接改变支撑基础 / 比较作用边界 / 足以推出 / 最能支撑 / 支撑强弱 / 证据层级 / 还不能定性 / 需要人工确认”；
+4. 会直接提示正确解法的完整推理路径，例如先把事实分层，再判断哪层成立，再说缺哪一条；
+5. 显式提醒“不要补充题外事实”“只能根据题干闭包”等会让弱模型靠规则复述得分的提示。
+只有当上述词句是原题中不可删除的核心事实原文时，才可以保留；否则必须换成具体场景事实或具体报告表述。
+evolved_prompt 应该只给：
+1. 原题相关的事实；
+2. 候选判断；
+3. 最小反事实；
+4. 一个需要作答者自行完成边界判断的问题。
+如果生成出的题面必须依靠答案标签才能成立，说明该算子不适合该样本，应换用更隐性的竞争判断。
+# 竞争项接近度硬规则
+凡是出现候选判断、候选表述或候选事实，必须满足：
+1. 候选项共享同一主体、同一场景、同一判断目标；
+2. 候选项不得让正确项独占同地点、同时间尺度、同判断对象、同证据来源；
+3. 每个干扰项都必须影响同一个核心判断，只能差在一个微小变量上；
+4. 干扰项不能只是背景事实、反向事实、外围主体或无关时间段；
+5. 如果无法构造足够接近的候选项，改成两个业务表述竞争，不要生成三选项题。
+# 最小变量变化硬规则
+本轮新题最多允许 1 个核心变量改变结论层级。若使用新增事实或反事实：
+1. 必须在题面写明其他关键事实保持不变；
+2. 新增事实只能有 1 条能改变判断层级；
+3. 不得让多个新增事实共同改变结论；
+4. 不得同时改变主体、地点、时间尺度和判断目标；
+5. 如果一个变量只能降低异常强度，不能把题目写成风险直接消失。
+# 第四步：发现模式复杂度预算
+本 prompt 用于发现当前弱模型的新失分点，因此允许 operator-specific 的局部复杂度放宽，但必须保持单主轴和稳定评分。
+通用预算：
+1. 新题必须只有 1 个清晰主轴；
+2. 新增事实或场景条件通常不超过 4 条；
+3. 输出任务通常不超过 2 个；O15 也应优先压缩为“变化后是否升格/降级 + 原判断哪一处需调整”；
+4. 不得要求大表格、多层标签体系、固定句数、复杂编号系统；
+5. 不得把难度主要建立在长篇格式、繁琐约束、复杂任务编排上；
+6. 题目必须完整、可独立作答，不能依赖题外专业知识。
+operator-specific 预算：
+1. O10：候选项最多 3 个，必须同主体、同场景、同目标，不能做显式分类表或材料排序题；
+2. O11：可允许较长题干，但必须只围绕一个不可见状态门槛，任务必须是处置或报告表述竞争；
+3. O12：只允许两个业务判断竞争，不得列条件清单、统计缺口或待补门槛；
+4. O13：候选事实最多 3 个，全部影响同一原评价，不能强弱悬殊；
+5. O14：不得直接提示抽象推理标签，必须通过两个业务表述比较体现；
+6. O15：只设置 1 个核心反事实，并写明其他关键事实保持不变；
+7. O16：只新增 1 个正常化事实，考察异常强度下调而非风险消失；
+8. O17：只比较报告或处置表述，不能出现处置/事实门槛标签；
+9. O18：只给同域基线或统计来源，不能明说口径错配。
+# 第五步：可回答性与评分稳定性检查
 1. 题干必须提供完成任务所需事实，不得要求题外知识才能回答。
 2. 新题应让弱模型主要在 1 个核心错误上失分，而不是在多个任务点上同时失分。
 3. 不得设置只能靠猜、靠经验、靠题外法律评价才能作答的陷阱。
 4. 如果参考答案需要大量新增知识才能回答，说明改写失败。
-5. 如果删掉题目中的一小段要求后，核心考点明显变化，说明本题混入了多个能力点，必须继续简化。
-
+5. 如果 judge 无法根据 rubric 稳定判断对错，说明改写失败。
+6. 如果强模型也很可能因为题面歧义而答错，说明改写失败。
+# 第六步：强弱模型差距预测
+输出前必须判断：
+1. 当前弱模型最可能错在哪里；
+2. 这个错误是否不同于旧式“普通两层拆分 / 显式最小缺口”；
+3. 强模型为什么有机会答对；
+4. judge 应该抓住哪些具体点评分；
+5. 该题是否适合进入 replay-based selection。
 # 禁止的进化方式
 1. 禁止把难度主要建立在题目更长、任务更多、格式更复杂上。
-2. 禁止连续多轮只复用“最小关键事实/最小前提/最小跳步/哪一层成立”这一类同家族题型。
+2. 禁止连续多轮只复用“最小关键事实 / 最小前提 / 最小跳步 / 哪一层成立”这一类旧题型。
 3. 禁止把开放题统一改写成边界题后就停住，不再继续追问真正决定胜负的差异。
 4. 禁止让题目主要考“遵循复杂指令”，而不是考原题对应的专业判断能力。
-
+5. 禁止在题面直接暴露答案模板，让弱模型靠复述题面得分。
+6. 禁止靠题外知识、冷门知识、主观评价或不可验证猜测制造难度。
+7. 禁止在 evolved_prompt 中出现 operator 名称、边界类型名或评分标签；这些只能出现在 JSON metadata 字段。
+8. 禁止把 evaluation_focus、target_current_qwen_failure 或 scoring_alignment 中的判断点原样搬进题面。
 # 输入
 ## 原题
 {|prompt|}
@@ -260,10 +310,14 @@ QUESTION_EVOLUTION_PROMPT_TEMPLATE_V1 = """
 # 输出要求
 返回合法 JSON 对象，不要输出 Markdown 标记或额外解释。
 必须包含以下字段：
-
+```json
 {
-  "evolved_prompt": "升级后的新题目。必须完整、可独立作答、聚焦一个主轴，并遵守复杂度预算。",
-  "evolution_strategy": "说明本轮选择了哪一个主错误、哪一种题型、为什么没有继续沿用更容易让题变清楚的改法。",
+  "evolved_prompt": "升级后的新题目。必须完整、可独立作答、聚焦一个主轴，并遵守发现模式复杂度预算。",
+  "evolution_strategy": "说明本轮选择了哪一个算子和题面竞争形式、为什么没有继续沿用旧式两层拆分或显式最小缺口问法，并说明题面如何避免泄漏答案标签。",
+  "target_current_qwen_failure": "预测当前弱模型最可能错在哪里，必须具体到一个可评分的判断点。",
+  "why_old_operator_not_enough": "说明为什么普通两层拆分、显式最小缺口、常规线索/结论区分等旧题型不足以继续压测本题。",
+  "new_boundary_type": "O10_evidence_sufficiency_ladder / O11_unobserved_state_attribution / O12_conjunctive_necessity / O13_minimal_disqualifier / O14_information_closure / O15_counterfactual_threshold_shift / O16_close_alternative_normalization / O17_action_vs_fact_threshold / O18_baseline_scope_mismatch / O9_abnormal_mainline_switch 之一。",
+  "expected_gpt_advantage": "说明强模型为什么应该能答对，优势来自对相近表述、事实变化和评价保留范围的精确区分，而不是题外知识。",
   "evaluation_focus": [
     "后续评分时最该检查的错误1",
     "后续评分时最该检查的错误2",
@@ -271,27 +325,58 @@ QUESTION_EVOLUTION_PROMPT_TEMPLATE_V1 = """
   ],
   "complexity_budget": {
     "main_axis": "一句话说明本题核心考什么",
-    "chosen_primary_cause": "A/B/C/D/E/F 之一",
-    "chosen_primary_method": "候选缺口二选一/子判断定位/近似项分层/伪闭环识别/补强项升级判断/单变量反事实",
-    "target_subclaim": "若结论可拆分，这一轮具体考哪一个子判断或哪一段相邻层级差异",
+    "chosen_boundary_type": "O10/O11/O12/O13/O14/O15/O16/O17/O18/O9+ 之一",
+    "target_subclaim_or_threshold": "本轮具体压测哪一个业务判断、报告表述、处置结论或评价保留范围",
     "new_facts_count": 0,
     "output_tasks_count": 0,
     "candidate_options_count": 0,
+    "counterfactual_count": 0,
     "estimated_prompt_chars": 0,
+    "operator_specific_budget_used": "说明是否使用了 operator-specific 放宽，以及为什么仍然不是复杂度堆叠",
     "clarity_trap_checked": true,
-    "why_within_budget": "说明为什么没有复杂度堆叠，也没有把题改得更清楚却更容易答"
+    "why_within_budget": "说明为什么没有靠加长、加任务、加格式制造难度，也没有把题改得更清楚却更容易答"
+  },
+  "scoring_alignment": {
+    "rubric_should_reward": [
+      "应该得分的关键判断1",
+      "应该得分的关键判断2"
+    ],
+    "rubric_should_penalize": [
+      "应该扣分的典型错误1",
+      "应该扣分的典型错误2"
+    ],
+    "is_replay_selection_ready": true
+  },
+  "prompt_leakage_check": {
+    "contains_operator_name_or_boundary_label": false,
+    "contains_answer_label": false,
+    "contains_forbidden_threshold_paraphrase": false,
+    "contains_full_reasoning_path": false,
+    "why_not_hint_leakage": "说明题面为什么只给事实和竞争判断，没有把答案标签、同义门槛泄漏句式或评分关注点写给模型"
+  },
+  "competition_closeness_check": {
+    "same_subject": true,
+    "same_scene": true,
+    "same_target_judgment": true,
+    "correct_option_does_not_monopolize_core_match": true,
+    "one_micro_variable_changes_level": true,
+    "why_distractors_are_not_runners_up_only": "说明干扰项为什么不是背景、外围、反向或无关事实"
   },
   "notes_for_reference": "如果参考答案需要补充或调整才能完美回答新题，请简要说明；如果基本适用则写'基本适用'"
 }
-
+```
 # 最终质量自检
 输出前逐项确认：
 1. 新题不是简单加长版；
 2. 新题只有 1 个主轴；
-3. 如果原题已经被压成边界题，这次是否真的换到了更细的竞争判断；
-4. 如果题目要求比较缺口，是否给出了足够接近但不等价的候选；
-5. 新题不会因为“更清楚”而让候选答案更容易顺着答；
-6. 新题的主要失分点能被 rubric 稳定捕捉。
+3. 新题没有继续复用已失效的旧式边界题模板；
+4. 新题至少包含两个足够接近但实际层级、方向、闭包状态或门槛不同的竞争判断；
+5. 正确项没有独占同主体、同地点、同时间尺度、同判断对象；
+6. 题面没有黑名单中的显性缺口、材料强弱或结论推出句式；
+7. 新题问的是报告表述、处置结论或原评价保留，不是材料分类；
+8. 新题不会因为“更清楚”而让候选答案更容易顺着答；
+9. 新题的主要失分点能被 rubric 稳定捕捉；
+10. 新题能服务于 replay-based selection，即可以比较当前弱模型得分、强模型得分和二者 gap。
 """.strip()
 
 
@@ -386,7 +471,7 @@ class RotatingAPIClient:
         self.api_keys = api_keys
         self.request_timeout = request_timeout
         self.current_key_index = 0
-        self.client: Optional[AsyncOpenAI] = None
+        self.client: Optional[Any] = None
         self._lock = asyncio.Lock()
         self._init_client()
 
@@ -956,7 +1041,7 @@ def enrich_evolution_result_with_operator(
     diagnosis = get_overscore_diagnosis(item)
     enriched = dict(evolved)
     enriched["operator_used"] = operator_id
-    enriched.setdefault("ability_axis", spec.ability_axis)
+    enriched["ability_axis"] = spec.ability_axis
 
     target_failure = str(diagnosis.get("target_failure_mode", "") or "").strip()
     cause = str(diagnosis.get("candidate_overscore_cause", "") or "").strip()
@@ -983,8 +1068,28 @@ def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rat
     meta_info = result.get("meta_info")
     if not isinstance(meta_info, dict):
         meta_info = {}
+    else:
+        meta_info = dict(meta_info)
+
+    # 保存直接父题的一层快照，供候选全部无效或 score_increased 时完整回滚。
+    # 不递归保存更早快照，保持当前实现的单层父节点语义。
+    parent_snapshot = {
+        "prompt": original_prompt,
+        "rubric": item.get("rubric"),
+        "rubric_thought_process": item.get("rubric_thought_process"),
+        "score_prompt": item.get("score_prompt"),
+        "scoring_result": item.get("scoring_result"),
+        "score_rate": get_score_rate(item),
+        "question_evolved": item.get("question_evolved", False),
+        "references": meta_info.get("references"),
+        "prompt_old": meta_info.get("prompt_old"),
+        "question_evolution_metadata": meta_info.get("question_evolution_metadata"),
+    }
+    meta_info["parent_snapshot"] = parent_snapshot
     meta_info["prompt_old"] = original_prompt
+    meta_info["stale_references"] = meta_info.get("references")
     meta_info["stale_rubric"] = result.pop("rubric", None)
+    meta_info["stale_rubric_thought_process"] = result.pop("rubric_thought_process", None)
     meta_info["stale_score_prompt"] = result.pop("score_prompt", None)
     meta_info["stale_scoring_result"] = result.pop("scoring_result", None)
 
@@ -1116,7 +1221,6 @@ class QuestionEvolutionProcessor:
             max_tokens=MAX_OUTPUT_TOKENS
         )
         content = extract_answer(response)
-        original_prompt = str(item.get("prompt", "")).strip()
         evolved = parse_evolution_response(content)
         if operator_id:
             evolved = enrich_evolution_result_with_operator(evolved, item, operator_id)
@@ -1356,8 +1460,10 @@ class QuestionEvolutionProcessor:
         failed_path = output_path + ".failed"
         file_mode = "a" if processed_keys else "w"
         candidate_counts = self.allocate_candidate_counts(pending_items) if self.num_candidates > 1 else {}
+        failed_count = 0
 
         async def run_one(item: Dict[str, Any], out_f, fail_f):
+            nonlocal failed_count
             try:
                 if self.num_candidates > 1:
                     processed_items = await self.process_item_candidates(
@@ -1395,6 +1501,7 @@ class QuestionEvolutionProcessor:
                     out_f.flush()
                     fail_f.write(json.dumps(failed_item, ensure_ascii=False) + "\n")
                     fail_f.flush()
+                    failed_count += 1
 
         pending_target_count = sum(1 for item in pending_items if should_evolve(item, self.min_score_rate))
         logger.info(
@@ -1414,6 +1521,12 @@ class QuestionEvolutionProcessor:
             os.remove(failed_path)
         elif os.path.exists(failed_path):
             logger.warning(f"存在失败数据，已保存至: {failed_path}")
+
+        if failed_count:
+            raise RuntimeError(
+                f"question evolution 阶段有 {failed_count}/{len(pending_items)} 条记录失败；"
+                f"失败详情见 {failed_path}，已停止后续流水线。"
+            )
 
         logger.info(f"question 进化/全量输出完成，结果保存至: {output_path}")
 

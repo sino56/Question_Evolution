@@ -290,15 +290,10 @@ class AnswerCollector:
 
     async def call_llm_raw(self, question: str) -> str:
         """原生调用 LLM，没有任何额外的 instruction"""
-        system_prompt = """请回答用户的问题。回答要求：
-1. 不要使用比喻、类比等修辞手法
-2. 结构化分条输出
-"""
         async with self.semaphore:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    # {"role": "system", "content": system_prompt},
                     {"role": "user", "content": question}
                 ],
                 # temperature=0.1, # 采样时通常需要一定的随机性
@@ -404,8 +399,7 @@ class AnswerCollector:
     async def process_file(self, input_path: str, output_path: str, num_samples: int, max_concurrent_items: int):
         """处理文件"""
         if not os.path.exists(input_path):
-            logger.error(f"输入文件不存在: {input_path}")
-            return
+            raise FileNotFoundError(f"输入文件不存在: {input_path}")
 
         items = []
         with open(input_path, 'r', encoding='utf-8') as f:
@@ -439,8 +433,10 @@ class AnswerCollector:
 
         # 控制处理条目的并发
         item_semaphore = asyncio.Semaphore(max_concurrent_items)
+        failed_count = 0
 
         async def sem_process(item, out_f, fail_f, position):
+            nonlocal failed_count
             async with item_semaphore:
                 item_index = item.get("index", position)
 
@@ -461,6 +457,7 @@ class AnswerCollector:
                     async with self.write_lock:
                         fail_f.write(json.dumps(failed_item, ensure_ascii=False) + '\n')
                         fail_f.flush()
+                        failed_count += 1
                     logger.error(f"条目 {item_index} 采集异常，已转入失败文件: {e}")
                     return failed_item
 
@@ -496,6 +493,7 @@ class AnswerCollector:
                         logger.error(f"条目 {item_index} 处理失败，存在异常回答: {answer_quality_issues}")
                         fail_f.write(json.dumps(transformed_data, ensure_ascii=False) + '\n')
                         fail_f.flush()
+                        failed_count += 1
                 return transformed_data
 
         with open(output_path, file_mode, encoding='utf-8') as f, \
@@ -514,6 +512,12 @@ class AnswerCollector:
             os.remove(failed_path)
         else:
             logger.warning(f"存在失败的数据，已保存至: {failed_path}")
+
+        if failed_count:
+            raise RuntimeError(
+                f"answer collection 阶段有 {failed_count}/{len(items)} 条记录失败；"
+                f"失败详情见 {failed_path}，已停止后续流水线。"
+            )
 
 async def main():
     parser = argparse.ArgumentParser(description="采集 LLM 对问题的原生回答")

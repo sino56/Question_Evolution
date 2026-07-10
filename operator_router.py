@@ -7,37 +7,40 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from select_evolution_candidates import (
     EVOLVE_HIGH_SCORE_OVERSCORE,
     PASS_THROUGH_OR_SCORING_NOISE,
+    PROBE_MIDDLE_SCORE_BOUNDARY,
     RECONSTRUCT_LOW_SCORE_BOUNDARY,
     STOP_EVOLUTION,
     get_score_rate,
 )
 
 
-O1_GAP_CHOICE = "O1_gap_choice"
-O2_SUBCLAIM_LOCALIZATION = "O2_subclaim_localization"
-O3_STEP_JUMP = "O3_step_jump"
-O4_NEAR_LEVEL_RANKING = "O4_near_level_ranking"
-O5_EXTRA_PREMISE_DETECTION = "O5_extra_premise_detection"
-O6_SINGLE_VARIABLE_COUNTERFACTUAL = "O6_single_variable_counterfactual"
-O7_FACT_BINDING_CONSTRAINT = "O7_fact_binding_constraint"
-O8_DOUBLE_THRESHOLD_CLAIM = "O8_double_threshold_claim"
-O9_ABNORMAL_CLUE_MAINLINE_SWITCH = "O9_abnormal_clue_mainline_switch"
+O10_EVIDENCE_SUFFICIENCY_LADDER = "O10_evidence_sufficiency_ladder"
+O11_UNOBSERVED_STATE_ATTRIBUTION = "O11_unobserved_state_attribution"
+O12_CONJUNCTIVE_NECESSITY = "O12_conjunctive_necessity"
+O13_MINIMAL_DISQUALIFIER = "O13_minimal_disqualifier"
+O14_INFORMATION_CLOSURE = "O14_information_closure"
+O15_COUNTERFACTUAL_THRESHOLD_SHIFT = "O15_counterfactual_threshold_shift"
+O16_CLOSE_ALTERNATIVE_NORMALIZATION = "O16_close_alternative_normalization"
+O17_ACTION_VS_FACT_THRESHOLD = "O17_action_vs_fact_threshold"
+O18_BASELINE_SCOPE_MISMATCH = "O18_baseline_scope_mismatch"
 
-OPERATOR_IDS = {
-    O1_GAP_CHOICE,
-    O2_SUBCLAIM_LOCALIZATION,
-    O3_STEP_JUMP,
-    O4_NEAR_LEVEL_RANKING,
-    O5_EXTRA_PREMISE_DETECTION,
-    O6_SINGLE_VARIABLE_COUNTERFACTUAL,
-    O7_FACT_BINDING_CONSTRAINT,
-    O8_DOUBLE_THRESHOLD_CLAIM,
-    O9_ABNORMAL_CLUE_MAINLINE_SWITCH,
-}
+OPERATOR_ORDER = (
+    O10_EVIDENCE_SUFFICIENCY_LADDER,
+    O11_UNOBSERVED_STATE_ATTRIBUTION,
+    O12_CONJUNCTIVE_NECESSITY,
+    O13_MINIMAL_DISQUALIFIER,
+    O14_INFORMATION_CLOSURE,
+    O15_COUNTERFACTUAL_THRESHOLD_SHIFT,
+    O16_CLOSE_ALTERNATIVE_NORMALIZATION,
+    O17_ACTION_VS_FACT_THRESHOLD,
+    O18_BASELINE_SCOPE_MISMATCH,
+)
+OPERATOR_IDS = set(OPERATOR_ORDER)
 
 EVOLUTION_REQUIRED_ACTIONS = {
     EVOLVE_HIGH_SCORE_OVERSCORE,
     RECONSTRUCT_LOW_SCORE_BOUNDARY,
+    PROBE_MIDDLE_SCORE_BOUNDARY,
 }
 
 NON_EVOLUTION_ACTIONS = {
@@ -58,15 +61,15 @@ except ValueError:
 FAILURE_MEMORY_WINDOW_ROUNDS = max(1, FAILURE_MEMORY_WINDOW_ROUNDS)
 
 OPERATOR_SURFACE_FORM_FAMILY = {
-    O1_GAP_CHOICE: "evidence_relation_comparison",
-    O2_SUBCLAIM_LOCALIZATION: "fact_conclusion_support_review",
-    O3_STEP_JUMP: "step_jump_review",
-    O4_NEAR_LEVEL_RANKING: "near_level_comparison",
-    O5_EXTRA_PREMISE_DETECTION: "external_premise_review",
-    O6_SINGLE_VARIABLE_COUNTERFACTUAL: "counterfactual_boundary",
-    O7_FACT_BINDING_CONSTRAINT: "fact_binding_review",
-    O8_DOUBLE_THRESHOLD_CLAIM: "conclusion_strength_boundary",
-    O9_ABNORMAL_CLUE_MAINLINE_SWITCH: "abnormal_mainline_switch",
+    O10_EVIDENCE_SUFFICIENCY_LADDER: "evidence_sufficiency_ladder",
+    O11_UNOBSERVED_STATE_ATTRIBUTION: "unobserved_state_attribution",
+    O12_CONJUNCTIVE_NECESSITY: "conjunctive_necessity",
+    O13_MINIMAL_DISQUALIFIER: "minimal_disqualifier",
+    O14_INFORMATION_CLOSURE: "information_closure",
+    O15_COUNTERFACTUAL_THRESHOLD_SHIFT: "counterfactual_threshold_shift",
+    O16_CLOSE_ALTERNATIVE_NORMALIZATION: "close_alternative_normalization",
+    O17_ACTION_VS_FACT_THRESHOLD: "action_vs_fact_threshold",
+    O18_BASELINE_SCOPE_MISMATCH: "baseline_scope_mismatch",
 }
 FAILURE_MEMORY_WARN_THRESHOLD = 1
 FAILURE_MEMORY_DOWNRANK_THRESHOLD = 2
@@ -398,66 +401,73 @@ def _base_rule_route(item: Dict[str, Any]) -> Tuple[Optional[str], List[str], st
     target = _clean_text(diagnosis.get("target_failure_mode"))
     combined = f"{cause} {target}"
 
-    if _has_any(target, ("反常线索主线切换失败", "主线切换")):
+    if _has_any(combined, ("盲区", "不可见区间", "未出现", "端点事实", "不可见状态")):
         return (
-            O9_ABNORMAL_CLUE_MAINLINE_SWITCH,
-            [O6_SINGLE_VARIABLE_COUNTERFACTUAL],
-            "target_failure_mode indicates abnormal-clue mainline switching.",
+            O11_UNOBSERVED_STATE_ATTRIBUTION,
+            [O17_ACTION_VS_FACT_THRESHOLD],
+            "diagnosis indicates unobserved-state attribution risk.",
         )
 
-    if _has_any(cause, ("漏最小关键事实", "最小关键事实", "最关键缺口")):
+    if _has_any(combined, ("基线", "样本口径", "统计口径", "范围错配", "基准范围")):
         return (
-            O1_GAP_CHOICE,
-            [O2_SUBCLAIM_LOCALIZATION],
-            "candidate_overscore_cause maps to gap-choice routing.",
+            O18_BASELINE_SCOPE_MISMATCH,
+            [O10_EVIDENCE_SUFFICIENCY_LADDER],
+            "diagnosis indicates baseline-scope mismatch.",
         )
 
-    if _has_any(cause, ("层级越推", "线索升级", "层级混淆")):
+    if _has_any(combined, ("正常解释", "替代解释", "风险消失", "异常强度下降")):
         return (
-            O3_STEP_JUMP,
-            [O4_NEAR_LEVEL_RANKING],
-            "candidate_overscore_cause maps to step-jump routing.",
+            O16_CLOSE_ALTERNATIVE_NORMALIZATION,
+            [O15_COUNTERFACTUAL_THRESHOLD_SHIFT],
+            "diagnosis indicates over-normalization by a close alternative.",
         )
 
-    if _has_any(cause, ("题外补设", "题干外", "隐藏前提")):
+    if _has_any(combined, ("反事实", "单变量", "变量变化", "门槛迁移", "保留范围")):
         return (
-            O5_EXTRA_PREMISE_DETECTION,
-            [],
-            "candidate_overscore_cause maps to extra-premise detection.",
+            O15_COUNTERFACTUAL_THRESHOLD_SHIFT,
+            [O16_CLOSE_ALTERNATIVE_NORMALIZATION],
+            "diagnosis calls for a single-variable threshold shift.",
         )
 
-    if _has_any(cause, ("泛化罗列", "套话", "事实绑定")):
+    if _has_any(combined, ("处置", "事实定性", "行动门槛", "报告表述", "动作层与性质层")):
         return (
-            O7_FACT_BINDING_CONSTRAINT,
-            [],
-            "candidate_overscore_cause maps to fact-binding constraint.",
+            O17_ACTION_VS_FACT_THRESHOLD,
+            [O11_UNOBSERVED_STATE_ATTRIBUTION, O12_CONJUNCTIVE_NECESSITY],
+            "diagnosis indicates confusion between action and fact thresholds.",
         )
 
-    if _has_any(cause, ("抓显眼点漏关键层", "双门槛", "漏关键层")):
+    if _has_any(combined, ("题外补设", "题干外", "隐藏前提", "信息闭包", "泛化罗列", "事实绑定")):
         return (
-            O8_DOUBLE_THRESHOLD_CLAIM,
-            [O2_SUBCLAIM_LOCALIZATION],
-            "candidate_overscore_cause maps to double-threshold routing.",
+            O14_INFORMATION_CLOSURE,
+            [O10_EVIDENCE_SUFFICIENCY_LADDER],
+            "diagnosis indicates an information-closure violation.",
         )
 
-    if _has_any(combined, ("近似项分层", "判据内", "判据外", "相关但不可用")):
+    if _has_any(combined, ("原评价", "新增事实", "推翻", "下调", "最小否决", "最小关键事实", "最关键缺口")):
         return (
-            O4_NEAR_LEVEL_RANKING,
-            [O5_EXTRA_PREMISE_DETECTION],
-            "diagnosis indicates near-level or criterion-boundary ranking.",
+            O13_MINIMAL_DISQUALIFIER,
+            [O15_COUNTERFACTUAL_THRESHOLD_SHIFT],
+            "diagnosis calls for testing whether a new fact changes an existing evaluation.",
         )
 
-    if _has_any(cause, ("受干扰信息带偏", "干扰信息")):
+    if _has_any(combined, ("强线索", "共同必要", "必要条件", "门槛未闭合", "层级越推", "抓显眼点漏关键层")):
         return (
-            O6_SINGLE_VARIABLE_COUNTERFACTUAL,
-            [O9_ABNORMAL_CLUE_MAINLINE_SWITCH, O4_NEAR_LEVEL_RANKING],
-            "candidate_overscore_cause maps to counterfactual or mainline-switch routing.",
+            O12_CONJUNCTIVE_NECESSITY,
+            [O17_ACTION_VS_FACT_THRESHOLD],
+            "diagnosis indicates that a strong clue is replacing an unclosed threshold.",
+        )
+
+    if _has_any(combined, ("反常线索", "主线切换", "受干扰信息带偏", "近似项分层", "层级混淆")):
+        return (
+            O10_EVIDENCE_SUFFICIENCY_LADDER,
+            [O15_COUNTERFACTUAL_THRESHOLD_SHIFT, O14_INFORMATION_CLOSURE],
+            "diagnosis calls for close business-judgment competition.",
         )
 
     return (
-        O2_SUBCLAIM_LOCALIZATION,
-        [O4_NEAR_LEVEL_RANKING],
-        "fallback to subclaim localization for evolvable sample.",
+        O10_EVIDENCE_SUFFICIENCY_LADDER,
+        [O17_ACTION_VS_FACT_THRESHOLD, O14_INFORMATION_CLOSURE],
+        "fallback to close business-judgment competition for an evolvable sample.",
     )
 
 
@@ -508,11 +518,13 @@ def _is_high_value_sample(item: Dict[str, Any]) -> bool:
         and _has_any(
             f"{cause} {target}",
             (
-                "漏最小关键事实",
-                "选错最关键缺口",
-                "抓显眼点漏关键层",
-                "近似项分层",
-                "反常线索主线切换失败",
+                "盲区",
+                "强线索",
+                "题外补设",
+                "反事实",
+                "正常解释",
+                "处置",
+                "基线",
                 "主线抓偏",
             ),
         )
@@ -569,14 +581,26 @@ def build_operator_route(
             primary = memory_operator
 
     previous_operator = _previous_operator(item)
-    if previous_operator == O1_GAP_CHOICE and _is_current_full_score(item, full_score_threshold):
-        _append_unique(avoid, [O1_GAP_CHOICE])
-        if primary == O1_GAP_CHOICE:
-            primary = O2_SUBCLAIM_LOCALIZATION
-            backups = [O4_NEAR_LEVEL_RANKING, O8_DOUBLE_THRESHOLD_CLAIM] + backups
-        else:
-            _append_unique(backups, [O2_SUBCLAIM_LOCALIZATION, O4_NEAR_LEVEL_RANKING, O8_DOUBLE_THRESHOLD_CLAIM])
-        reason_parts.append("previous O1 full-score result blocks repeating O1.")
+    state = get_evolution_state(item)
+    previous_effect = _clean_text(state.get("previous_effect_status"))
+    stop_status = _clean_text(state.get("stop_status"))
+    if previous_operator and (
+        _is_current_full_score(item, full_score_threshold)
+        or previous_effect in {
+            "full_score_no_drop",
+            "no_clear_effect",
+            "needs_manual_review",
+            "repeated_pattern",
+            "score_increased",
+        }
+        or stop_status in {
+            "continue_with_new_operator",
+            "local_tree_search_needed",
+            "rollback_and_reroute",
+        }
+    ):
+        _append_unique(avoid, [previous_operator])
+        reason_parts.append(f"previous ineffective operator {previous_operator} is blocked for this reroute.")
 
     if recommended_next:
         ordered_candidates: List[str] = []
@@ -599,7 +623,7 @@ def build_operator_route(
             primary = replacement
             backups = _remove_values(backups, [primary])
         else:
-            primary = O2_SUBCLAIM_LOCALIZATION if O2_SUBCLAIM_LOCALIZATION not in avoid else None
+            primary = next((operator for operator in OPERATOR_ORDER if operator not in avoid), None)
 
     primary, backups, memory_action_reasons = _apply_surface_form_memory_actions(
         primary,

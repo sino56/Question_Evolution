@@ -188,11 +188,9 @@ def test_state_update_and_memory_entries_cover_success_failure_invalid_review():
     assert states["stage05-full"]["consecutive_full_score_count"] == 2
     assert states["stage05-invalid"]["stop_status"] == "invalid_complexity_sample"
     assert states["stage05-review"]["stop_status"] == "continue_with_new_operator"
+    assert states["stage05-drop"]["round"] == 3
 
-    assert {entry["sample_id"] for entry in operator_memory} == {"stage05-drop", "stage05-review"}
-    low_confidence_entry = next(entry for entry in operator_memory if entry["sample_id"] == "stage05-review")
-    assert low_confidence_entry["hit_confidence"] == "low"
-    assert low_confidence_entry["needs_manual_review"] is True
+    assert {entry["sample_id"] for entry in operator_memory} == {"stage05-drop"}
 
     assert {entry["sample_id"] for entry in failure_memory} == {"stage05-full"}
     assert failure_memory[0]["failure_type"] == "full_score_no_drop"
@@ -238,19 +236,20 @@ def test_preselection_difficulty_gain_failures_feed_memory_entries():
     assert failure_entries[0]["risk_tags"] == ["missing_premise_named"]
 
 
-def test_full_score_after_operator_switch_can_stop_as_stable_high_score():
+def test_full_score_after_operator_switch_enters_local_tree_search():
     record = {
         "sample_id": "stable-stop",
         "question_evolved": True,
         "evolution_state": {
-            "previous_operator": "O1_gap_choice",
+            "previous_operator": "O13_minimal_disqualifier",
             "consecutive_full_score_count": 1,
             "consecutive_same_operator_count": 1,
+            "recommended_next_methods": ["O15_counterfactual_threshold_shift"],
             "stop_status": "continue_with_new_operator",
         },
         "effect_analysis": {
             "effect_label": "full_score_no_drop",
-            "operator_used": "O2_subclaim_localization",
+            "operator_used": "O15_counterfactual_threshold_shift",
             "is_full_score": True,
             "score_rate_after": 1.0,
             "complexity_passed": True,
@@ -261,8 +260,98 @@ def test_full_score_after_operator_switch_can_stop_as_stable_high_score():
     state = updated[0]["evolution_state"]
 
     assert state["consecutive_full_score_count"] == 2
-    assert state["stop_status"] == "stable_high_score_stop"
+    assert state["stop_status"] == "local_tree_search_needed"
     assert failure_memory[0]["failure_type"] == "full_score_no_drop"
+
+
+def test_score_increased_rolls_back_parent_and_reroutes():
+    record = {
+        "sample_id": "rollback",
+        "prompt": "进化后但更容易的新题",
+        "question_evolved": True,
+        "rubric": [{"title": "new"}],
+        "score_prompt": "new score prompt",
+        "scoring_result": {"total_awarded": 9, "total_possible": 10},
+        "score_rate": 0.9,
+        "meta_info": {
+            "references": ["新题参考答案"],
+            "parent_snapshot": {
+                "prompt": "父题",
+                "rubric": [{"title": "old"}],
+                "score_prompt": "old score prompt",
+                "scoring_result": {"total_awarded": 6, "total_possible": 10},
+                "score_rate": 0.6,
+                "question_evolved": False,
+                "references": ["父题参考答案"],
+                "prompt_old": None,
+                "question_evolution_metadata": None,
+            },
+        },
+        "effect_analysis": {
+            "effect_label": "score_increased",
+            "operator_used": "O13_minimal_disqualifier",
+            "is_full_score": False,
+            "score_rate_before": 0.6,
+            "score_rate_after": 0.9,
+            "complexity_passed": True,
+            "lightweight_hit_reason": "分数升高",
+        },
+    }
+
+    updated, _, failure_memory, _ = update_records([record])
+    rolled_back = updated[0]
+
+    assert rolled_back["prompt"] == "父题"
+    assert rolled_back["rubric"] == [{"title": "old"}]
+    assert rolled_back["score_prompt"] == "old score prompt"
+    assert rolled_back["scoring_result"]["total_awarded"] == 6
+    assert rolled_back["score_rate"] == 0.6
+    assert rolled_back["meta_info"]["references"] == ["父题参考答案"]
+    assert rolled_back["question_evolved"] is False
+    assert rolled_back["evolution_state"]["stop_status"] == "rollback_and_reroute"
+    assert rolled_back["evolution_state"]["recommended_next_methods"]
+    assert failure_memory[0]["operator_used"] == "O13_minimal_disqualifier"
+
+
+def test_effect_analysis_prefers_selected_candidate_operator():
+    previous = [{"sample_id": "selected-op", "score_rate": 1.0}]
+    current = [{
+        "sample_id": "selected-op",
+        "prompt": "题目",
+        "question_evolved": True,
+        "candidate_selection": {"selected_operator": "O17_action_vs_fact_threshold"},
+        "candidate_operator": "O17_action_vs_fact_threshold",
+        "meta_info": {"question_evolution_metadata": {
+            "operator_used": "O10_evidence_sufficiency_ladder",
+            "expected_evaluation_focus": ["处置触发与事实定性"],
+        }},
+        "validation_result": {"passed": True, "repeat_pattern_risk": "low"},
+        "scoring_result": {
+            "candidate_answer": "处置触发和事实定性混淆。",
+            "total_awarded": 6,
+            "total_possible": 10,
+        },
+        "score_rate": 0.6,
+    }]
+
+    effect = analyze_records(current, previous_records=previous)[0]["effect_analysis"]
+    assert effect["operator_used"] == "O17_action_vs_fact_threshold"
+
+
+def test_score_increase_takes_precedence_when_new_score_reaches_full():
+    previous = [{"sample_id": "increase-to-full", "score_rate": 0.8}]
+    current = [{
+        "sample_id": "increase-to-full",
+        "prompt": "新题",
+        "question_evolved": True,
+        "candidate_selection": {"selected_operator": "O10_evidence_sufficiency_ladder"},
+        "meta_info": {"question_evolution_metadata": {"expected_evaluation_focus": ["业务判断竞争"]}},
+        "validation_result": {"passed": True, "repeat_pattern_risk": "low"},
+        "scoring_result": {"candidate_answer": "完整正确", "total_awarded": 10, "total_possible": 10},
+        "score_rate": 1.0,
+    }]
+    effect = analyze_records(current, previous_records=previous)[0]["effect_analysis"]
+    assert effect["effect_label"] == "score_increased"
 
 
 if __name__ == "__main__":
@@ -273,5 +362,8 @@ if __name__ == "__main__":
     test_effect_matrix_summarizes_sample_type_by_operator()
     test_state_update_and_memory_entries_cover_success_failure_invalid_review()
     test_preselection_difficulty_gain_failures_feed_memory_entries()
-    test_full_score_after_operator_switch_can_stop_as_stable_high_score()
+    test_full_score_after_operator_switch_enters_local_tree_search()
+    test_score_increased_rolls_back_parent_and_reroutes()
+    test_effect_analysis_prefers_selected_candidate_operator()
+    test_score_increase_takes_precedence_when_new_score_reaches_full()
     print("stage05 effect analysis and state update checks passed")

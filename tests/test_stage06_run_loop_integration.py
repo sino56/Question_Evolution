@@ -58,11 +58,24 @@ def test_run_loop_carries_state_forward_and_guards_memory_writes():
     assert 'state_update_report.json' in RUN_LOOP
 
 
-def test_run_loop_defaults_to_admitted_samples_with_legacy_fallback():
+def test_run_loop_defaults_to_admitted_input_with_legacy_fallback():
     assert 'DEFAULT_INPUT_FILE="admitted_seed_samples.jsonl"' in RUN_LOOP
     assert 'LEGACY_INPUT_FILE="data/data.jsonl"' in RUN_LOOP
     assert 'INPUT_FILE=${INPUT_FILE:-$DEFAULT_INPUT_FILE}' in RUN_LOOP
-    assert "请设置 INPUT_FILE 指向 admitted_seed_samples.jsonl" in RUN_LOOP
+    assert "请设置 INPUT_FILE 指向" in RUN_LOOP
+
+
+def test_run_loop_injects_the_current_round_into_each_round_input():
+    assert "prepare_round_input()" in RUN_LOOP
+    assert 'item["round"] = round_number' in RUN_LOOP
+    assert 'prepare_round_input "$INPUT_FILE" "$ROUND_DIR/input.jsonl" "$ROUND"' in RUN_LOOP
+    assert 'prepare_round_input "$PREV_SCORED" "$ROUND_DIR/input.jsonl" "$ROUND"' in RUN_LOOP
+
+
+def test_run_loop_uses_rolled_back_state_for_global_stop_checks():
+    assert 'AVG_RATE=$(compute_avg_score_rate "$ROUND_OUTPUT_FOR_NEXT")' in RUN_LOOP
+    assert 'CONTINUE_COUNT=$(extract_continue_count "$ROUND_OUTPUT_FOR_NEXT")' in RUN_LOOP
+    assert '"$CONTINUE_COUNT" -eq 0' in RUN_LOOP
 
 
 def test_run_loop_uses_existing_stage_cli_flags():
@@ -108,7 +121,9 @@ def test_run_loop_keeps_rubric_and_scoring_as_closed_loop_steps_only():
 if __name__ == "__main__":
     test_run_loop_uses_stage06_full_pipeline_order()
     test_run_loop_carries_state_forward_and_guards_memory_writes()
-    test_run_loop_defaults_to_admitted_samples_with_legacy_fallback()
+    test_run_loop_defaults_to_admitted_input_with_legacy_fallback()
+    test_run_loop_injects_the_current_round_into_each_round_input()
+    test_run_loop_uses_rolled_back_state_for_global_stop_checks()
     test_run_loop_uses_existing_stage_cli_flags()
     test_run_loop_keeps_rubric_and_scoring_as_closed_loop_steps_only()
     print("stage06 run loop integration checks passed")

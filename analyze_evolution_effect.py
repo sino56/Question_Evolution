@@ -395,6 +395,9 @@ def build_effect_analysis(
     elif delta_score_rate > score_increase_threshold:
         effect_label = "score_increased"
         reason = "新一轮得分率升高，当前改写未带来更清晰边界。"
+    elif is_full_score:
+        effect_label = "full_score_no_drop"
+        reason = "新一轮评分仍为满分，当前算子未形成有效压测。"
     else:
         effect_label = "no_clear_effect"
         reason = "未观察到足够清晰的得分变化。"

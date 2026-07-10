@@ -56,6 +56,7 @@
       "enum": [
         "evolve_high_score_overscore",
         "reconstruct_low_score_boundary",
+        "probe_middle_score_boundary",
         "pass_through_or_scoring_noise",
         "stop_evolution"
       ]

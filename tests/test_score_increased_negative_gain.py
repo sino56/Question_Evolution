@@ -11,7 +11,7 @@ from analyze_evolution_effect import analyze_records
 from update_sample_state import update_records
 
 
-def test_score_increased_is_negative_gain_and_continues_with_new_operator():
+def test_score_increased_is_negative_gain_rolls_back_and_reroutes():
     previous = [
         {
             "sample_id": "score-up",
@@ -29,7 +29,7 @@ def test_score_increased_is_negative_gain_and_continues_with_new_operator():
             "meta_info": {
                 "question_evolution_metadata": {
                     "question_evolved": True,
-                    "operator_used": "O1_gap_choice",
+                    "operator_used": "O13_minimal_disqualifier",
                     "expected_evaluation_focus": ["boundary"],
                 }
             },
@@ -45,11 +45,10 @@ def test_score_increased_is_negative_gain_and_continues_with_new_operator():
 
     assert effect["effect_label"] == "score_increased"
     assert effect["score_increased_after_evolution"] is True
-    assert state["stop_status"] == "continue_with_new_operator"
+    assert state["stop_status"] == "rollback_and_reroute"
     assert state["recommended_next_methods"] == [
-        "O2_subclaim_localization",
-        "O4_near_level_ranking",
-        "O8_double_threshold_claim",
+        "O15_counterfactual_threshold_shift",
+        "O16_close_alternative_normalization",
     ]
     assert operator_memory == []
     assert invalid_memory == []
@@ -58,5 +57,5 @@ def test_score_increased_is_negative_gain_and_continues_with_new_operator():
 
 
 if __name__ == "__main__":
-    test_score_increased_is_negative_gain_and_continues_with_new_operator()
+    test_score_increased_is_negative_gain_rolls_back_and_reroutes()
     print("score increased negative-gain checks passed")

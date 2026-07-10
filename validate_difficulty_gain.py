@@ -492,10 +492,8 @@ def attach_difficulty_gain_validation(item: Dict[str, Any], validation: Dict[str
 
 def build_rule_only_raw_validation(item: Dict[str, Any]) -> Dict[str, Any]:
     prompt = _clean_text(item.get("prompt"))
-    old_prompt = _clean_text((item.get("meta_info") or {}).get("prompt_old")) if isinstance(item.get("meta_info"), dict) else ""
     profile = item.get("sample_profile") if isinstance(item.get("sample_profile"), dict) else {}
     diagnosis = item.get("overscore_diagnosis") if isinstance(item.get("overscore_diagnosis"), dict) else {}
-    combined = f"{prompt}\n{old_prompt}"
     risk_tags: List[str] = []
     scores = {
         "axis_consistency_score": 0.82,

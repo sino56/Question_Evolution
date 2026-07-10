@@ -51,8 +51,12 @@
         "unanswerable_or_trap_sample",
         "stable_high_score_stop",
         "continue_with_new_operator",
-        "local_tree_search_needed"
+        "local_tree_search_needed",
+        "rollback_and_reroute"
       ]
+    },
+    "rollback_applied": {
+      "type": "boolean"
     }
   }
 }

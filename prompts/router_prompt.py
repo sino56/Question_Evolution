@@ -4,14 +4,17 @@ from typing import Any, Dict, Optional
 
 ROUTER_RULE_SUMMARY = """
 规则路由优先级：
-- 漏最小关键事实 -> O1_gap_choice，备选 O2_subclaim_localization
-- 层级越推 -> O3_step_jump，备选 O4_near_level_ranking
-- 题外补设 -> O5_extra_premise_detection
-- 泛化罗列 -> O7_fact_binding_constraint
-- 抓显眼点漏关键层 -> O8_double_threshold_claim
-- 受干扰信息带偏 -> O6_single_variable_counterfactual 或 O9_abnormal_clue_mainline_switch
-- target_failure_mode 为反常线索主线切换失败 -> O9_abnormal_clue_mainline_switch
-- 上一轮 O1 且本轮满分 -> 禁止继续 O1，优先 O2/O4/O8
+- evolution_state.recommended_next_methods > 相似样本成功记忆 > 诊断规则
+- 盲区或不可见状态归因 -> O11_unobserved_state_attribution
+- 强线索替代未闭合门槛 -> O12_conjunctive_necessity
+- 新增事实改变原评价 -> O13_minimal_disqualifier
+- 题外补设或信息闭包 -> O14_information_closure
+- 单变量变化后的保留/撤回 -> O15_counterfactual_threshold_shift
+- 相近正常解释导致过度降级 -> O16_close_alternative_normalization
+- 处置触发与事实定性混淆 -> O17_action_vs_fact_threshold
+- 统计基线范围或样本口径错配 -> O18_baseline_scope_mismatch
+- 其他近似业务判断竞争 -> O10_evidence_sufficiency_ladder
+- score_increased、重复题型或其他失败状态必须避开上一轮失败算子
 """.strip()
 
 
@@ -40,8 +43,8 @@ def build_router_prompt(record: Dict[str, Any], memory_summary: Optional[Dict[st
 返回合法 JSON 对象，不要输出 Markdown：
 {{
   "operator_route": {{
-    "primary_operator": "O1_gap_choice",
-    "backup_operators": ["O2_subclaim_localization"],
+    "primary_operator": "O10_evidence_sufficiency_ladder",
+    "backup_operators": ["O17_action_vs_fact_threshold"],
     "avoid_operators": [],
     "routing_reason": "简要说明为什么选择该 operator",
     "is_high_value_sample": true,

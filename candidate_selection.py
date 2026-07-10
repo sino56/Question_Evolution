@@ -686,18 +686,45 @@ def _sync_operator_metadata(
 def _restore_original_passthrough(item: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(item)
     meta_info = result.get("meta_info")
-    meta_info = meta_info if isinstance(meta_info, dict) else {}
+    meta_info = dict(meta_info) if isinstance(meta_info, dict) else {}
+    snapshot = meta_info.get("parent_snapshot")
+    if isinstance(snapshot, dict):
+        result["prompt"] = snapshot.get("prompt") or result.get("prompt")
+        for field in ("rubric", "rubric_thought_process", "score_prompt", "scoring_result", "score_rate"):
+            if snapshot.get(field) is None:
+                result.pop(field, None)
+            else:
+                result[field] = snapshot.get(field)
+        if snapshot.get("references") is not None:
+            meta_info["references"] = snapshot.get("references")
+        if snapshot.get("prompt_old") is None:
+            meta_info.pop("prompt_old", None)
+        else:
+            meta_info["prompt_old"] = snapshot.get("prompt_old")
+        if snapshot.get("question_evolution_metadata") is None:
+            meta_info.pop("question_evolution_metadata", None)
+        else:
+            meta_info["question_evolution_metadata"] = snapshot.get("question_evolution_metadata")
+        result["question_evolved"] = False
+        meta_info.pop("parent_snapshot", None)
+        result["meta_info"] = meta_info
+        return result
+
     old_prompt = meta_info.get("prompt_old")
     if isinstance(old_prompt, str) and old_prompt.strip():
         result["prompt"] = old_prompt.strip()
     stale_fields = {
         "rubric": "stale_rubric",
+        "rubric_thought_process": "stale_rubric_thought_process",
         "score_prompt": "stale_score_prompt",
         "scoring_result": "stale_scoring_result",
     }
     for field, stale_field in stale_fields.items():
-        if field not in result and stale_field in meta_info:
+        if stale_field in meta_info:
             result[field] = meta_info.get(stale_field)
+    if "stale_references" in meta_info:
+        meta_info["references"] = meta_info.get("stale_references")
+    result["meta_info"] = meta_info
     result["question_evolved"] = False
     return _sync_operator_metadata(result, "", question_evolved=False)
 
@@ -1004,7 +1031,6 @@ def generate_report(
     light_factual_fatal_count = 0
     light_factual_warning_count = 0
     for record in input_records:
-        check = light_factual_check(record)
         if light_factual_fatal_errors(record):
             light_factual_fatal_count += 1
         if light_factual_warnings(record):

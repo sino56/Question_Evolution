@@ -12,6 +12,7 @@ from profile_samples import ProfileProcessor, parse_profile_response
 from select_evolution_candidates import (
     EVOLVE_HIGH_SCORE_OVERSCORE,
     PASS_THROUGH_OR_SCORING_NOISE,
+    PROBE_MIDDLE_SCORE_BOUNDARY,
     RECONSTRUCT_LOW_SCORE_BOUNDARY,
     STOP_EVOLUTION,
     process_records,
@@ -128,7 +129,35 @@ def test_profile_processor_and_selector_cover_stage02_actions():
         assert "operator_used" not in record
 
 
+def test_middle_score_and_cross_round_recommendation_continue_evolution():
+    base = {
+        "sample_profile": {"core_capability": "边界判断"},
+        "overscore_diagnosis": {
+            "is_worth_evolving": True,
+            "candidate_overscore_cause": "正常解释导致风险判断过度撤回",
+            "target_failure_mode": "异常强度下降被误写为风险消失",
+        },
+        "score_rate": 0.7,
+    }
+    middle = process_records([base])[0]
+    assert middle["evolution_action"] == PROBE_MIDDLE_SCORE_BOUNDARY
+
+    reroute = dict(base)
+    reroute["overscore_diagnosis"] = {
+        "is_worth_evolving": False,
+        "candidate_overscore_cause": "基础边界判断过稳",
+        "target_failure_mode": "稳定满分",
+    }
+    reroute["evolution_state"] = {
+        "stop_status": "rollback_and_reroute",
+        "recommended_next_methods": ["O16_close_alternative_normalization"],
+    }
+    selected = process_records([reroute])[0]
+    assert selected["evolution_action"] == PROBE_MIDDLE_SCORE_BOUNDARY
+
+
 if __name__ == "__main__":
     test_profile_parser_rejects_operator_recommendation()
     test_profile_processor_and_selector_cover_stage02_actions()
+    test_middle_score_and_cross_round_recommendation_continue_evolution()
     print("stage02 profile and candidate selection checks passed")

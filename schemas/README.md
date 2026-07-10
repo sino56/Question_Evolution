@@ -21,6 +21,9 @@ Stage 0-5 question evolution pipeline.
 - `evolution_state` is the cross-round state produced by
   `update_sample_state.py` and consumed by candidate selection, routing, and
   stop rules in later rounds.
+- `probe_middle_score_boundary` keeps worthwhile middle-score samples in the
+  evolution path. `rollback_and_reroute` marks a score-increased child that was
+  restored to its direct parent and must avoid the failed operator next round.
 - `meta_info.question_evolution_metadata` is produced by question evolution.
 - `validation_result` is produced by `validate_evolved_question.py`.
   The script can optionally run `--validate-schema` to check pipeline records

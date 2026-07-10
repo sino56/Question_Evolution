@@ -41,8 +41,8 @@ def failure(round_number, suffix=""):
             "problem_shape": "候选项区分",
             "candidate_overscore_cause": "漏最小关键事实",
         },
-        "operator_used": "O1_gap_choice",
-        "surface_form_family": "evidence_relation_comparison",
+        "operator_used": "O13_minimal_disqualifier",
+        "surface_form_family": "minimal_disqualifier",
         "failure_type": "score_increased",
         "failure_reason": "negative gain",
     }
@@ -52,11 +52,11 @@ def test_one_recent_same_failure_warns_only():
     routed = route_records([make_item()], failure_memory=[failure(4)], failure_memory_window_rounds=3)
     route = routed[0]["operator_route"]
 
-    assert route["primary_operator"] == "O1_gap_choice"
+    assert route["primary_operator"] == "O13_minimal_disqualifier"
     assert route["memory_warnings"][0]["action"] == "warn_only"
     assert route["downrank_operator_surface_forms"] == []
     assert route["avoid_operator_surface_forms"] == []
-    assert "O1_gap_choice" not in route["avoid_operators"]
+    assert "O13_minimal_disqualifier" not in route["avoid_operators"]
 
 
 def test_two_recent_same_failures_downrank_operator_surface_form():
@@ -67,10 +67,10 @@ def test_two_recent_same_failures_downrank_operator_surface_form():
     )
     route = routed[0]["operator_route"]
 
-    assert route["primary_operator"] == "O2_subclaim_localization"
+    assert route["primary_operator"] == "O15_counterfactual_threshold_shift"
     assert route["downrank_operator_surface_forms"][0]["action"] == "downrank"
-    assert "O1_gap_choice" in route["backup_operators"]
-    assert "O1_gap_choice" not in route["avoid_operators"]
+    assert "O13_minimal_disqualifier" in route["backup_operators"]
+    assert "O13_minimal_disqualifier" not in route["avoid_operators"]
 
 
 def test_three_recent_same_failures_avoid_surface_form_without_coarse_operator_ban():
@@ -81,10 +81,10 @@ def test_three_recent_same_failures_avoid_surface_form_without_coarse_operator_b
     )
     route = routed[0]["operator_route"]
 
-    assert route["primary_operator"] == "O2_subclaim_localization"
+    assert route["primary_operator"] == "O15_counterfactual_threshold_shift"
     assert route["avoid_operator_surface_forms"][0]["action"] == "avoid"
-    assert route["avoid_operator_surface_forms"][0]["operator_used"] == "O1_gap_choice"
-    assert "O1_gap_choice" not in route["avoid_operators"]
+    assert route["avoid_operator_surface_forms"][0]["operator_used"] == "O13_minimal_disqualifier"
+    assert "O13_minimal_disqualifier" not in route["avoid_operators"]
 
 
 def test_old_failures_and_missing_surface_form_do_not_count():
@@ -99,7 +99,7 @@ def test_old_failures_and_missing_surface_form_do_not_count():
     )
     route = routed[0]["operator_route"]
 
-    assert route["primary_operator"] == "O1_gap_choice"
+    assert route["primary_operator"] == "O13_minimal_disqualifier"
     assert route["memory_warnings"] == []
     assert route["downrank_operator_surface_forms"] == []
     assert route["avoid_operator_surface_forms"] == []

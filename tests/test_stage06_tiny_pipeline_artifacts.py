@@ -67,18 +67,18 @@ class FakeProfileClient:
 class FakeEvolutionClient:
     async def chat_completions_create(self, **kwargs):
         prompt = kwargs["messages"][0]["content"]
-        if "O2_subclaim_localization" in prompt:
+        if "O15_counterfactual_threshold_shift" in prompt:
             evolved_prompt = (
                 "请只围绕原题结论中的一个子判断作答：现有事实支持哪一层，"
                 "哪一层仍缺少独立必要事实？请说明最少还缺哪一类事实。"
             )
-            strategy = "O2 子判断定位"
+            strategy = "O15 单变量门槛迁移"
         else:
             evolved_prompt = (
                 "请比较 A 与 B 两个候选补充事实，判断哪一个才是支撑结论的最小关键事实，"
                 "并说明另一个为什么不足或已被吸收。"
             )
-            strategy = "O1 候选缺口二选一"
+            strategy = "O13 新增事实改变原评价"
         return FakeResponse(
             json.dumps(
                 {

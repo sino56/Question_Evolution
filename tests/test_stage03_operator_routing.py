@@ -64,9 +64,9 @@ class FailingEvolutionClient:
         raise RuntimeError("mock generation failed")
 
 
-def test_operator_registry_covers_o1_to_o9():
+def test_operator_registry_covers_o10_to_o18():
     assert len(OPERATOR_SPECS) == 9
-    for index in range(1, 10):
+    for index in range(10, 19):
         assert any(operator_id.startswith(f"O{index}_") for operator_id in OPERATOR_SPECS)
 
 
@@ -75,16 +75,15 @@ def test_router_covers_representative_stage03_paths():
     routed = route_records(records)
     routes = {record["sample_id"]: record["operator_route"] for record in routed}
 
-    assert routes["stage03-o1"]["primary_operator"] == "O1_gap_choice"
-    assert "O2_subclaim_localization" in routes["stage03-o1"]["backup_operators"]
+    assert routes["stage03-o1"]["primary_operator"] == "O13_minimal_disqualifier"
+    assert "O15_counterfactual_threshold_shift" in routes["stage03-o1"]["backup_operators"]
 
-    assert routes["stage03-o2"]["primary_operator"] == "O2_subclaim_localization"
-    assert "O1_gap_choice" in routes["stage03-o2"]["avoid_operators"]
-    assert "O4_near_level_ranking" in routes["stage03-o2"]["backup_operators"]
+    assert routes["stage03-o2"]["primary_operator"] == "O15_counterfactual_threshold_shift"
+    assert "O13_minimal_disqualifier" in routes["stage03-o2"]["avoid_operators"]
 
-    assert routes["stage03-o4"]["primary_operator"] == "O4_near_level_ranking"
-    assert routes["stage03-o8"]["primary_operator"] == "O8_double_threshold_claim"
-    assert routes["stage03-o9"]["primary_operator"] == "O9_abnormal_clue_mainline_switch"
+    assert routes["stage03-o4"]["primary_operator"] == "O10_evidence_sufficiency_ladder"
+    assert routes["stage03-o8"]["primary_operator"] == "O17_action_vs_fact_threshold"
+    assert routes["stage03-o9"]["primary_operator"] == "O10_evidence_sufficiency_ladder"
 
     assert routes["stage03-pass"]["primary_operator"] is None
 
@@ -104,12 +103,12 @@ def test_question_evolution_uses_route_and_skips_passthrough():
     evolved = asyncio.run(processor.process_item(by_id["stage03-o1"]))
     metadata = evolved["meta_info"]["question_evolution_metadata"]
     assert evolved["question_evolved"] is True
-    assert metadata["operator_used"] == "O1_gap_choice"
-    assert metadata["ability_axis"] == "独立必要条件识别"
+    assert metadata["operator_used"] == "O13_minimal_disqualifier"
+    assert metadata["ability_axis"] == "同一判断内的层级改变事实识别"
     assert metadata["expected_qwen_failure"] == "选错最关键缺口"
     assert metadata["expected_evaluation_focus"]
     assert len(fake_client.calls) == 1
-    assert "O1_gap_choice" in fake_client.calls[0]["messages"][0]["content"]
+    assert "O13_minimal_disqualifier" in fake_client.calls[0]["messages"][0]["content"]
 
     passed = asyncio.run(processor.process_item(by_id["stage03-pass"]))
     assert passed["question_evolved"] is False
@@ -168,11 +167,52 @@ def test_candidate_generation_failure_returns_passthrough_candidate():
     assert fallback["candidate_group_id"] == "stage03-o1"
     assert len(fake_client.calls) >= 1
 
+def test_state_recommendation_precedes_memory_and_failed_operator_is_avoided():
+    item = {
+        "sample_id": "route-priority",
+        "prompt": "题目",
+        "score_rate": 0.7,
+        "evolution_action": "probe_middle_score_boundary",
+        "sample_profile": {
+            "core_capability": "边界判断",
+            "claim_level": "可疑线索",
+            "problem_shape": "候选项区分",
+            "external_knowledge_risk": "low",
+        },
+        "overscore_diagnosis": {
+            "is_worth_evolving": True,
+            "candidate_overscore_cause": "处置触发与事实定性混淆",
+            "target_failure_mode": "报告表述越界",
+        },
+        "evolution_state": {
+            "previous_operator": "O13_minimal_disqualifier",
+            "previous_effect_status": "score_increased",
+            "recommended_next_methods": ["O18_baseline_scope_mismatch"],
+            "stop_status": "rollback_and_reroute",
+        },
+    }
+    signature = {
+        "core_capability": "边界判断",
+        "claim_level": "可疑线索",
+        "problem_shape": "候选项区分",
+        "candidate_overscore_cause": "处置触发与事实定性混淆",
+    }
+    operator_memory = [{
+        "sample_signature": signature,
+        "operator_used": "O16_close_alternative_normalization",
+    }]
+
+    route = route_records([item], operator_memory=operator_memory)[0]["operator_route"]
+    assert route["primary_operator"] == "O18_baseline_scope_mismatch"
+    assert "O13_minimal_disqualifier" in route["avoid_operators"]
+    assert "O16_close_alternative_normalization" in route["backup_operators"]
+
 
 if __name__ == "__main__":
-    test_operator_registry_covers_o1_to_o9()
+    test_operator_registry_covers_o10_to_o18()
     test_router_covers_representative_stage03_paths()
     test_question_evolution_uses_route_and_skips_passthrough()
     test_candidate_generation_falls_back_when_no_operator_available()
     test_candidate_generation_failure_returns_passthrough_candidate()
+    test_state_recommendation_precedes_memory_and_failed_operator_is_avoided()
     print("stage03 operator routing checks passed")

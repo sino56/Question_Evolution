@@ -6,12 +6,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 EVOLVE_HIGH_SCORE_OVERSCORE = "evolve_high_score_overscore"
 RECONSTRUCT_LOW_SCORE_BOUNDARY = "reconstruct_low_score_boundary"
+PROBE_MIDDLE_SCORE_BOUNDARY = "probe_middle_score_boundary"
 PASS_THROUGH_OR_SCORING_NOISE = "pass_through_or_scoring_noise"
 STOP_EVOLUTION = "stop_evolution"
 
 EVOLUTION_ACTIONS = {
     EVOLVE_HIGH_SCORE_OVERSCORE,
     RECONSTRUCT_LOW_SCORE_BOUNDARY,
+    PROBE_MIDDLE_SCORE_BOUNDARY,
     PASS_THROUGH_OR_SCORING_NOISE,
     STOP_EVOLUTION,
 }
@@ -227,6 +229,15 @@ def build_evolution_budget(
         "admission_status": status,
     }
 
+def _recommended_next_methods(item: Dict[str, Any]) -> List[str]:
+    state = item.get("evolution_state")
+    if not isinstance(state, dict):
+        return []
+    values = state.get("recommended_next_methods")
+    if not isinstance(values, list):
+        return []
+    return [str(value).strip() for value in values if str(value).strip()]
+
 
 def validate_profiled_record(item: Dict[str, Any]) -> None:
     if not isinstance(item.get("sample_profile"), dict):
@@ -250,12 +261,10 @@ def decide_evolution_action(
     score_rate = get_score_rate(item)
     diagnosis_text = _joined_diagnosis_text(item)
     stop_status = _stop_status(item)
+    recommended_next = _recommended_next_methods(item)
 
     if stop_status in STOP_STATUSES:
         return STOP_EVOLUTION, f"evolution_state.stop_status={stop_status} indicates a terminal state."
-
-    if _has_any_term(diagnosis_text, STOP_TERMS) and not worth_evolving:
-        return STOP_EVOLUTION, "diagnosis says the sample is stable or should stop."
 
     round0_decision = decide_action_from_round0_summary(
         item,
@@ -264,9 +273,33 @@ def decide_evolution_action(
     )
     if round0_decision is not None:
         return round0_decision
-
     if score_rate is None:
         return PASS_THROUGH_OR_SCORING_NOISE, "score_rate is missing or invalid."
+
+    # 跨轮状态优先于当前分数区间。上一轮已经要求换算子、局部探索或回滚重路由时，
+    # 不能因为当前分数落在中间区间而把样本意外透传。
+    if recommended_next or stop_status in {
+        "continue_with_new_operator",
+        "local_tree_search_needed",
+        "rollback_and_reroute",
+    }:
+        if score_rate >= high_score_threshold:
+            action = EVOLVE_HIGH_SCORE_OVERSCORE
+        elif (
+            score_rate <= low_score_threshold
+            and worth_evolving
+            and _has_any_term(diagnosis_text, LOW_SCORE_BOUNDARY_TERMS)
+        ):
+            action = RECONSTRUCT_LOW_SCORE_BOUNDARY
+        else:
+            action = PROBE_MIDDLE_SCORE_BOUNDARY
+        return action, (
+            f"evolution_state requests continued exploration "
+            f"(stop_status={stop_status or 'continue'}, recommended_next_methods={recommended_next})."
+        )
+
+    if _has_any_term(diagnosis_text, STOP_TERMS) and not worth_evolving:
+        return STOP_EVOLUTION, "diagnosis says the sample is stable or should stop."
 
     if score_rate >= high_score_threshold:
         if worth_evolving:
@@ -289,8 +322,8 @@ def decide_evolution_action(
         )
 
     if worth_evolving:
-        return PASS_THROUGH_OR_SCORING_NOISE, (
-            f"score_rate={score_rate:.4f} is neither high overscore nor low boundary reconstruction."
+        return PROBE_MIDDLE_SCORE_BOUNDARY, (
+            f"score_rate={score_rate:.4f} is in the middle band and diagnosis identifies a probeable boundary."
         )
     return PASS_THROUGH_OR_SCORING_NOISE, "diagnosis does not mark this sample as worth evolving."
 

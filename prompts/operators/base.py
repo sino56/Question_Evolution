@@ -37,42 +37,50 @@ def build_prompt(
         "operator_route": operator_route,
     }
     return f"""
-# 角色
+角色
 你是一位 question evolution 题目生成专家。本轮只能执行指定 operator：{spec.operator_id}（{spec.name}）。
 
-# Operator 目标
-能力轴：{spec.ability_axis}
-目标：{spec.goal}
-题型形态：{spec.required_question_shape}
-避免：{spec.avoid}
+Operator 目标
+{spec.goal}
 
-# 必守边界
+要求题型
+{spec.required_question_shape}
+
+避免
+{spec.avoid}
+
+必守边界
 - 只生成一道完整、可独立作答的新题。
 - 新题只能围绕一个清晰主轴，不靠长篇格式、表格、复杂编号或多任务压分。
 - 不修改 rubric，不生成评分标准，不把 expected_evaluation_focus 写进 rubric。
 - 不引入题干外事实；如必须比较候选事实，题面要给足比较依据。
 - 如果本 operator 不适合该样本，仍要在 operator 范围内收窄问题，不得改用其他 operator。
+- 一个 operator 只压一个可归因错误；优先制造两个"接近但不等价"的竞争判断。
+- 题面给事实，不给分层答案；不得把答案标签、目标错误名或完整推理路径直接写进题面。
+- 保留最小变量变化，观察模型是否重排结论；不得靠题长、多事实、多任务制造表面复杂度。
+- 不要把题目改成固定分层问法，也不要直接点名隐含补设位置。
+- 好的输出应是边界诱发器，而不是答案拆解器：让模型在接近判断之间暴露是否守住证据边界。
 
-# 输入画像与路由
+输入画像与路由
 {_json_block(input_payload)}
 
-# 原题
-{prompt.strip()}
+原题
+{prompt}
 
-# 参考答案
-{reference_answer.strip()}
+参考答案
+{reference_answer}
 
-# 候选答案
-{candidate_answer.strip()}
+候选答案
+{candidate_answer}
 
-# 现有评分标准（只用于理解原题，不得改写）
-{_json_block(rubric if isinstance(rubric, list) else [])}
+现有评分标准（只用于理解原题，不得改写）
+{_json_block(rubric)}
 
-# 输出
+输出
 返回合法 JSON 对象，不要输出 Markdown 或额外解释：
 {{
   "evolved_prompt": "升级后的新题目，必须完整、可独立作答，并严格符合当前 operator。",
-  "evolution_strategy": "说明为什么本 operator 能压测目标弱点，以及如何避免换壳重复。",
+  "evolution_strategy": "说明本 operator 压的唯一可归因错误、制造了哪两个接近但不等价的竞争判断，以及如何避免提示答案。",
   "ability_axis": "{spec.ability_axis}",
   "target_subclaim": "本题压测的最小子判断或关键层级",
   "boundary_hypothesis": "一句话说明预期能力边界",
