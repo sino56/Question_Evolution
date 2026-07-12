@@ -1,0 +1,1 @@
+{"evaluation_bundle_id": "eval_6406_b01_n02", "node_id": "6406_b01_n02", "trial_target": 3, "trial_completed": 3, "score_mean": 0.71, "score_std": 0.04, "score_min": 0.66, "score_max": 0.76, "answer_model": "qwen3.6-27b", "judge_model": "qwen3.6-27b", "seed_support_confirmed": false, "bundle_status": "confirmed_r3", "config_hash": "sha256:example"}
