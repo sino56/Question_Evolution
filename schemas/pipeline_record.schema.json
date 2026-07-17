@@ -40,6 +40,40 @@
       "minimum": 0,
       "maximum": 1
     },
+    "evaluation_protocol": {
+      "type": "string",
+      "description": "Scoring protocol identifier; dual Judge outputs use dual_judge_parallel_v1."
+    },
+    "qwen_score_summary": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "requested_count": {"type": "integer", "minimum": 0},
+        "successful_count": {"type": "integer", "minimum": 0},
+        "failed_count": {"type": "integer", "minimum": 0},
+        "score_mean": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "score_min": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "score_max": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "decision_source": {"const": "qwen"}
+      }
+    },
+    "gpt_score_summary": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "requested_count": {"type": "integer", "minimum": 0},
+        "successful_count": {"type": "integer", "minimum": 0},
+        "failed_count": {"type": "integer", "minimum": 0},
+        "score_mean": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "score_min": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "score_max": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "experimental": {"const": true}
+      }
+    },
+    "representative_trial_index": {
+      "type": "integer",
+      "minimum": 1
+    },
     "sample_profile": {
       "$ref": "sample_profile.schema.json"
     },

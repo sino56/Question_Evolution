@@ -95,6 +95,14 @@ def test_run_loop_uses_existing_stage_cli_flags():
     assert "--weak-answer-base-url \"$WEAK_ANSWER_BASE_URL\"" in RUN_LOOP
     assert "--judge-base-url \"$QWEN_BASE_URL\"" in RUN_LOOP
     assert "--judge-api-key \"$QWEN_API_KEY\"" in RUN_LOOP
+    assert "--answer-trials \"$SCORING_ANSWER_TRIALS\"" in RUN_LOOP
+    assert "--qwen-judge-repeats \"$QWEN_JUDGE_REPEATS\"" in RUN_LOOP
+    assert "--gpt-judge-base-url \"$GPT_JUDGE_BASE_URL\"" in RUN_LOOP
+    assert "--gpt-judge-api-key \"$GPT_JUDGE_API_KEY\"" in RUN_LOOP
+    assert "--gpt-judge-model \"$GPT_JUDGE_MODEL\"" in RUN_LOOP
+    assert "--gpt-judge-repeats \"$GPT_JUDGE_REPEATS\"" in RUN_LOOP
+    assert "--qwen-max-concurrent \"$QWEN_SCORING_MAX_CONCURRENT\"" in RUN_LOOP
+    assert "--gpt-max-concurrent \"$GPT_SCORING_MAX_CONCURRENT\"" in RUN_LOOP
     assert "--base-url \"$ANSWER_BASE_URL\"" in RUN_LOOP
     assert "--base-url \"$RUBRIC_BASE_URL\"" in RUN_LOOP
     select_call_start = RUN_LOOP.find("python select_evolution_candidates.py")

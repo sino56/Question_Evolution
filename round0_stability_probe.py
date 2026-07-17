@@ -13,6 +13,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from scoring import (
     ANSWER_BASE_URL,
     ANSWER_MODEL,
+    DEFAULT_GPT_JUDGE_REPEATS,
+    DEFAULT_QWEN_JUDGE_REPEATS,
+    EVALUATION_PROTOCOL,
+    GPT_JUDGE_BASE_URL,
+    GPT_JUDGE_MODEL,
     JUDGE_BASE_URL,
     JUDGE_MODEL,
     AnswerLLMClient,
@@ -21,6 +26,7 @@ from scoring import (
     compute_score_rate,
     ensure_sample_identity,
     parse_api_keys,
+    parse_gpt_judge_api_keys,
     resolve_answer_api_key,
 )
 
@@ -348,6 +354,10 @@ def _record_cache_key(item: Dict[str, Any], trial_id: int, config: argparse.Name
         "answer_top_p": config.answer_top_p,
         "answer_seed": answer_seed,
         "judge_temperature": config.judge_temperature,
+        "qwen_judge_repeats": getattr(config, "qwen_judge_repeats", 1),
+        "gpt_judge_model": getattr(config, "gpt_judge_model", ""),
+        "gpt_judge_temperature": getattr(config, "gpt_judge_temperature", 0.0),
+        "gpt_judge_repeats": getattr(config, "gpt_judge_repeats", 0),
         "probe_version": PROBE_VERSION,
         "trial_id": trial_id,
     }
@@ -401,6 +411,24 @@ def _extract_trial_fields(scoring_result: Dict[str, Any]) -> Tuple[List[Any], Li
     return awards, comments
 
 
+def _trial_trace_ids(trial: Dict[str, Any]) -> List[str]:
+    scoring_result = trial.get("scoring_result")
+    if not isinstance(scoring_result, dict):
+        return []
+    trace_ids = []
+    for field in ("qwen_judge_results", "gpt_judge_results"):
+        rows = scoring_result.get(field)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            trace_id = row.get("raw_response_trace_id")
+            if isinstance(trace_id, str) and trace_id:
+                trace_ids.append(trace_id)
+    return trace_ids
+
+
 async def run_answer_and_score_trial(
     item: Dict[str, Any],
     trial_id: int,
@@ -410,11 +438,25 @@ async def run_answer_and_score_trial(
     cache_key = _record_cache_key(item, trial_id, config)
     cached = None if getattr(config, "force", False) else _read_cached_trial(getattr(config, "cache_dir", None), cache_key)
     if cached is not None:
-        cached["cache_hit"] = True
-        return cached
+        trace_ids = _trial_trace_ids(cached)
+        known_traces = getattr(processor, "_trace_entries", {})
+        if not trace_ids or all(trace_id in known_traces for trace_id in trace_ids):
+            cached["cache_hit"] = True
+            return cached
+        logger.warning("round0 cache trace sidecar 缺失，忽略 cache 并重新评分 key=%s", cache_key)
 
     candidate_answer = await processor.generate_candidate_answer_with_retry(item)
-    scoring_result = await processor.score_candidate_answer(item, candidate_answer)
+    try:
+        scoring_result = await processor.score_candidate_answer(
+            item,
+            candidate_answer,
+            trial_index=trial_id,
+        )
+    except TypeError as exc:
+        if "trial_index" not in str(exc):
+            raise
+        # Backward compatibility for lightweight test/custom processors.
+        scoring_result = await processor.score_candidate_answer(item, candidate_answer)
     score_rate = compute_score_rate(scoring_result)
     rubric_item_awards, rubric_item_comments = _extract_trial_fields(scoring_result)
     answer_seed = _trial_seed(config, trial_id)
@@ -429,6 +471,10 @@ async def run_answer_and_score_trial(
         "answer_seed": answer_seed,
         "seed_supported": False,
         "judge_temperature": config.judge_temperature,
+        "qwen_judge_repeats": getattr(config, "qwen_judge_repeats", 1),
+        "gpt_judge_model": getattr(config, "gpt_judge_model", ""),
+        "gpt_judge_temperature": getattr(config, "gpt_judge_temperature", 0.0),
+        "gpt_judge_repeats": getattr(config, "gpt_judge_repeats", 0),
         "force_generate_answer": True,
         "cache_hit": False,
         "candidate_answer": candidate_answer.strip(),
@@ -535,12 +581,16 @@ async def process_item_with_stability_probe(
             meta_info.setdefault("pre_stability_scoring_result", deepcopy(result["scoring_result"]))
         result["meta_info"] = meta_info
 
-        trials: List[Dict[str, Any]] = []
-        for trial_id in range(1, config.initial_trials + 1):
+        async def run_trial(trial_id: int) -> Dict[str, Any]:
             trial_item = deepcopy(result)
             trial_item.pop("scoring_result", None)
             trial_item.pop("score_rate", None)
-            trials.append(await run_answer_and_score_trial(trial_item, trial_id, processor, config))
+            return await run_answer_and_score_trial(trial_item, trial_id, processor, config)
+
+        trials: List[Dict[str, Any]] = list(await asyncio.gather(*[
+            run_trial(trial_id)
+            for trial_id in range(1, config.initial_trials + 1)
+        ]))
 
         summary = compute_score_summary(
             trials,
@@ -557,11 +607,12 @@ async def process_item_with_stability_probe(
 
         max_trials = min(config.max_trials, config.initial_trials + config.extra_trials)
         if extra_needed:
-            for trial_id in range(len(trials) + 1, max_trials + 1):
-                trial_item = deepcopy(result)
-                trial_item.pop("scoring_result", None)
-                trial_item.pop("score_rate", None)
-                trials.append(await run_answer_and_score_trial(trial_item, trial_id, processor, config))
+            extra_trial_ids = list(range(len(trials) + 1, max_trials + 1))
+            if extra_trial_ids:
+                trials.extend(await asyncio.gather(*[
+                    run_trial(trial_id)
+                    for trial_id in extra_trial_ids
+                ]))
             summary = compute_score_summary(
                 trials,
                 high_score_threshold=config.score_threshold,
@@ -574,23 +625,59 @@ async def process_item_with_stability_probe(
         summary["probe_version"] = PROBE_VERSION
 
         stable_score = _as_score(summary.get("stable_score"))
-        representative = select_representative_trial(trials, stable_score)
-        if representative and isinstance(representative.get("scoring_result"), dict):
-            result["scoring_result"] = deepcopy(representative["scoring_result"])
-            representative_answer = str(representative.get("candidate_answer", "") or "").strip()
-            if representative_answer:
-                result["scoring_result"]["candidate_answer"] = representative_answer
-                result["candidate_answer"] = representative_answer
+        protocol_trials = []
+        for trial in trials:
+            scoring_result = trial.get("scoring_result")
+            if not isinstance(scoring_result, dict) or not isinstance(scoring_result.get("qwen_judge_results"), list):
+                protocol_trials = []
+                break
+            protocol_trial = deepcopy(scoring_result)
+            protocol_trial["trial_index"] = trial.get("trial_id")
+            protocol_trials.append(protocol_trial)
+
+        if protocol_trials and hasattr(processor, "aggregate_answer_trials"):
+            aggregate = processor.aggregate_answer_trials(protocol_trials)
+            result["scoring_result"] = aggregate
+            result["evaluation_protocol"] = EVALUATION_PROTOCOL
+            result["qwen_score_summary"] = deepcopy(aggregate["qwen_score_summary"])
+            result["gpt_score_summary"] = deepcopy(aggregate["gpt_score_summary"])
+            result["representative_trial_index"] = aggregate["representative_trial_index"]
+            result["score_rate"] = compute_score_rate(aggregate)
+            representative_id = aggregate["representative_trial_index"]
+            representative = next(
+                (trial for trial in trials if trial.get("trial_id") == representative_id),
+                None,
+            )
+            representative_answer = str(aggregate.get("candidate_answer", "") or "").strip()
+            result["candidate_answer"] = representative_answer
             result["representative_round0_answer"] = {
-                "trial_id": representative.get("trial_id"),
-                "score_rate": _trial_score(representative),
+                "trial_id": representative_id,
+                "score_rate": _trial_score(representative or {}),
                 "candidate_answer": representative_answer,
-                "candidate_answer_hash": representative.get("candidate_answer_hash"),
-                "selection_reason": "closest_to_stable_score",
+                "candidate_answer_hash": (representative or {}).get("candidate_answer_hash"),
+                "selection_reason": "closest_to_qwen_overall_mean",
             }
-            summary["representative_trial_id"] = representative.get("trial_id")
-        if stable_score is not None:
-            result["score_rate"] = stable_score
+            summary["representative_trial_id"] = representative_id
+            summary["qwen_online_score_rate"] = result["score_rate"]
+        else:
+            # Preserve compatibility with legacy/custom single-judge processors.
+            representative = select_representative_trial(trials, stable_score)
+            if representative and isinstance(representative.get("scoring_result"), dict):
+                result["scoring_result"] = deepcopy(representative["scoring_result"])
+                representative_answer = str(representative.get("candidate_answer", "") or "").strip()
+                if representative_answer:
+                    result["scoring_result"]["candidate_answer"] = representative_answer
+                    result["candidate_answer"] = representative_answer
+                result["representative_round0_answer"] = {
+                    "trial_id": representative.get("trial_id"),
+                    "score_rate": _trial_score(representative),
+                    "candidate_answer": representative_answer,
+                    "candidate_answer_hash": representative.get("candidate_answer_hash"),
+                    "selection_reason": "closest_to_stable_score",
+                }
+                summary["representative_trial_id"] = representative.get("trial_id")
+            if stable_score is not None:
+                result["score_rate"] = stable_score
 
         result["round0_score_trials"] = trials
         result["round0_score_summary"] = summary
@@ -635,6 +722,8 @@ def build_stability_report(records: Sequence[Dict[str, Any]], score_threshold: f
     rescued_by_stability = 0
     removed_by_stability = 0
     score_diffs = []
+    qwen_judge_call_counts = []
+    gpt_judge_call_counts = []
 
     for record in records:
         summary = record.get("round0_score_summary")
@@ -647,6 +736,10 @@ def build_stability_report(records: Sequence[Dict[str, Any]], score_threshold: f
         except (TypeError, ValueError):
             trial_count = 0
         trial_counts.append(trial_count)
+        trial_rows = record.get("round0_score_trials")
+        trial_rows = trial_rows if isinstance(trial_rows, list) else []
+        qwen_judge_call_counts.append(sum(int(row.get("qwen_judge_repeats") or 1) for row in trial_rows))
+        gpt_judge_call_counts.append(sum(int(row.get("gpt_judge_repeats") or 0) for row in trial_rows))
         if bool(summary.get("needs_extra_trials")):
             extra_count += 1
 
@@ -671,13 +764,17 @@ def build_stability_report(records: Sequence[Dict[str, Any]], score_threshold: f
                 removed_by_stability += 1
 
     average_trial_count = statistics.fmean(trial_counts) if trial_counts else 0.0
+    average_qwen_judge_calls = statistics.fmean(qwen_judge_call_counts) if qwen_judge_call_counts else average_trial_count
+    average_gpt_judge_calls = statistics.fmean(gpt_judge_call_counts) if gpt_judge_call_counts else 0.0
     return {
         "total_samples": total_samples,
         "average_trial_count": _round_float(average_trial_count),
         "extra_trial_rate": _round_float(extra_count / total_samples) if total_samples else 0.0,
         "estimated_cost_per_100_samples": {
             "answer_calls": _round_float(average_trial_count * 100),
-            "judge_calls": _round_float(average_trial_count * 100),
+            "judge_calls": _round_float((average_qwen_judge_calls + average_gpt_judge_calls) * 100),
+            "qwen_judge_calls": _round_float(average_qwen_judge_calls * 100),
+            "gpt_judge_calls": _round_float(average_gpt_judge_calls * 100),
         },
         "classification_distribution": classification_distribution,
         "legacy_vs_stable_admission": {
@@ -715,6 +812,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-base-url", default=JUDGE_BASE_URL)
     parser.add_argument("--judge-api-key", action="append", default=None)
     parser.add_argument("--judge-temperature", type=float, default=0.0)
+    parser.add_argument("--qwen-judge-repeats", type=int, default=DEFAULT_QWEN_JUDGE_REPEATS)
+    parser.add_argument("--gpt-judge-model", default=GPT_JUDGE_MODEL)
+    parser.add_argument("--gpt-judge-base-url", default=GPT_JUDGE_BASE_URL)
+    parser.add_argument("--gpt-judge-api-key", action="append", default=None)
+    parser.add_argument("--gpt-judge-temperature", type=float, default=0.0)
+    parser.add_argument("--gpt-judge-repeats", type=int, default=DEFAULT_GPT_JUDGE_REPEATS)
+    parser.add_argument("--qwen-max-concurrent", type=int, default=20)
+    parser.add_argument("--gpt-max-concurrent", type=int, default=20)
     parser.add_argument("--score-threshold", type=float, default=HIGH_SCORE_THRESHOLD)
     parser.add_argument("--strong-high-threshold", type=float, default=STRONG_HIGH_THRESHOLD)
     parser.add_argument("--borderline-low", type=float, default=BORDERLINE_LOW)
@@ -733,6 +838,14 @@ def validate_config(args: argparse.Namespace) -> None:
         raise ValueError("--extra-trials must be >= 0")
     if args.max_trials < args.initial_trials:
         raise ValueError("--max-trials must be >= --initial-trials")
+    if args.qwen_judge_repeats < 1:
+        raise ValueError("--qwen-judge-repeats must be >= 1")
+    if args.gpt_judge_repeats < 0:
+        raise ValueError("--gpt-judge-repeats must be >= 0")
+    if args.gpt_judge_repeats and not (args.gpt_judge_base_url or "").strip():
+        raise ValueError("--gpt-judge-base-url is required when GPT judge is enabled")
+    if args.gpt_judge_repeats and not (args.gpt_judge_model or "").strip():
+        raise ValueError("--gpt-judge-model is required when GPT judge is enabled")
     if args.answer_mode == "llm" and not (args.answer_base_url or "").strip():
         raise ValueError("--answer-base-url is required when --answer-mode llm")
     if args.answer_mode == "llm" and not (args.answer_model or "").strip():
@@ -761,6 +874,12 @@ async def main() -> None:
         base_url=args.judge_base_url,
         api_keys=parse_api_keys(args.judge_api_key),
     )
+    gpt_judge_client = None
+    if args.gpt_judge_repeats:
+        gpt_judge_client = RotatingAPIClient(
+            base_url=args.gpt_judge_base_url,
+            api_keys=parse_gpt_judge_api_keys(args.gpt_judge_api_key),
+        )
     processor = ScoringProcessor(
         judge_client=judge_client,
         judge_model=args.judge_model,
@@ -771,10 +890,20 @@ async def main() -> None:
         answer_model_name=answer_model_name,
         force_generate_answer=True,
         judge_temperature=args.judge_temperature,
+        gpt_judge_client=gpt_judge_client,
+        gpt_judge_model=args.gpt_judge_model,
+        gpt_judge_temperature=args.gpt_judge_temperature,
+        answer_trials=1,
+        qwen_judge_repeats=args.qwen_judge_repeats,
+        gpt_judge_repeats=args.gpt_judge_repeats,
+        qwen_max_concurrent=args.qwen_max_concurrent,
+        gpt_max_concurrent=args.gpt_max_concurrent,
     )
 
+    processor.load_existing_traces(args.output)
     processed = await process_records(records, processor, args)
     write_jsonl(processed, args.output)
+    processor.write_trace_artifacts(args.output)
     report_output = args.report_output or f"{args.output}.report.json"
     write_json(build_stability_report(processed, args.score_threshold), report_output)
     logger.info("round0 stability scoring complete: %s", args.output)

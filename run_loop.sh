@@ -16,6 +16,9 @@ CONFIG_GPT_MODEL=$(read_config_value GPT_MODEL QA_MODEL "gpt-5.4")
 CONFIG_QWEN_BASE_URL=$(read_config_value QWEN_BASE_URL "$CONFIG_BASE_URL")
 CONFIG_QWEN_API_KEY=$(read_config_value QWEN_API_KEY "")
 CONFIG_QWEN_MODEL=$(read_config_value QWEN_MODEL GPT_MODEL "hjl_Qwen3.6-27B")
+CONFIG_GPT_JUDGE_MODEL=$(read_config_value GPT_JUDGE_MODEL GPT_MODEL QA_MODEL "$CONFIG_GPT_MODEL")
+CONFIG_GPT_JUDGE_BASE_URL=$(read_config_value GPT_JUDGE_BASE_URL OPENAI_BASE_URL BASE_URL "$CONFIG_BASE_URL")
+CONFIG_GPT_JUDGE_API_KEY=$(read_config_value GPT_JUDGE_API_KEY OPENAI_API_KEY "")
 CONFIG_PROFILE_MODEL=$(read_config_value PROFILE_MODEL EVOLVE_MODEL QA_MODEL GPT_MODEL "$CONFIG_GPT_MODEL")
 CONFIG_DIFFICULTY_GAIN_MODEL=$(read_config_value DIFFICULTY_GAIN_MODEL PROFILE_MODEL EVOLVE_MODEL QA_MODEL GPT_MODEL "$CONFIG_PROFILE_MODEL")
 CONFIG_DIFFICULTY_GAIN_BASE_URL=$(read_config_value DIFFICULTY_GAIN_BASE_URL PROFILE_BASE_URL EVOLVE_BASE_URL BASE_URL OPENAI_BASE_URL "$CONFIG_BASE_URL")
@@ -53,6 +56,9 @@ ROUND0_ANSWER_TEMPERATURE=${ROUND0_ANSWER_TEMPERATURE:-0.7}
 ROUND0_ANSWER_TOP_P=${ROUND0_ANSWER_TOP_P:-0.95}
 ROUND0_ANSWER_SEED_BASE=${ROUND0_ANSWER_SEED_BASE:-20260704}
 ROUND0_JUDGE_TEMPERATURE=${ROUND0_JUDGE_TEMPERATURE:-0.0}
+SCORING_ANSWER_TRIALS=${SCORING_ANSWER_TRIALS:-3}
+QWEN_JUDGE_REPEATS=${QWEN_JUDGE_REPEATS:-2}
+GPT_JUDGE_REPEATS=${GPT_JUDGE_REPEATS:-2}
 
 DEFAULT_INPUT_FILE="admitted_seed_samples.jsonl"
 LEGACY_INPUT_FILE="data/data.jsonl"
@@ -63,6 +69,9 @@ EXP_ROOT=${EXP_ROOT:-"experiments"}              # 实验结果根目录
 QWEN_BASE_URL=${QWEN_BASE_URL:-$CONFIG_QWEN_BASE_URL}
 QWEN_API_KEY=${QWEN_API_KEY:-$CONFIG_QWEN_API_KEY}
 QWEN_MODEL=${QWEN_MODEL:-$CONFIG_QWEN_MODEL}
+GPT_JUDGE_MODEL=${GPT_JUDGE_MODEL:-$CONFIG_GPT_JUDGE_MODEL}
+GPT_JUDGE_BASE_URL=${GPT_JUDGE_BASE_URL:-$CONFIG_GPT_JUDGE_BASE_URL}
+GPT_JUDGE_API_KEY=${GPT_JUDGE_API_KEY:-$CONFIG_GPT_JUDGE_API_KEY}
 
 # GPT / OpenAI-compatible 配置。API key 优先使用各脚本支持的环境变量：
 # PROFILE_API_KEYS、EVOLVE_API_KEYS、OPENAI_API_KEYS 或 OPENAI_API_KEY。
@@ -82,6 +91,8 @@ RUBRIC_BASE_URL=${RUBRIC_BASE_URL:-$OPENAI_BASE_URL}
 
 # 并发数
 SCORING_CONCURRENCY=${SCORING_CONCURRENCY:-10}
+QWEN_SCORING_MAX_CONCURRENT=${QWEN_SCORING_MAX_CONCURRENT:-20}
+GPT_SCORING_MAX_CONCURRENT=${GPT_SCORING_MAX_CONCURRENT:-20}
 PROFILE_CONCURRENCY=${PROFILE_CONCURRENCY:-5}
 DIFFICULTY_GAIN_CONCURRENCY=${DIFFICULTY_GAIN_CONCURRENCY:-$PROFILE_CONCURRENCY}
 EVO_CONCURRENCY=${EVO_CONCURRENCY:-10}
@@ -321,6 +332,11 @@ echo "Difficulty gain allow borderline: $DIFFICULTY_GAIN_ALLOW_BORDERLINE" >> "$
 echo "Difficulty gain weak probe: $DIFFICULTY_GAIN_ENABLE_WEAK_PROBE" >> "$SUMMARY_FILE"
 echo "Uncertain low probe: $ENABLE_UNCERTAIN_LOW_PROBE" >> "$SUMMARY_FILE"
 echo "Failure memory window rounds: $FAILURE_MEMORY_WINDOW_ROUNDS" >> "$SUMMARY_FILE"
+echo "Scoring answer trials: $SCORING_ANSWER_TRIALS" >> "$SUMMARY_FILE"
+echo "Qwen judge repeats: $QWEN_JUDGE_REPEATS" >> "$SUMMARY_FILE"
+echo "GPT judge repeats: $GPT_JUDGE_REPEATS" >> "$SUMMARY_FILE"
+echo "Qwen scoring max concurrent: $QWEN_SCORING_MAX_CONCURRENT" >> "$SUMMARY_FILE"
+echo "GPT scoring max concurrent: $GPT_SCORING_MAX_CONCURRENT" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
 echo "Round | Avg Score Rate | Status" >> "$SUMMARY_FILE"
 echo "------|----------------|--------" >> "$SUMMARY_FILE"
@@ -349,6 +365,13 @@ run_if_missing "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 1/2: round0_stabil
         --judge-base-url "$QWEN_BASE_URL" \
         --judge-api-key "$QWEN_API_KEY" \
         --judge-model "$QWEN_MODEL" \
+        --qwen-judge-repeats "$QWEN_JUDGE_REPEATS" \
+        --gpt-judge-base-url "$GPT_JUDGE_BASE_URL" \
+        --gpt-judge-api-key "$GPT_JUDGE_API_KEY" \
+        --gpt-judge-model "$GPT_JUDGE_MODEL" \
+        --gpt-judge-repeats "$GPT_JUDGE_REPEATS" \
+        --qwen-max-concurrent "$QWEN_SCORING_MAX_CONCURRENT" \
+        --gpt-max-concurrent "$GPT_SCORING_MAX_CONCURRENT" \
         --max-concurrent "$SCORING_CONCURRENCY" \
         --initial-trials "$ROUND0_INITIAL_TRIALS" \
         --extra-trials "$ROUND0_EXTRA_TRIALS" \
@@ -485,6 +508,14 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --judge-base-url "$QWEN_BASE_URL" \
                 --judge-api-key "$QWEN_API_KEY" \
                 --judge-model "$QWEN_MODEL" \
+                --answer-trials "$SCORING_ANSWER_TRIALS" \
+                --qwen-judge-repeats "$QWEN_JUDGE_REPEATS" \
+                --gpt-judge-base-url "$GPT_JUDGE_BASE_URL" \
+                --gpt-judge-api-key "$GPT_JUDGE_API_KEY" \
+                --gpt-judge-model "$GPT_JUDGE_MODEL" \
+                --gpt-judge-repeats "$GPT_JUDGE_REPEATS" \
+                --qwen-max-concurrent "$QWEN_SCORING_MAX_CONCURRENT" \
+                --gpt-max-concurrent "$GPT_SCORING_MAX_CONCURRENT" \
                 --concurrency "$SCORING_CONCURRENCY"
     fi
 

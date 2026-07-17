@@ -1,10 +1,17 @@
 import argparse
 import asyncio
+import gzip
+import hashlib
 import json
 import logging
 import os
 import re
+import statistics
 import unicodedata
+from collections import deque
+from contextlib import asynccontextmanager
+from copy import deepcopy
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
@@ -31,10 +38,24 @@ ANSWER_BASE_URL = (
     or os.getenv("QWEN_BASE_URL")
     or get_config_value("ANSWER_BASE_URL", "QWEN_BASE_URL", default="")
 )
+GPT_JUDGE_MODEL = (
+    os.getenv("GPT_JUDGE_MODEL")
+    or os.getenv("GPT_MODEL")
+    or get_config_value("GPT_JUDGE_MODEL", "GPT_MODEL", "QA_MODEL", default="")
+)
+GPT_JUDGE_BASE_URL = (
+    os.getenv("GPT_JUDGE_BASE_URL")
+    or os.getenv("OPENAI_BASE_URL")
+    or get_config_value("GPT_JUDGE_BASE_URL", "OPENAI_BASE_URL", "BASE_URL", default="")
+)
 
 
 ANSWER_PLACEHOLDER = "<<<待评答案>>"
 REQUEST_TIMEOUT_SECONDS = 180.0
+EVALUATION_PROTOCOL = "dual_judge_parallel_v1"
+DEFAULT_ANSWER_TRIALS = 3
+DEFAULT_QWEN_JUDGE_REPEATS = 2
+DEFAULT_GPT_JUDGE_REPEATS = 2
 
 
 logging.basicConfig(
@@ -94,6 +115,110 @@ def resolve_answer_api_key(cli_key: str = "") -> str:
         "API_KEYS",
     )
     return config_keys[0] if config_keys else ""
+
+
+def parse_gpt_judge_api_keys(cli_keys: Optional[List[str]] = None) -> List[str]:
+    """Resolve GPT judge credentials without falling back to the Qwen service key."""
+    if cli_keys:
+        keys = [key.strip() for key in cli_keys if key and key.strip()]
+        if keys:
+            return keys
+    raw = (
+        os.getenv("GPT_JUDGE_API_KEYS")
+        or os.getenv("GPT_JUDGE_API_KEY")
+        or os.getenv("GPT_API_KEYS")
+        or os.getenv("HIAPI_KEYS_BIG")
+        or os.getenv("OPENAI_API_KEYS")
+        or os.getenv("OPENAI_API_KEY")
+        or ""
+    )
+    keys = [part.strip() for part in raw.split(",") if part.strip()]
+    if keys:
+        return keys
+    keys = get_config_list(
+        "GPT_JUDGE_API_KEYS",
+        "GPT_JUDGE_API_KEY",
+        "GPT_API_KEYS",
+        "HIAPI_KEYS_BIG",
+        "OPENAI_API_KEYS",
+        "OPENAI_API_KEY",
+        "API_KEYS",
+    )
+    return keys or ["EMPTY_KEY"]
+
+
+class FairRequestPool:
+    """Bound actual in-flight calls and rotate grants across active samples."""
+
+    def __init__(self, limit: int, name: str):
+        if limit < 1:
+            raise ValueError(f"{name} request pool limit must be >= 1")
+        self.limit = int(limit)
+        self.name = name
+        self.active = 0
+        self.peak_active = 0
+        self._waiters = deque()
+        self._lock = asyncio.Lock()
+        self._last_granted_sample: Optional[str] = None
+
+    def _next_waiter_index(self) -> int:
+        if not self._waiters:
+            return -1
+        if self._last_granted_sample is None:
+            return 0
+        for index, (sample_key, _) in enumerate(self._waiters):
+            if sample_key != self._last_granted_sample:
+                return index
+        return 0
+
+    def _dispatch_locked(self) -> None:
+        while self.active < self.limit and self._waiters:
+            index = self._next_waiter_index()
+            self._waiters.rotate(-index)
+            sample_key, future = self._waiters.popleft()
+            self._waiters.rotate(index)
+            if future.cancelled():
+                continue
+            self.active += 1
+            self.peak_active = max(self.peak_active, self.active)
+            self._last_granted_sample = sample_key
+            future.set_result(None)
+
+    async def acquire(self, sample_key: str) -> None:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        normalized_key = str(sample_key or "unknown")
+        async with self._lock:
+            self._waiters.append((normalized_key, future))
+            self._dispatch_locked()
+        try:
+            await future
+        except asyncio.CancelledError:
+            async with self._lock:
+                still_waiting = any(waiter_future is future for _, waiter_future in self._waiters)
+                if still_waiting:
+                    self._waiters = deque(
+                        (key, waiter_future)
+                        for key, waiter_future in self._waiters
+                        if waiter_future is not future
+                    )
+                else:
+                    self.active = max(0, self.active - 1)
+                self._dispatch_locked()
+            raise
+
+    async def release(self) -> None:
+        async with self._lock:
+            self.active = max(0, self.active - 1)
+            self._dispatch_locked()
+
+    @asynccontextmanager
+    async def request(self, sample_key: str):
+        await self.acquire(sample_key)
+        try:
+            yield
+        finally:
+            await self.release()
 
 
 def extract_answer(resp) -> str:
@@ -447,17 +572,43 @@ class ScoringProcessor:
         answer_model_name: str = "",
         force_generate_answer: bool = False,
         judge_temperature: float = 0.0,
+        gpt_judge_client: Optional[RotatingAPIClient] = None,
+        gpt_judge_model: str = "",
+        gpt_judge_temperature: float = 0.0,
+        answer_trials: int = 1,
+        qwen_judge_repeats: int = 1,
+        gpt_judge_repeats: int = 0,
+        qwen_max_concurrent: int = 20,
+        gpt_max_concurrent: int = 20,
     ):
+        if answer_trials < 1:
+            raise ValueError("answer_trials must be >= 1")
+        if qwen_judge_repeats < 1:
+            raise ValueError("qwen_judge_repeats must be >= 1")
+        if gpt_judge_repeats < 0:
+            raise ValueError("gpt_judge_repeats must be >= 0")
+        if gpt_judge_repeats and not gpt_judge_client:
+            raise ValueError("gpt_judge_repeats > 0 but gpt_judge_client is missing")
         self.judge_client = judge_client
         self.judge_model = judge_model
+        self.gpt_judge_client = gpt_judge_client
+        self.gpt_judge_model = gpt_judge_model
         self.answer_mode = answer_mode
         self.answer_client = answer_client
         self.answer_model_name = answer_model_name
         self.force_generate_answer = force_generate_answer
         self.judge_temperature = judge_temperature
+        self.gpt_judge_temperature = gpt_judge_temperature
+        self.answer_trials = int(answer_trials)
+        self.qwen_judge_repeats = int(qwen_judge_repeats)
+        self.gpt_judge_repeats = int(gpt_judge_repeats)
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.qwen_request_pool = FairRequestPool(qwen_max_concurrent, "qwen")
+        self.gpt_request_pool = FairRequestPool(gpt_max_concurrent, "gpt")
         self.write_lock = asyncio.Lock()
+        self.trace_lock = asyncio.Lock()
         self.max_retries = max_retries
+        self._trace_entries: Dict[str, Dict[str, Any]] = {}
 
     def load_processed_keys(self, output_path: str) -> set:
         processed_keys = set()
@@ -481,8 +632,10 @@ class ScoringProcessor:
 
     def get_item_key(self, item: Dict[str, Any]) -> str:
         prompt = item.get("prompt", "")
-        index = item.get("index", "")
-        return f"{index}|||{prompt}"
+        identity = item.get("sample_id")
+        if identity is None or not str(identity).strip():
+            identity = item.get("index", "")
+        return f"{identity}|||{prompt}"
 
     def get_reference_answer(self, item: Dict[str, Any]) -> str:
         outputs = item.get("meta_info").get("references")
@@ -502,7 +655,9 @@ class ScoringProcessor:
         question = item.get("prompt")
         if not isinstance(question, str) or not question.strip():
             raise ValueError("缺少有效 prompt，无法生成待评答案")
-        return await self.answer_client.generate_answer(question.strip())
+        sample_key = self.get_item_key(item)
+        async with self.qwen_request_pool.request(sample_key):
+            return await self.answer_client.generate_answer(question.strip())
 
     async def generate_candidate_answer_with_retry(self, item: Dict[str, Any]) -> str:
         for attempt in range(self.max_retries + 1):
@@ -519,15 +674,23 @@ class ScoringProcessor:
                     raise
         raise RuntimeError("待评答案重试逻辑异常退出")
 
-    async def score_once(self, score_prompt: str) -> Dict[str, Any]:
-        response = await self.judge_client.chat_completions_create(
-            model=self.judge_model,
-            messages=[
-                {"role": "user", "content": score_prompt}
-            ],
-            temperature=self.judge_temperature
-        )
-        content = response.choices[0].message.content or ""
+    async def score_once(
+        self,
+        score_prompt: str,
+        *,
+        judge_client: RotatingAPIClient,
+        judge_model: str,
+        judge_temperature: float,
+        request_pool: FairRequestPool,
+        sample_key: str,
+    ) -> Dict[str, Any]:
+        async with request_pool.request(sample_key):
+            response = await judge_client.chat_completions_create(
+                model=judge_model,
+                messages=[{"role": "user", "content": score_prompt}],
+                temperature=judge_temperature,
+            )
+        content = extract_answer(response)
         json_str = extract_json_from_response(content)
         parsed = loads_json_with_repair(json_str)
         if not isinstance(parsed, dict):
@@ -535,12 +698,39 @@ class ScoringProcessor:
         parsed["_raw_response"] = content.strip()
         return parsed
 
-    async def score_with_retry(self, score_prompt: str) -> Dict[str, Any]:
+    async def score_with_retry(
+        self,
+        score_prompt: str,
+        *,
+        judge_client: Optional[RotatingAPIClient] = None,
+        judge_model: Optional[str] = None,
+        judge_temperature: Optional[float] = None,
+        request_pool: Optional[FairRequestPool] = None,
+        sample_key: str = "unknown",
+        judge_name: str = "qwen",
+    ) -> Dict[str, Any]:
+        resolved_client = judge_client or self.judge_client
+        resolved_model = judge_model or self.judge_model
+        resolved_temperature = self.judge_temperature if judge_temperature is None else judge_temperature
+        resolved_pool = request_pool or self.qwen_request_pool
         for attempt in range(self.max_retries + 1):
             try:
-                return await self.score_once(score_prompt)
+                return await self.score_once(
+                    score_prompt,
+                    judge_client=resolved_client,
+                    judge_model=resolved_model,
+                    judge_temperature=resolved_temperature,
+                    request_pool=resolved_pool,
+                    sample_key=sample_key,
+                )
             except Exception as e:
-                logger.warning(f"评分失败 (尝试 {attempt + 1}/{self.max_retries + 1}): {str(e)[:200]}")
+                logger.warning(
+                    "%s 评分失败 (尝试 %s/%s): %s",
+                    judge_name,
+                    attempt + 1,
+                    self.max_retries + 1,
+                    str(e)[:200],
+                )
                 if attempt < self.max_retries:
                     error_text = str(e)
                     if "调用频率" in error_text or "qpm" in error_text.lower() or "0x04030020" in error_text:
@@ -551,33 +741,267 @@ class ScoringProcessor:
                     raise
         raise RuntimeError("评分重试逻辑异常退出")
 
-    async def score_candidate_answer(self, item: Dict[str, Any], candidate_answer: str) -> Dict[str, Any]:
+    async def _register_trace(
+        self,
+        *,
+        sample_key: str,
+        trial_index: int,
+        judge_name: str,
+        repeat_index: int,
+        judge_model: str,
+        raw_response: str,
+    ) -> str:
+        trace_source = "|".join([
+            EVALUATION_PROTOCOL,
+            sample_key,
+            str(trial_index),
+            judge_name,
+            str(repeat_index),
+            raw_response,
+        ])
+        trace_id = hashlib.sha256(trace_source.encode("utf-8")).hexdigest()
+        entry = {
+            "trace_id": trace_id,
+            "evaluation_protocol": EVALUATION_PROTOCOL,
+            "sample_key": sample_key,
+            "trial_index": trial_index,
+            "judge": judge_name,
+            "repeat_index": repeat_index,
+            "judge_model": judge_model,
+            "raw_response": raw_response,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        async with self.trace_lock:
+            self._trace_entries[trace_id] = entry
+        return trace_id
+
+    async def _normalize_judge_result(
+        self,
+        *,
+        parsed: Dict[str, Any],
+        rubric: List[Dict[str, Any]],
+        sample_key: str,
+        trial_index: int,
+        repeat_index: int,
+        judge_name: str,
+        judge_model: str,
+    ) -> Dict[str, Any]:
+        normalized_item_scores, total_awarded = normalize_item_scores(
+            parsed.get("item_scores", []),
+            rubric,
+        )
+        total_possible = sum(max(0, int(criterion.get("weight", 0) or 0)) for criterion in rubric)
+        raw_response = str(parsed.get("_raw_response", "") or "")
+        trace_id = await self._register_trace(
+            sample_key=sample_key,
+            trial_index=trial_index,
+            judge_name=judge_name,
+            repeat_index=repeat_index,
+            judge_model=judge_model,
+            raw_response=raw_response,
+        )
+        return {
+            "repeat_index": repeat_index,
+            "judge_model": judge_model,
+            "item_scores": normalized_item_scores,
+            "overall_comment": str(parsed.get("overall_comment", "")).strip(),
+            "total_awarded": total_awarded,
+            "total_possible": total_possible,
+            "score_rate": total_awarded / total_possible if total_possible > 0 else None,
+            "raw_response_trace_id": trace_id,
+        }
+
+    async def _score_judge_repeat(
+        self,
+        *,
+        final_prompt: str,
+        rubric: List[Dict[str, Any]],
+        sample_key: str,
+        trial_index: int,
+        repeat_index: int,
+        judge_name: str,
+    ) -> Dict[str, Any]:
+        is_gpt = judge_name == "gpt"
+        client = self.gpt_judge_client if is_gpt else self.judge_client
+        model = self.gpt_judge_model if is_gpt else self.judge_model
+        temperature = self.gpt_judge_temperature if is_gpt else self.judge_temperature
+        pool = self.gpt_request_pool if is_gpt else self.qwen_request_pool
+        if client is None:
+            raise ValueError(f"{judge_name} judge client is missing")
+        parsed = await self.score_with_retry(
+            final_prompt,
+            judge_client=client,
+            judge_model=model,
+            judge_temperature=temperature,
+            request_pool=pool,
+            sample_key=sample_key,
+            judge_name=judge_name,
+        )
+        return await self._normalize_judge_result(
+            parsed=parsed,
+            rubric=rubric,
+            sample_key=sample_key,
+            trial_index=trial_index,
+            repeat_index=repeat_index,
+            judge_name=judge_name,
+            judge_model=model,
+        )
+
+    async def score_candidate_answer(
+        self,
+        item: Dict[str, Any],
+        candidate_answer: str,
+        trial_index: int = 1,
+    ) -> Dict[str, Any]:
         score_prompt_template = item.get("score_prompt")
         rubric = item.get("rubric")
-
         if not isinstance(score_prompt_template, str) or not score_prompt_template.strip():
             raise ValueError("输入数据缺少非空 score_prompt")
         if not isinstance(rubric, list) or not rubric:
             raise ValueError("输入数据缺少非空 rubric")
 
         final_prompt = build_scoring_prompt(score_prompt_template, candidate_answer.strip())
-        score_result = await self.score_with_retry(final_prompt)
-        normalized_item_scores, total_awarded = normalize_item_scores(
-            score_result.get("item_scores", []),
-            rubric
-        )
-        total_possible = sum(max(0, int(criterion.get("weight", 0) or 0)) for criterion in rubric)
+        sample_key = self.get_item_key(item)
+        qwen_tasks = [
+            self._score_judge_repeat(
+                final_prompt=final_prompt,
+                rubric=rubric,
+                sample_key=sample_key,
+                trial_index=trial_index,
+                repeat_index=repeat_index,
+                judge_name="qwen",
+            )
+            for repeat_index in range(1, self.qwen_judge_repeats + 1)
+        ]
 
-        return {
+        async def experimental_gpt(repeat_index: int) -> Dict[str, Any]:
+            try:
+                return await self._score_judge_repeat(
+                    final_prompt=final_prompt,
+                    rubric=rubric,
+                    sample_key=sample_key,
+                    trial_index=trial_index,
+                    repeat_index=repeat_index,
+                    judge_name="gpt",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "GPT 实验评分失败 sample=%s trial=%s repeat=%s error=%s",
+                    sample_key,
+                    trial_index,
+                    repeat_index,
+                    str(exc)[:200],
+                )
+                return {
+                    "repeat_index": repeat_index,
+                    "judge_model": self.gpt_judge_model,
+                    "error": str(exc),
+                }
+
+        combined = await asyncio.gather(
+            *qwen_tasks,
+            *(experimental_gpt(index) for index in range(1, self.gpt_judge_repeats + 1)),
+        )
+        qwen_results = list(combined[:len(qwen_tasks)])
+        gpt_results = list(combined[len(qwen_tasks):])
+        qwen_rates = [float(result["score_rate"]) for result in qwen_results]
+        gpt_rates = [
+            float(result["score_rate"])
+            for result in gpt_results
+            if result.get("score_rate") is not None and "error" not in result
+        ]
+        representative_qwen = qwen_results[0]
+        trial_result = {
+            "trial_index": trial_index,
+            "candidate_answer": candidate_answer.strip(),
             "answer_mode": self.answer_mode,
             "answer_model": self.answer_model_name if self.answer_mode == "llm" else "meta_info.references[0]",
-            "candidate_answer": candidate_answer.strip(),
-            "item_scores": normalized_item_scores,
-            "overall_comment": str(score_result.get("overall_comment", "")).strip(),
-            "total_awarded": total_awarded,
+            "qwen_judge_results": qwen_results,
+            "gpt_judge_results": gpt_results,
+            "qwen_score_mean": statistics.fmean(qwen_rates),
+            "gpt_score_mean": statistics.fmean(gpt_rates) if gpt_rates else None,
+            # Legacy-compatible projection for Round 0 and callers that score one answer.
+            "item_scores": deepcopy(representative_qwen["item_scores"]),
+            "overall_comment": representative_qwen["overall_comment"],
+            "total_awarded": statistics.fmean(qwen_rates) * representative_qwen["total_possible"],
+            "total_possible": representative_qwen["total_possible"],
+            "judge_model": self.judge_model,
+            "judge_raw_response_trace_id": representative_qwen["raw_response_trace_id"],
+        }
+        return trial_result
+
+    @staticmethod
+    def _score_summary(
+        rates: List[float],
+        *,
+        requested_count: int,
+        experimental: bool,
+    ) -> Dict[str, Any]:
+        successful_count = len(rates)
+        return {
+            "requested_count": requested_count,
+            "successful_count": successful_count,
+            "failed_count": requested_count - successful_count,
+            "score_count": successful_count,
+            "score_mean": statistics.fmean(rates) if rates else None,
+            "score_min": min(rates) if rates else None,
+            "score_max": max(rates) if rates else None,
+            "experimental": experimental,
+        }
+
+    def aggregate_answer_trials(self, trials: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not trials:
+            raise ValueError("至少需要一个 answer trial")
+        ordered_trials = sorted(trials, key=lambda trial: int(trial.get("trial_index") or 0))
+        qwen_rates = [
+            float(result["score_rate"])
+            for trial in ordered_trials
+            for result in trial.get("qwen_judge_results", [])
+        ]
+        if len(qwen_rates) != len(ordered_trials) * self.qwen_judge_repeats:
+            raise ValueError("必需的 Qwen judge repeat 不完整，拒绝生成在线分数")
+        gpt_rates = [
+            float(result["score_rate"])
+            for trial in ordered_trials
+            for result in trial.get("gpt_judge_results", [])
+            if "error" not in result and result.get("score_rate") is not None
+        ]
+        qwen_summary = self._score_summary(
+            qwen_rates,
+            requested_count=len(ordered_trials) * self.qwen_judge_repeats,
+            experimental=False,
+        )
+        qwen_summary["decision_source"] = "qwen"
+        gpt_summary = self._score_summary(
+            gpt_rates,
+            requested_count=len(ordered_trials) * self.gpt_judge_repeats,
+            experimental=True,
+        )
+        overall_qwen_mean = float(qwen_summary["score_mean"])
+        representative = min(
+            ordered_trials,
+            key=lambda trial: (
+                abs(float(trial["qwen_score_mean"]) - overall_qwen_mean),
+                int(trial.get("trial_index") or 0),
+            ),
+        )
+        representative_qwen = representative["qwen_judge_results"][0]
+        total_possible = int(representative_qwen["total_possible"])
+        return {
+            "evaluation_protocol": EVALUATION_PROTOCOL,
+            "answer_mode": self.answer_mode,
+            "answer_model": representative["answer_model"],
+            "candidate_answer": representative["candidate_answer"],
+            "item_scores": deepcopy(representative_qwen["item_scores"]),
+            "overall_comment": representative_qwen["overall_comment"],
+            "total_awarded": overall_qwen_mean * total_possible,
             "total_possible": total_possible,
             "judge_model": self.judge_model,
-            "judge_raw_response": score_result.get("_raw_response", "")
+            "judge_raw_response_trace_id": representative_qwen["raw_response_trace_id"],
+            "representative_trial_index": representative["trial_index"],
+            "answer_trials": ordered_trials,
+            "qwen_score_summary": qwen_summary,
+            "gpt_score_summary": gpt_summary,
         }
 
     async def process_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -594,19 +1018,96 @@ class ScoringProcessor:
                 attach_score_rate(item)
                 return item
 
-            if self.answer_mode == "reference":
-                candidate_answer = self.get_reference_answer(item)
-            else:
-                existing_answer = item.get("scoring_result", {}).get("candidate_answer")
-                if not self.force_generate_answer and isinstance(existing_answer, str) and existing_answer.strip():
-                    logger.info(f"读取已有 candidate_answer (index={item.get('index')})")
-                    candidate_answer = existing_answer.strip()
+            existing_answer = None
+            if self.answer_mode == "llm" and not self.force_generate_answer:
+                raw_existing_answer = item.get("scoring_result", {}).get("candidate_answer")
+                if isinstance(raw_existing_answer, str) and raw_existing_answer.strip():
+                    existing_answer = raw_existing_answer.strip()
+                    logger.info(f"首个 trial 读取已有 candidate_answer (index={item.get('index')})")
+
+            async def run_trial(trial_index: int) -> Dict[str, Any]:
+                if self.answer_mode == "reference":
+                    candidate_answer = self.get_reference_answer(item)
+                elif trial_index == 1 and existing_answer is not None:
+                    candidate_answer = existing_answer
                 else:
                     candidate_answer = await self.generate_candidate_answer_with_retry(item)
+                return await self.score_candidate_answer(item, candidate_answer, trial_index=trial_index)
 
-            item["scoring_result"] = await self.score_candidate_answer(item, candidate_answer)
+            trials = await asyncio.gather(*[
+                run_trial(trial_index)
+                for trial_index in range(1, self.answer_trials + 1)
+            ])
+            item["scoring_result"] = self.aggregate_answer_trials(list(trials))
+            item["evaluation_protocol"] = EVALUATION_PROTOCOL
+            item["qwen_score_summary"] = deepcopy(item["scoring_result"]["qwen_score_summary"])
+            item["gpt_score_summary"] = deepcopy(item["scoring_result"]["gpt_score_summary"])
+            item["representative_trial_index"] = item["scoring_result"]["representative_trial_index"]
             attach_score_rate(item)
             return item
+
+    @staticmethod
+    def trace_sidecar_path(output_path: str) -> str:
+        return output_path + ".judge_traces.jsonl.gz"
+
+    @staticmethod
+    def manifest_path(output_path: str) -> str:
+        return output_path + ".manifest.json"
+
+    def load_existing_traces(self, output_path: str) -> None:
+        sidecar_path = self.trace_sidecar_path(output_path)
+        if not os.path.exists(sidecar_path):
+            return
+        try:
+            with gzip.open(sidecar_path, "rt", encoding="utf-8") as trace_file:
+                for line in trace_file:
+                    if not line.strip():
+                        continue
+                    entry = json.loads(line)
+                    trace_id = entry.get("trace_id")
+                    if isinstance(trace_id, str) and trace_id:
+                        self._trace_entries[trace_id] = entry
+        except Exception as exc:
+            logger.warning("读取已有 judge trace sidecar 失败，将重新写入当前 trace: %s", str(exc)[:200])
+
+    @staticmethod
+    def _sha256_file(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def write_trace_artifacts(self, output_path: str) -> Tuple[str, str]:
+        sidecar_path = self.trace_sidecar_path(output_path)
+        manifest_path = self.manifest_path(output_path)
+        os.makedirs(os.path.dirname(os.path.abspath(sidecar_path)), exist_ok=True)
+        sidecar_temp = sidecar_path + ".tmp"
+        with gzip.open(sidecar_temp, "wt", encoding="utf-8") as trace_file:
+            for trace_id in sorted(self._trace_entries):
+                trace_file.write(json.dumps(self._trace_entries[trace_id], ensure_ascii=False) + "\n")
+        os.replace(sidecar_temp, sidecar_path)
+
+        manifest = {
+            "evaluation_protocol": EVALUATION_PROTOCOL,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "scoring_artifact": {
+                "path": os.path.basename(output_path),
+                "sha256": self._sha256_file(output_path) if os.path.exists(output_path) else None,
+            },
+            "judge_trace_sidecar": {
+                "path": os.path.basename(sidecar_path),
+                "compression": "gzip",
+                "record_count": len(self._trace_entries),
+                "sha256": self._sha256_file(sidecar_path),
+            },
+        }
+        manifest_temp = manifest_path + ".tmp"
+        with open(manifest_temp, "w", encoding="utf-8") as manifest_file:
+            json.dump(manifest, manifest_file, ensure_ascii=False, indent=2)
+            manifest_file.write("\n")
+        os.replace(manifest_temp, manifest_path)
+        return sidecar_path, manifest_path
 
     def _print_scoring_stats(self, results: List[Dict[str, Any]]):
         """自动统计并打印得分率。"""
@@ -677,6 +1178,7 @@ class ScoringProcessor:
                         items.append(json.loads(line))
 
         processed_keys = self.load_processed_keys(output_path)
+        self.load_existing_traces(output_path)
         original_count = len(items)
         items = [item for item in items if self.get_item_key(item) not in processed_keys]
         skipped_count = original_count - len(items)
@@ -685,6 +1187,8 @@ class ScoringProcessor:
 
         if not items:
             logger.info("所有数据已处理完成，无需继续")
+            if os.path.exists(output_path):
+                self.write_trace_artifacts(output_path)
             return
 
         logger.info(f"开始评分 {len(items)} 条数据，并发限制 {self.semaphore._value}")
@@ -724,6 +1228,9 @@ class ScoringProcessor:
         self._print_scoring_stats(results)
 
         logger.info(f"评分完成，结果保存至: {output_path}")
+        sidecar_path, manifest_path = self.write_trace_artifacts(output_path)
+        logger.info("judge trace sidecar: %s", sidecar_path)
+        logger.info("scoring manifest: %s", manifest_path)
         if os.path.exists(failed_path) and os.path.getsize(failed_path) == 0:
             os.remove(failed_path)
         elif os.path.exists(failed_path):
@@ -740,12 +1247,21 @@ async def main():
     parser = argparse.ArgumentParser(description="基于 gen_rubric.py 产出的 score_prompt 对答案进行自动评分")
     parser.add_argument("--input", type=str, required=True, help="gen_rubric.py 输出的 jsonl 文件路径")
     parser.add_argument("--output", type=str, help="输出 jsonl 文件路径，默认在输入文件名后追加 _scored")
-    parser.add_argument("--concurrency", type=int, default=50, help="并行处理的题目数量")
+    parser.add_argument("--concurrency", type=int, default=50, help="并行处理的题目 worker 数量")
     parser.add_argument("--retries", type=int, default=3, help="评分调用失败时的重试次数")
+    parser.add_argument("--answer-trials", type=int, default=None, help="每题回答 trial 数；llm 模式默认 3，reference 模式默认 1")
+    parser.add_argument("--qwen-judge-repeats", type=int, default=DEFAULT_QWEN_JUDGE_REPEATS, help="每个回答的 Qwen judge 独立评分次数")
+    parser.add_argument("--gpt-judge-repeats", type=int, default=DEFAULT_GPT_JUDGE_REPEATS, help="每个回答的 GPT 实验复评次数；设为 0 可关闭")
+    parser.add_argument("--qwen-max-concurrent", type=int, default=20, help="Qwen answer 与 Qwen judge 共享请求池的在途上限")
+    parser.add_argument("--gpt-max-concurrent", type=int, default=20, help="GPT judge 独立请求池的在途上限")
     parser.add_argument("--judge-model", type=str, default=JUDGE_MODEL, help="评分模型名称")
     parser.add_argument("--judge-base-url", type=str, default=JUDGE_BASE_URL, help="评分模型 OpenAI-compatible base_url")
     parser.add_argument("--judge-api-key", action="append", default=None, help="评分模型 API key；可多次传入。本地 Qwen 服务不需要 key 时可不传。")
     parser.add_argument("--judge-temperature", type=float, default=0.0, help="评分模型 temperature，默认 0.0")
+    parser.add_argument("--gpt-judge-model", type=str, default=GPT_JUDGE_MODEL, help="GPT 实验评分模型名称")
+    parser.add_argument("--gpt-judge-base-url", type=str, default=GPT_JUDGE_BASE_URL, help="GPT 实验评分服务 base_url")
+    parser.add_argument("--gpt-judge-api-key", action="append", default=None, help="GPT 实验评分 API key；可多次传入")
+    parser.add_argument("--gpt-judge-temperature", type=float, default=0.0, help="GPT 实验评分 temperature")
     parser.add_argument(
         "--answer-mode",
         type=str,
@@ -764,6 +1280,20 @@ async def main():
         help="answer-mode=llm 时忽略已有 scoring_result.candidate_answer，强制重新生成待评答案",
     )
     args = parser.parse_args()
+
+    resolved_answer_trials = args.answer_trials
+    if resolved_answer_trials is None:
+        resolved_answer_trials = DEFAULT_ANSWER_TRIALS if args.answer_mode == "llm" else 1
+    if resolved_answer_trials < 1:
+        raise ValueError("--answer-trials 必须 >= 1")
+    if args.qwen_judge_repeats < 1:
+        raise ValueError("--qwen-judge-repeats 必须 >= 1")
+    if args.gpt_judge_repeats < 0:
+        raise ValueError("--gpt-judge-repeats 必须 >= 0")
+    if args.gpt_judge_repeats and not (args.gpt_judge_base_url or "").strip():
+        raise ValueError("启用 GPT judge 时必须提供 --gpt-judge-base-url")
+    if args.gpt_judge_repeats and not (args.gpt_judge_model or "").strip():
+        raise ValueError("启用 GPT judge 时必须提供 --gpt-judge-model")
 
     if not args.output:
         base, ext = os.path.splitext(args.input)
@@ -789,6 +1319,12 @@ async def main():
         base_url=args.judge_base_url or JUDGE_BASE_URL,
         api_keys=parse_api_keys(args.judge_api_key)
     )
+    gpt_judge_client = None
+    if args.gpt_judge_repeats:
+        gpt_judge_client = RotatingAPIClient(
+            base_url=args.gpt_judge_base_url,
+            api_keys=parse_gpt_judge_api_keys(args.gpt_judge_api_key),
+        )
 
     processor = ScoringProcessor(
         judge_client=judge_client,
@@ -800,6 +1336,14 @@ async def main():
         answer_model_name=answer_model_name,
         force_generate_answer=args.force_generate_answer,
         judge_temperature=args.judge_temperature,
+        gpt_judge_client=gpt_judge_client,
+        gpt_judge_model=args.gpt_judge_model,
+        gpt_judge_temperature=args.gpt_judge_temperature,
+        answer_trials=resolved_answer_trials,
+        qwen_judge_repeats=args.qwen_judge_repeats,
+        gpt_judge_repeats=args.gpt_judge_repeats,
+        qwen_max_concurrent=args.qwen_max_concurrent,
+        gpt_max_concurrent=args.gpt_max_concurrent,
     )
 
     await processor.process_file(args.input, args.output)

@@ -10,6 +10,11 @@ Stage 0-5 question evolution pipeline.
 - `sample_id`, `index`, `round`, `prompt`, `meta_info`, `rubric`,
   `score_prompt`, `scoring_result`, `score_rate`, and `question_evolved` are
   shared pipeline fields.
+- Dual Judge scoring optionally adds `evaluation_protocol`,
+  `qwen_score_summary`, `gpt_score_summary`, and
+  `representative_trial_index`. `scoring_result.answer_trials` keeps the
+  ordered per-answer Qwen/GPT repeat records. Only the Qwen summary may drive
+  the top-level `score_rate`; the GPT summary is experimental metadata.
 - `sample_profile` is produced by `profile_samples.py`; `overscore_diagnosis`
   is produced by the same profiling step and consumed by
   `select_evolution_candidates.py`.

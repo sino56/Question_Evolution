@@ -557,8 +557,8 @@ VALIDATION_RETRIES=1
 ### 4.3 分步运行
 
 ```bash
-# Round 0：baseline 评分
-python scoring.py \
+# Round 0：稳定多 trial + 双 Judge baseline 评分
+python round0_stability_probe.py \
   --input data/data.jsonl \
   --output round_0_scored.jsonl \
   --answer-mode llm \
@@ -567,7 +567,12 @@ python scoring.py \
   --answer-model "$QWEN_MODEL" \
   --judge-base-url "$QWEN_BASE_URL" \
   --judge-api-key "$QWEN_API_KEY" \
-  --judge-model "$QWEN_MODEL"
+  --judge-model "$QWEN_MODEL" \
+  --qwen-judge-repeats 2 \
+  --gpt-judge-base-url "$GPT_JUDGE_BASE_URL" \
+  --gpt-judge-api-key "$GPT_JUDGE_API_KEY" \
+  --gpt-judge-model "$GPT_JUDGE_MODEL" \
+  --gpt-judge-repeats 2
 
 # Step 1：画像
 python profile_samples.py \
@@ -661,7 +666,13 @@ python scoring.py \
   --answer-model "$QWEN_MODEL" \
   --judge-base-url "$QWEN_BASE_URL" \
   --judge-api-key "$QWEN_API_KEY" \
-  --judge-model "$QWEN_MODEL"
+  --judge-model "$QWEN_MODEL" \
+  --answer-trials 3 \
+  --qwen-judge-repeats 2 \
+  --gpt-judge-base-url "$GPT_JUDGE_BASE_URL" \
+  --gpt-judge-api-key "$GPT_JUDGE_API_KEY" \
+  --gpt-judge-model "$GPT_JUDGE_MODEL" \
+  --gpt-judge-repeats 2
 
 # Step 11：效果统计
 python analyze_evolution_effect.py \
@@ -740,6 +751,12 @@ python collect_answers.py --input data/questions_evolved_only.jsonl --output dat
 
 ### scoring.py
 
+自由回答模式默认生成 3 个独立 Qwen 回答，每个回答执行 2 次必需的
+Qwen 评分和 2 次实验性 GPT 复评。顶层 `score_rate` 只由全部 Qwen
+repeat 聚合得到；GPT 结果只写入 `gpt_score_summary` 和 trial 明细。
+原始 judge 响应写入 `*.judge_traces.jsonl.gz`，校验信息登记在
+`*.manifest.json`。未进化透传样本仍完全复用已有评分，不发起任何新请求。
+
 ```bash
 python scoring.py \
   --input INPUT.jsonl \
@@ -751,6 +768,14 @@ python scoring.py \
   --judge-base-url URL \
   --judge-api-key KEY \
   --judge-model MODEL \
+  --answer-trials 3 \
+  --qwen-judge-repeats 2 \
+  --gpt-judge-base-url URL \
+  --gpt-judge-api-key KEY \
+  --gpt-judge-model MODEL \
+  --gpt-judge-repeats 2 \
+  --qwen-max-concurrent 20 \
+  --gpt-max-concurrent 20 \
   --concurrency N \
   --retries N
 ```
