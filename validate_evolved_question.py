@@ -1,14 +1,17 @@
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from local_api_config import get_config_list, get_config_value
 from prompts.validation_prompt import build_validation_prompt
 from schema_validation import validate_records_against_schema
+from pipeline_runtime import StageMetrics, load_json_records, publish_records
 
 
 FORMAT_DIFFICULTY_TERMS = (
@@ -47,17 +50,30 @@ VALIDATION_BASE_URL = (
 )
 
 
+def local_validation_rule_version(
+    *,
+    max_prompt_chars: int = 1200,
+    max_output_tasks: int = 2,
+    max_candidate_options: int = 3,
+    max_counterfactuals: int = 1,
+) -> str:
+    payload = {
+        "format_difficulty_terms": FORMAT_DIFFICULTY_TERMS,
+        "external_knowledge_terms": EXTERNAL_KNOWLEDGE_TERMS,
+        "counterfactual_terms": COUNTERFACTUAL_TERMS,
+        "task_split_pattern": TASK_SPLIT_PATTERN.pattern,
+        "option_pattern": OPTION_PATTERN.pattern,
+        "max_prompt_chars": max_prompt_chars,
+        "max_output_tasks": max_output_tasks,
+        "max_candidate_options": max_candidate_options,
+        "max_counterfactuals": max_counterfactuals,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
-    with open(input_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-    if not content:
-        return []
-    if content.startswith("["):
-        data = json.loads(content)
-        if not isinstance(data, list):
-            raise ValueError("JSON input must be an array")
-        return data
-    return [json.loads(line) for line in content.splitlines() if line.strip()]
+    return load_json_records(input_path, stage="validate_evolved_question")
 
 
 def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str) -> None:
@@ -384,8 +400,14 @@ def validate_record(
     max_counterfactuals: int = 1,
     llm_validation: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    rule_version = local_validation_rule_version(
+        max_prompt_chars=max_prompt_chars,
+        max_output_tasks=max_output_tasks,
+        max_candidate_options=max_candidate_options,
+        max_counterfactuals=max_counterfactuals,
+    )
     if item.get("question_evolved") is False:
-        return merge_llm_validation_result({
+        result = merge_llm_validation_result({
             "passed": True,
             "main_axis_count": 0,
             "new_facts_count": 0,
@@ -400,6 +422,8 @@ def validate_record(
             "reject_reason": None,
             "invalid_type": None,
         }, llm_validation)
+        result["local_validation_rule_version"] = rule_version
+        return result
 
     original_prompt = get_original_prompt(item)
     prompt = get_current_prompt(item)
@@ -469,7 +493,22 @@ def validate_record(
         "reject_reasons": reject_reasons,
         "invalid_type": None if passed else invalid_type or "invalid_complexity",
     }
-    return merge_llm_validation_result(rule_result, llm_validation)
+    result = merge_llm_validation_result(rule_result, llm_validation)
+    result["local_validation_rule_version"] = rule_version
+    return result
+
+
+def _cached_local_validation(
+    item: Dict[str, Any],
+    *,
+    expected_rule_version: str,
+) -> Optional[Dict[str, Any]]:
+    cached = _metadata(item).get("local_validation_result")
+    if not isinstance(cached, dict):
+        return None
+    if cached.get("local_validation_rule_version") != expected_rule_version:
+        return None
+    return dict(cached)
 
 
 def attach_validation_result(
@@ -482,14 +521,28 @@ def attach_validation_result(
     llm_validation: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     result = dict(item)
-    result["validation_result"] = validate_record(
-        item,
+    expected_rule_version = local_validation_rule_version(
         max_prompt_chars=max_prompt_chars,
         max_output_tasks=max_output_tasks,
         max_candidate_options=max_candidate_options,
         max_counterfactuals=max_counterfactuals,
-        llm_validation=llm_validation,
     )
+    cached = _cached_local_validation(item, expected_rule_version=expected_rule_version)
+    if cached is not None:
+        cached["local_validation_reused"] = True
+        result["validation_result"] = merge_llm_validation_result(cached, llm_validation)
+        result["validation_result"]["local_validation_rule_version"] = expected_rule_version
+        result["validation_result"]["local_validation_reused"] = True
+    else:
+        result["validation_result"] = validate_record(
+            item,
+            max_prompt_chars=max_prompt_chars,
+            max_output_tasks=max_output_tasks,
+            max_candidate_options=max_candidate_options,
+            max_counterfactuals=max_counterfactuals,
+            llm_validation=llm_validation,
+        )
+        result["validation_result"]["local_validation_reused"] = False
     return result
 
 
@@ -552,6 +605,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-api-key", action="append", default=None, help="LLM validation API key; can be provided multiple times.")
     parser.add_argument("--llm-concurrency", type=int, default=5, help="LLM validation concurrency.")
     parser.add_argument("--validate-schema", action="store_true", help="Validate input/output records against local JSON schemas.")
+    parser.add_argument("--performance-events", default=None)
     return parser.parse_args()
 
 
@@ -559,7 +613,13 @@ def main() -> None:
     args = parse_args()
     if args.max_prompt_chars <= 0:
         raise ValueError("--max-prompt-chars must be positive")
+    stage = "validate_evolved_question"
+    metrics = StageMetrics(stage)
+    metrics.input_bytes = os.path.getsize(args.input)
+    parse_started = time.monotonic()
     records = load_json_or_jsonl(args.input)
+    metrics.parse_seconds += time.monotonic() - parse_started
+    compute_started = time.monotonic()
     if args.validate_schema:
         schema_errors = validate_records_against_schema(records, Path("schemas") / "pipeline_record.schema.json")
         if schema_errors:
@@ -587,7 +647,25 @@ def main() -> None:
         schema_errors = validate_records_against_schema(validated, Path("schemas") / "pipeline_record.schema.json")
         if schema_errors:
             raise ValueError(f"output schema validation failed: {schema_errors[0]}")
-    write_jsonl(validated, args.output)
+    metrics.compute_seconds += time.monotonic() - compute_started
+    publish_records(
+        validated,
+        args.output,
+        stage=stage,
+        input_path=args.input,
+        config={
+            "max_prompt_chars": args.max_prompt_chars,
+            "max_output_tasks": args.max_output_tasks,
+            "max_candidate_options": args.max_candidate_options,
+            "max_counterfactuals": args.max_counterfactuals,
+            "enable_llm_validation": args.enable_llm_validation,
+            "llm_model": args.llm_model if args.enable_llm_validation else None,
+            "validate_schema": args.validate_schema,
+        },
+        performance_path=args.performance_events,
+        code_paths=[__file__],
+        metrics=metrics,
+    )
 
 
 if __name__ == "__main__":

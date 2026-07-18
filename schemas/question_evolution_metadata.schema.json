@@ -44,7 +44,13 @@
       "type": "string"
     },
     "question_evolution_raw_response": {
-      "type": "string"
+      "type": "string",
+      "deprecated": true,
+      "description": "Legacy inline trace retained only for historical-record compatibility."
+    },
+    "question_evolution_raw_response_trace_id": {
+      "type": "string",
+      "description": "Trace ID for the raw response stored in the gzip sidecar registered by the artifact manifest."
     },
     "complexity_budget": {
       "type": "object",

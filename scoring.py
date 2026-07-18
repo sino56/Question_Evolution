@@ -8,8 +8,6 @@ import os
 import re
 import statistics
 import unicodedata
-from collections import deque
-from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,6 +15,16 @@ from typing import Any, Dict, List, Optional, Tuple
 from openai import AsyncOpenAI
 
 from local_api_config import get_config_list, get_config_value
+from pipeline_runtime import (
+    AtomicJsonlStageWriter,
+    FairRequestPool,
+    StageMetrics,
+    append_performance_event,
+    bounded_async_map,
+    ensure_passthrough_reusable,
+    iter_json_records,
+    validate_published_artifact,
+)
 
 JUDGE_MODEL = (
     os.getenv("JUDGE_MODEL")
@@ -147,80 +155,6 @@ def parse_gpt_judge_api_keys(cli_keys: Optional[List[str]] = None) -> List[str]:
     return keys or ["EMPTY_KEY"]
 
 
-class FairRequestPool:
-    """Bound actual in-flight calls and rotate grants across active samples."""
-
-    def __init__(self, limit: int, name: str):
-        if limit < 1:
-            raise ValueError(f"{name} request pool limit must be >= 1")
-        self.limit = int(limit)
-        self.name = name
-        self.active = 0
-        self.peak_active = 0
-        self._waiters = deque()
-        self._lock = asyncio.Lock()
-        self._last_granted_sample: Optional[str] = None
-
-    def _next_waiter_index(self) -> int:
-        if not self._waiters:
-            return -1
-        if self._last_granted_sample is None:
-            return 0
-        for index, (sample_key, _) in enumerate(self._waiters):
-            if sample_key != self._last_granted_sample:
-                return index
-        return 0
-
-    def _dispatch_locked(self) -> None:
-        while self.active < self.limit and self._waiters:
-            index = self._next_waiter_index()
-            self._waiters.rotate(-index)
-            sample_key, future = self._waiters.popleft()
-            self._waiters.rotate(index)
-            if future.cancelled():
-                continue
-            self.active += 1
-            self.peak_active = max(self.peak_active, self.active)
-            self._last_granted_sample = sample_key
-            future.set_result(None)
-
-    async def acquire(self, sample_key: str) -> None:
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        normalized_key = str(sample_key or "unknown")
-        async with self._lock:
-            self._waiters.append((normalized_key, future))
-            self._dispatch_locked()
-        try:
-            await future
-        except asyncio.CancelledError:
-            async with self._lock:
-                still_waiting = any(waiter_future is future for _, waiter_future in self._waiters)
-                if still_waiting:
-                    self._waiters = deque(
-                        (key, waiter_future)
-                        for key, waiter_future in self._waiters
-                        if waiter_future is not future
-                    )
-                else:
-                    self.active = max(0, self.active - 1)
-                self._dispatch_locked()
-            raise
-
-    async def release(self) -> None:
-        async with self._lock:
-            self.active = max(0, self.active - 1)
-            self._dispatch_locked()
-
-    @asynccontextmanager
-    async def request(self, sample_key: str):
-        await self.acquire(sample_key)
-        try:
-            yield
-        finally:
-            await self.release()
-
-
 def extract_answer(resp) -> str:
     choices = getattr(resp, "choices", None)
     if choices:
@@ -287,6 +221,8 @@ class RotatingAPIClient:
             if self.current_key_index >= len(self.api_keys):
                 logger.error("所有评分 API Key 额度已用尽")
                 return False
+            if self.client is not None:
+                await self.client.close()
             self._init_client()
             return True
 
@@ -303,6 +239,14 @@ class RotatingAPIClient:
                     raise Exception("所有评分 API Key 额度已用尽") from e
                 raise
         raise Exception("所有评分 API Key 额度已用尽")
+
+    async def close(self) -> None:
+        client = self.client
+        close = getattr(client, "close", None)
+        if close is not None:
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
 
 
 class AnswerLLMClient:
@@ -341,6 +285,11 @@ class AnswerLLMClient:
             **request
         )
         return extract_answer(response)
+
+    async def close(self) -> None:
+        result = self.client.close()
+        if asyncio.iscoroutine(result):
+            await result
 
 
 def extract_json_from_response(response_text: str) -> str:
@@ -609,6 +558,7 @@ class ScoringProcessor:
         self.trace_lock = asyncio.Lock()
         self.max_retries = max_retries
         self._trace_entries: Dict[str, Dict[str, Any]] = {}
+        self._trace_recovery_path: Optional[str] = None
 
     def load_processed_keys(self, output_path: str) -> set:
         processed_keys = set()
@@ -760,19 +710,33 @@ class ScoringProcessor:
             raw_response,
         ])
         trace_id = hashlib.sha256(trace_source.encode("utf-8")).hexdigest()
+        content_sha256 = hashlib.sha256(raw_response.encode("utf-8")).hexdigest()
         entry = {
             "trace_id": trace_id,
+            "record_key": sample_key,
+            "stage": "scoring",
+            "trace_kind": "judge_model_response",
+            "content_sha256": content_sha256,
+            "encoding": "utf-8",
+            "raw_text": raw_response,
+            # Legacy alias retained for existing trace readers.
+            "raw_response": raw_response,
             "evaluation_protocol": EVALUATION_PROTOCOL,
             "sample_key": sample_key,
             "trial_index": trial_index,
             "judge": judge_name,
             "repeat_index": repeat_index,
             "judge_model": judge_model,
-            "raw_response": raw_response,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         async with self.trace_lock:
-            self._trace_entries[trace_id] = entry
+            if trace_id not in self._trace_entries:
+                self._trace_entries[trace_id] = entry
+                if self._trace_recovery_path:
+                    with open(self._trace_recovery_path, "a", encoding="utf-8") as target:
+                        target.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+                        target.flush()
+                        os.fsync(target.fileno())
         return trace_id
 
     async def _normalize_judge_result(
@@ -1011,9 +975,11 @@ class ScoringProcessor:
             # question evolution 循环中，未进化样本应完全复用上一轮评分结果，
             # 避免重复答题/重评带来的随机波动污染本轮进化效果。
             if item.get("question_evolved") is False:
-                scoring_result = item.get("scoring_result")
-                if not isinstance(scoring_result, dict) or not scoring_result:
-                    raise ValueError("question_evolved=False 但缺少可复用的 scoring_result")
+                ensure_passthrough_reusable(
+                    item,
+                    stage="scoring",
+                    required=("rubric", "score_prompt", "scoring_result"),
+                )
                 logger.info(f"透传未进化样本 index={item.get('index')}，不重新答题/评分")
                 attach_score_rate(item)
                 return item
@@ -1056,19 +1022,33 @@ class ScoringProcessor:
 
     def load_existing_traces(self, output_path: str) -> None:
         sidecar_path = self.trace_sidecar_path(output_path)
-        if not os.path.exists(sidecar_path):
-            return
-        try:
-            with gzip.open(sidecar_path, "rt", encoding="utf-8") as trace_file:
-                for line in trace_file:
-                    if not line.strip():
-                        continue
-                    entry = json.loads(line)
-                    trace_id = entry.get("trace_id")
-                    if isinstance(trace_id, str) and trace_id:
-                        self._trace_entries[trace_id] = entry
-        except Exception as exc:
-            logger.warning("读取已有 judge trace sidecar 失败，将重新写入当前 trace: %s", str(exc)[:200])
+        recovery_path = sidecar_path + ".partial"
+        self._trace_recovery_path = recovery_path
+        sources = []
+        if os.path.exists(sidecar_path):
+            sources.append((gzip.open, sidecar_path))
+        if os.path.exists(recovery_path):
+            sources.append((open, recovery_path))
+        for opener, path in sources:
+            try:
+                with opener(path, "rt", encoding="utf-8") as trace_file:
+                    for line in trace_file:
+                        if not line.strip():
+                            continue
+                        entry = json.loads(line)
+                        trace_id = entry.get("trace_id")
+                        if isinstance(trace_id, str) and trace_id:
+                            raw_text = str(entry.get("raw_text", entry.get("raw_response", "")) or "")
+                            entry.setdefault("record_key", str(entry.get("sample_key") or "unknown"))
+                            entry.setdefault("stage", "scoring")
+                            entry.setdefault("trace_kind", "judge_model_response")
+                            entry.setdefault("content_sha256", hashlib.sha256(raw_text.encode("utf-8")).hexdigest())
+                            entry.setdefault("encoding", "utf-8")
+                            entry.setdefault("raw_text", raw_text)
+                            entry.setdefault("raw_response", raw_text)
+                            self._trace_entries[trace_id] = entry
+            except Exception as exc:
+                logger.warning("读取已有 judge trace 失败 %s: %s", path, str(exc)[:200])
 
     @staticmethod
     def _sha256_file(path: str) -> str:
@@ -1078,7 +1058,13 @@ class ScoringProcessor:
                 digest.update(chunk)
         return digest.hexdigest()
 
-    def write_trace_artifacts(self, output_path: str) -> Tuple[str, str]:
+    def write_trace_artifacts(
+        self,
+        output_path: str,
+        *,
+        write_manifest: bool = True,
+        finalize_recovery: bool = True,
+    ) -> Tuple[str, str]:
         sidecar_path = self.trace_sidecar_path(output_path)
         manifest_path = self.manifest_path(output_path)
         os.makedirs(os.path.dirname(os.path.abspath(sidecar_path)), exist_ok=True)
@@ -1087,6 +1073,9 @@ class ScoringProcessor:
             for trace_id in sorted(self._trace_entries):
                 trace_file.write(json.dumps(self._trace_entries[trace_id], ensure_ascii=False) + "\n")
         os.replace(sidecar_temp, sidecar_path)
+        recovery_path = sidecar_path + ".partial"
+        if finalize_recovery and os.path.exists(recovery_path):
+            os.remove(recovery_path)
 
         manifest = {
             "evaluation_protocol": EVALUATION_PROTOCOL,
@@ -1102,11 +1091,12 @@ class ScoringProcessor:
                 "sha256": self._sha256_file(sidecar_path),
             },
         }
-        manifest_temp = manifest_path + ".tmp"
-        with open(manifest_temp, "w", encoding="utf-8") as manifest_file:
-            json.dump(manifest, manifest_file, ensure_ascii=False, indent=2)
-            manifest_file.write("\n")
-        os.replace(manifest_temp, manifest_path)
+        if write_manifest:
+            manifest_temp = manifest_path + ".tmp"
+            with open(manifest_temp, "w", encoding="utf-8") as manifest_file:
+                json.dump(manifest, manifest_file, ensure_ascii=False, indent=2)
+                manifest_file.write("\n")
+            os.replace(manifest_temp, manifest_path)
         return sidecar_path, manifest_path
 
     def _print_scoring_stats(self, results: List[Dict[str, Any]]):
@@ -1161,93 +1151,143 @@ class ScoringProcessor:
             print(f"{'...':>8} ({len(sorted_stats) - 10} 条已省略)")
         print("=" * 60 + "\n")
 
-    async def process_file(self, input_path: str, output_path: str):
+    async def process_file(
+        self,
+        input_path: str,
+        output_path: str,
+        *,
+        performance_path: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ):
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"输入文件不存在: {input_path}")
 
-        items = []
-        with open(input_path, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            if content.startswith("["):
-                # JSON array format
-                items = json.loads(content)
-            else:
-                # JSONL format
-                for line in content.splitlines():
-                    if line.strip():
-                        items.append(json.loads(line))
-
-        processed_keys = self.load_processed_keys(output_path)
-        self.load_existing_traces(output_path)
-        original_count = len(items)
-        items = [item for item in items if self.get_item_key(item) not in processed_keys]
-        skipped_count = original_count - len(items)
-        if skipped_count > 0:
-            logger.info(f"跳过 {skipped_count} 条已处理数据")
-
-        if not items:
-            logger.info("所有数据已处理完成，无需继续")
-            if os.path.exists(output_path):
-                self.write_trace_artifacts(output_path)
+        stage = "scoring"
+        resolved_config = config or {
+            "judge_model": self.judge_model,
+            "gpt_judge_model": self.gpt_judge_model,
+            "answer_mode": self.answer_mode,
+            "answer_trials": self.answer_trials,
+            "qwen_judge_repeats": self.qwen_judge_repeats,
+            "gpt_judge_repeats": self.gpt_judge_repeats,
+        }
+        valid, _ = validate_published_artifact(
+            output_path,
+            stage=stage,
+            input_path=input_path,
+            config=resolved_config,
+        )
+        if valid:
+            logger.info("Verified published scoring artifact; skipping %s", output_path)
             return
 
-        logger.info(f"开始评分 {len(items)} 条数据，并发限制 {self.semaphore._value}")
-
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        metrics = StageMetrics(stage)
+        metrics.input_bytes = os.path.getsize(input_path)
+        writer = AtomicJsonlStageWriter(
+            output_path,
+            stage=stage,
+            input_path=input_path,
+            config=resolved_config,
+            code_paths=[__file__],
+            metrics=metrics,
+        )
+        self.load_existing_traces(output_path)
         failed_path = output_path + ".failed"
-        file_mode = "a" if processed_keys else "w"
         results: List[Dict[str, Any]] = []
         failed_count = 0
 
-        async def run_one(item: Dict[str, Any], out_f, fail_f):
-            nonlocal failed_count
+        async def worker(item: Dict[str, Any]):
             try:
                 processed_item = await self.process_item(item)
-                async with self.write_lock:
-                    out_f.write(json.dumps(processed_item, ensure_ascii=False) + "\n")
-                    out_f.flush()
-                    results.append(processed_item)
-            except Exception as e:
+                return processed_item, None
+            except Exception as exc:
                 failed_item = dict(item)
-                failed_item["scoring_error"] = str(e)
-                logger.error(f"评分失败 index={item.get('index')} prompt={str(item.get('prompt', ''))[:80]} error={e}")
-                async with self.write_lock:
-                    fail_f.write(json.dumps(failed_item, ensure_ascii=False) + "\n")
-                    fail_f.flush()
-                    failed_count += 1
+                failed_item["scoring_error"] = str(exc)
+                logger.error(
+                    "评分失败 index=%s prompt=%s error=%s",
+                    item.get("index"),
+                    str(item.get("prompt", ""))[:80],
+                    exc,
+                )
+                return None, failed_item
 
-        with open(output_path, file_mode, encoding="utf-8") as out_f, \
-             open(failed_path, file_mode, encoding="utf-8") as fail_f:
-            tasks = [run_one(item, out_f, fail_f) for item in items]
-            try:
-                from tqdm.asyncio import tqdm
-                await tqdm.gather(*tasks)
-            except ImportError:
-                await asyncio.gather(*tasks)
+        async def on_result(_sequence: int, item: Dict[str, Any], outcome) -> None:
+            nonlocal failed_count
+            result, failed = outcome
+            if result is not None:
+                writer.add_group(self.get_item_key(item), [result])
+                results.append(result)
+            if failed is not None:
+                with open(failed_path, "a", encoding="utf-8") as target:
+                    target.write(json.dumps(failed, ensure_ascii=False) + "\n")
+                    target.flush()
+                failed_count += 1
+
+        def pending_records():
+            for item in iter_json_records(input_path, stage=stage):
+                if self.get_item_key(item) in writer.processed_keys:
+                    continue
+                yield item
+
+        try:
+            await bounded_async_map(
+                pending_records(),
+                worker,
+                concurrency=max(1, self.semaphore._value),
+                on_result=on_result,
+                metrics=metrics,
+            )
+            metrics.request_pool_peaks = {
+                "qwen": self.qwen_request_pool.peak_active,
+                "gpt": self.gpt_request_pool.peak_active,
+            }
+            if failed_count:
+                raise RuntimeError(
+                    f"scoring 阶段有 {failed_count}/{metrics.input_records} 条记录失败；"
+                    f"失败详情见 {failed_path}，已停止后续流水线。"
+                )
+            sidecar_path, _ = self.write_trace_artifacts(
+                output_path,
+                write_manifest=False,
+                finalize_recovery=False,
+            )
+            writer.register_sidecar(
+                sidecar_path,
+                kind="judge_raw_response",
+                record_count=len(self._trace_entries),
+            )
+            sidecar_meta = {
+                "path": os.path.basename(sidecar_path),
+                "compression": "gzip",
+                "record_count": len(self._trace_entries),
+                "sha256": self._sha256_file(sidecar_path),
+            }
+            writer.publish(
+                extra_manifest={
+                    "evaluation_protocol": EVALUATION_PROTOCOL,
+                    "judge_trace_sidecar": sidecar_meta,
+                }
+            )
+            recovery_path = sidecar_path + ".partial"
+            if os.path.exists(recovery_path):
+                os.remove(recovery_path)
+        except Exception:
+            writer.close()
+            append_performance_event(performance_path, metrics.event(status="failed"))
+            raise
 
         self._print_scoring_stats(results)
-
-        logger.info(f"评分完成，结果保存至: {output_path}")
-        sidecar_path, manifest_path = self.write_trace_artifacts(output_path)
-        logger.info("judge trace sidecar: %s", sidecar_path)
-        logger.info("scoring manifest: %s", manifest_path)
         if os.path.exists(failed_path) and os.path.getsize(failed_path) == 0:
             os.remove(failed_path)
-        elif os.path.exists(failed_path):
-            logger.warning(f"存在失败数据，已保存至: {failed_path}")
-
-        if failed_count:
-            raise RuntimeError(
-                f"scoring 阶段有 {failed_count}/{len(items)} 条记录失败；"
-                f"失败详情见 {failed_path}，已停止后续流水线。"
-            )
+        append_performance_event(performance_path, metrics.event())
+        logger.info("评分完成，结果保存至: %s", output_path)
 
 
 async def main():
     parser = argparse.ArgumentParser(description="基于 gen_rubric.py 产出的 score_prompt 对答案进行自动评分")
     parser.add_argument("--input", type=str, required=True, help="gen_rubric.py 输出的 jsonl 文件路径")
     parser.add_argument("--output", type=str, help="输出 jsonl 文件路径，默认在输入文件名后追加 _scored")
-    parser.add_argument("--concurrency", type=int, default=50, help="并行处理的题目 worker 数量")
+    parser.add_argument("--concurrency", type=int, default=20, help="并行处理的题目 worker 数量")
     parser.add_argument("--retries", type=int, default=3, help="评分调用失败时的重试次数")
     parser.add_argument("--answer-trials", type=int, default=None, help="每题回答 trial 数；llm 模式默认 3，reference 模式默认 1")
     parser.add_argument("--qwen-judge-repeats", type=int, default=DEFAULT_QWEN_JUDGE_REPEATS, help="每个回答的 Qwen judge 独立评分次数")
@@ -1278,6 +1318,11 @@ async def main():
         dest="force_generate_answer",
         action="store_true",
         help="answer-mode=llm 时忽略已有 scoring_result.candidate_answer，强制重新生成待评答案",
+    )
+    parser.add_argument(
+        "--performance-events",
+        default=None,
+        help="Append metrics to this performance_events.jsonl file.",
     )
     args = parser.parse_args()
 
@@ -1346,7 +1391,34 @@ async def main():
         gpt_max_concurrent=args.gpt_max_concurrent,
     )
 
-    await processor.process_file(args.input, args.output)
+    try:
+        await processor.process_file(
+            args.input,
+            args.output,
+            performance_path=args.performance_events,
+            config={
+                "answer_mode": args.answer_mode,
+                "answer_model": resolved_answer_model if args.answer_mode == "llm" else "reference",
+                "judge_model": args.judge_model or JUDGE_MODEL,
+                "gpt_judge_model": args.gpt_judge_model,
+                "answer_trials": resolved_answer_trials,
+                "qwen_judge_repeats": args.qwen_judge_repeats,
+                "gpt_judge_repeats": args.gpt_judge_repeats,
+                "qwen_max_concurrent": args.qwen_max_concurrent,
+                "gpt_max_concurrent": args.gpt_max_concurrent,
+                "worker_concurrency": args.concurrency,
+                "retries": args.retries,
+                "judge_temperature": args.judge_temperature,
+                "gpt_judge_temperature": args.gpt_judge_temperature,
+                "force_generate_answer": args.force_generate_answer,
+            },
+        )
+    finally:
+        await judge_client.close()
+        if gpt_judge_client is not None:
+            await gpt_judge_client.close()
+        if answer_client is not None:
+            await answer_client.close()
 
 
 if __name__ == "__main__":

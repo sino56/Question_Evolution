@@ -3,14 +3,19 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from operator_router import route_records
+from operator_router import MemoryMatchIndex, find_memory_matches, route_records
 from prompts.operators import OPERATOR_SPECS
-from question_evolution import QuestionEvolutionProcessor
+import question_evolution as question_evolution_module
+import operator_router as operator_router_module
+from pipeline_runtime import AtomicJsonlStageWriter
+from question_evolution import QuestionEvolutionProcessor, get_item_key
 
 
 def load_jsonl(path: Path):
@@ -115,6 +120,140 @@ def test_question_evolution_uses_route_and_skips_passthrough():
     assert len(fake_client.calls) == 1
 
 
+def test_question_evolution_file_stage_checkpoints_candidate_group_and_externalizes_trace(tmp_path):
+    records = load_jsonl(ROOT / "tests" / "fixtures" / "stage03_routing_input.jsonl")
+    item = route_records(records)[0]
+    item["operator_route"] = dict(item["operator_route"])
+    item["operator_route"]["is_high_value_sample"] = True
+    input_path = tmp_path / "routed.jsonl"
+    output_path = tmp_path / "candidates.jsonl"
+    input_path.write_text(json.dumps(item, ensure_ascii=False) + "\n", encoding="utf-8")
+    processor = QuestionEvolutionProcessor(
+        FakeEvolutionClient(),
+        model="mock-evolution-model",
+        max_concurrent=2,
+        max_retries=0,
+        num_candidates=2,
+    )
+    asyncio.run(processor.process_file(str(input_path), str(output_path)))
+
+    candidates = load_jsonl(output_path)
+    assert len(candidates) == 2
+    assert len({candidate["candidate_group_id"] for candidate in candidates}) == 1
+    for candidate in candidates:
+        metadata = candidate["meta_info"]["question_evolution_metadata"]
+        assert "question_evolution_raw_response" not in metadata
+        assert metadata["question_evolution_raw_response_trace_id"]
+    assert Path(str(output_path) + ".evolution_traces.jsonl.gz").exists()
+    manifest = json.loads(Path(str(output_path) + ".manifest.json").read_text(encoding="utf-8"))
+    assert manifest["artifact"]["record_count"] == 2
+    assert manifest["sidecars"][0]["record_count"] == 2
+
+
+def test_question_evolution_failed_record_is_retried_instead_of_checkpointed(tmp_path):
+    item = route_records(load_jsonl(ROOT / "tests" / "fixtures" / "stage03_routing_input.jsonl"))[0]
+    input_path = tmp_path / "routed.jsonl"
+    output_path = tmp_path / "candidates.jsonl"
+    input_path.write_text(json.dumps(item, ensure_ascii=False) + "\n", encoding="utf-8")
+    processor = QuestionEvolutionProcessor(
+        FakeEvolutionClient(),
+        model="mock-evolution-model",
+        max_concurrent=1,
+        max_retries=0,
+    )
+
+    calls = []
+
+    async def fail_once(record):
+        calls.append("failed")
+        raise RuntimeError("isolated failure")
+
+    processor.process_item = fail_once
+    with pytest.raises(RuntimeError, match="question evolution 阶段有 1/1 条记录失败"):
+        asyncio.run(processor.process_file(str(input_path), str(output_path)))
+
+    assert not output_path.exists()
+    checkpoint_path = Path(str(output_path) + ".checkpoint.jsonl")
+    checkpoint_rows = [
+        json.loads(line)
+        for line in checkpoint_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [row["type"] for row in checkpoint_rows] == ["header"]
+
+    async def succeed(record):
+        calls.append("succeeded")
+        return {**record, "question_evolved": False, "question_evolution_status": "not_required"}
+
+    processor.process_item = succeed
+    asyncio.run(processor.process_file(str(input_path), str(output_path)))
+
+    published = load_jsonl(output_path)
+    assert calls == ["failed", "succeeded"]
+    assert published[0]["question_evolution_status"] == "not_required"
+    assert not Path(str(output_path) + ".failed").exists()
+
+
+def test_question_evolution_resume_preserves_round_candidate_budget(tmp_path):
+    items = [
+        {"sample_id": "sample-a", "index": 1, "prompt": "same", "score_rate": 0.9},
+        {"sample_id": "sample-b", "index": 1, "prompt": "same", "score_rate": 0.9},
+    ]
+    input_path = tmp_path / "routed.jsonl"
+    output_path = tmp_path / "candidates.jsonl"
+    input_path.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in items),
+        encoding="utf-8",
+    )
+    processor = QuestionEvolutionProcessor(
+        FakeEvolutionClient(),
+        model="mock-evolution-model",
+        max_concurrent=1,
+        max_retries=0,
+        num_candidates=3,
+        max_candidate_budget=3,
+    )
+    processor.recommended_candidate_count = lambda _item: 3
+    config = {
+        "model": processor.model,
+        "min_score_rate": processor.min_score_rate,
+        "num_candidates": processor.num_candidates,
+        "max_candidate_budget": processor.max_candidate_budget,
+        "validation_retries": processor.max_validation_retries,
+    }
+    writer = AtomicJsonlStageWriter(
+        str(output_path),
+        stage="question_evolution",
+        input_path=str(input_path),
+        config=config,
+        code_paths=[
+            question_evolution_module.__file__,
+            question_evolution_module.validation_stage.__file__,
+        ],
+        flush_records=1,
+    )
+    writer.add_group(get_item_key(items[0]), [{**items[0], "question_evolved": False}])
+    writer.close()
+
+    requested = []
+
+    async def generate(record, requested_candidates):
+        requested.append((record["sample_id"], requested_candidates))
+        return [{**record, "question_evolved": False}]
+
+    processor.process_item_candidates = generate
+    asyncio.run(processor.process_file(str(input_path), str(output_path)))
+
+    assert requested == [("sample-b", 1)]
+    assert {row["sample_id"] for row in load_jsonl(output_path)} == {"sample-a", "sample-b"}
+
+
+def test_question_evolution_record_key_prefers_sample_id():
+    first = {"sample_id": "sample-a", "index": 1, "prompt": "same"}
+    second = {"sample_id": "sample-b", "index": 1, "prompt": "same"}
+    assert get_item_key(first) != get_item_key(second)
+
+
 def test_candidate_generation_falls_back_when_no_operator_available():
     records = load_jsonl(ROOT / "tests" / "fixtures" / "stage03_routing_input.jsonl")
     routed = route_records(records)
@@ -206,6 +345,60 @@ def test_state_recommendation_precedes_memory_and_failed_operator_is_avoided():
     assert route["primary_operator"] == "O18_baseline_scope_mismatch"
     assert "O13_minimal_disqualifier" in route["avoid_operators"]
     assert "O16_close_alternative_normalization" in route["backup_operators"]
+
+
+def test_memory_index_preserves_linear_match_order_and_caches_signature():
+    signature = {
+        "core_capability": "边界判断",
+        "claim_level": "可疑线索",
+        "problem_shape": "候选项区分",
+        "candidate_overscore_cause": "处置触发混淆",
+    }
+    records = [
+        {"sample_signature": dict(signature), "operator_used": "O17_action_vs_fact_threshold"},
+        {
+            "sample_signature": {**signature, "problem_shape": "事实承接"},
+            "operator_used": "O10_evidence_sufficiency_ladder",
+        },
+        {
+            "sample_signature": {field: "不匹配" for field in signature},
+            "operator_used": "O18_baseline_scope_mismatch",
+        },
+    ]
+    expected = find_memory_matches(signature, records)
+    index = MemoryMatchIndex(records)
+    assert find_memory_matches(signature, records, index=index) == expected
+    assert find_memory_matches(signature, records, index=index) == expected
+    assert index.cache_hits == 1
+
+
+def test_operator_router_performance_event_covers_parse_compute_and_windows_rss(tmp_path, monkeypatch):
+    input_path = ROOT / "tests" / "fixtures" / "stage03_routing_input.jsonl"
+    output_path = tmp_path / "routed.jsonl"
+    performance_path = tmp_path / "performance_events.jsonl"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "operator_router.py",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--memory-dir",
+            str(tmp_path / "memory"),
+            "--performance-events",
+            str(performance_path),
+        ],
+    )
+
+    operator_router_module.main()
+
+    event = json.loads(performance_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert event["stage"] == "operator_router"
+    assert event["parse_seconds"] > 0
+    assert event["compute_seconds"] > 0
+    assert event["rss_peak_bytes"] > 0
 
 
 if __name__ == "__main__":

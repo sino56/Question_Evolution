@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -10,6 +11,7 @@ from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, T
 from local_api_config import get_config_list, get_config_value
 from prompts.difficulty_gain_validation import build_difficulty_gain_prompt, build_weak_probe_judgment_prompt
 from schema_validation import validate_records_against_schema
+from pipeline_runtime import StageMetrics, load_json_records, publish_records
 
 
 DEFAULT_VALIDATOR_MODEL = (
@@ -103,16 +105,7 @@ WEAK_PROBE_SOFT_RISK_TAGS = {
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
-    with open(input_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-    if not content:
-        return []
-    if content.startswith("["):
-        data = json.loads(content)
-        if not isinstance(data, list):
-            raise ValueError("JSON input must be an array")
-        return data
-    return [json.loads(line) for line in content.splitlines() if line.strip()]
+    return load_json_records(input_path, stage="validate_difficulty_gain")
 
 
 def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str) -> None:
@@ -1025,6 +1018,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weak-answer-api-key", action="append", default=None, help="Weak-answer API key; can be provided multiple times.")
     parser.add_argument("--rule-only", action="store_true", help="Use local heuristics instead of calling an LLM validator. Intended for offline smoke tests.")
     parser.add_argument("--validate-schema", action="store_true", help="Validate input/output records against local JSON schemas.")
+    parser.add_argument("--performance-events", default=None)
     return parser.parse_args()
 
 
@@ -1034,7 +1028,13 @@ def main() -> None:
         raise ValueError("score thresholds must satisfy 0 <= borderline <= min <= 1")
     if not 0 <= args.min_competitive_judgment_score <= 1:
         raise ValueError("min competitive judgment score must be in [0, 1]")
+    stage = "validate_difficulty_gain"
+    metrics = StageMetrics(stage)
+    metrics.input_bytes = os.path.getsize(args.input)
+    parse_started = time.monotonic()
     records = load_json_or_jsonl(args.input)
+    metrics.parse_seconds += time.monotonic() - parse_started
+    compute_started = time.monotonic()
     if args.validate_schema:
         schema_errors = validate_records_against_schema(records, Path("schemas") / "pipeline_record.schema.json")
         if schema_errors:
@@ -1075,7 +1075,30 @@ def main() -> None:
         schema_errors = validate_records_against_schema(validated, Path("schemas") / "pipeline_record.schema.json")
         if schema_errors:
             raise ValueError(f"output schema validation failed: {schema_errors[0]}")
-    write_jsonl(validated, args.output)
+    metrics.compute_seconds += time.monotonic() - compute_started
+    publish_records(
+        validated,
+        args.output,
+        stage=stage,
+        input_path=args.input,
+        config={
+            "model": None if args.rule_only else (args.model or DEFAULT_VALIDATOR_MODEL),
+            "rule_only": args.rule_only,
+            "concurrency": args.concurrency,
+            "request_timeout": args.request_timeout,
+            "min_gain_score": args.min_gain_score,
+            "borderline_gain_score": args.borderline_gain_score,
+            "min_competitive_judgment_score": args.min_competitive_judgment_score,
+            "allow_borderline": args.allow_borderline,
+            "enable_weak_probe": args.enable_weak_probe,
+            "weak_probe_mode": args.weak_probe_mode,
+            "weak_answer_model": args.weak_answer_model if args.enable_weak_probe else None,
+            "validate_schema": args.validate_schema,
+        },
+        performance_path=args.performance_events,
+        code_paths=[__file__],
+        metrics=metrics,
+    )
     write_json(generate_report(validated), args.report_output or default_report_output(args.output))
 
 

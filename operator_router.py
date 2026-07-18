@@ -1,8 +1,11 @@
 import argparse
 import json
 import os
+import time
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from pipeline_runtime import StageMetrics, load_json_records, publish_records, sha256_file
 
 from select_evolution_candidates import (
     EVOLVE_HIGH_SCORE_OVERSCORE,
@@ -77,16 +80,7 @@ FAILURE_MEMORY_AVOID_THRESHOLD = 3
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
-    with open(input_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-    if not content:
-        return []
-    if content.startswith("["):
-        data = json.loads(content)
-        if not isinstance(data, list):
-            raise ValueError("JSON input must be an array")
-        return data
-    return [json.loads(line) for line in content.splitlines() if line.strip()]
+    return load_json_records(input_path, stage="operator_router")
 
 
 def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str) -> None:
@@ -250,13 +244,19 @@ def build_failure_memory_actions(
     failure_memory: Sequence[Dict[str, Any]],
     *,
     window_rounds: int = FAILURE_MEMORY_WINDOW_ROUNDS,
+    memory_index: Optional["MemoryMatchIndex"] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     signature = build_sample_signature(item)
     current_round = _round_value(item)
     min_round = current_round - window_rounds + 1 if current_round is not None else None
     grouped: Counter = Counter()
 
-    for record in failure_memory:
+    candidate_memory = (
+        memory_index.candidate_records(signature)
+        if memory_index is not None
+        else failure_memory
+    )
+    for record in candidate_memory:
         memory_signature = _sample_signature_from_record(record)
         if not memory_signature or not _same_signature(signature, memory_signature):
             continue
@@ -375,7 +375,59 @@ def signature_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     return matched / compared
 
 
-def find_memory_matches(
+class MemoryMatchIndex:
+    """Read-only inverted index with exact-result caching.
+
+    Candidate pruning uses exact signature field hits, then delegates to the
+    existing similarity calculation and stable ordering.  It therefore changes
+    lookup cost, not routing semantics.
+    """
+
+    def __init__(self, records: Sequence[Dict[str, Any]]):
+        self.records = list(records)
+        self._postings: Dict[Tuple[str, str], set] = {}
+        self._cache: Dict[Tuple[Tuple[str, str], float], List[Dict[str, Any]]] = {}
+        self.cache_hits = 0
+        for index, record in enumerate(self.records):
+            signature = _sample_signature_from_record(record)
+            for field in SIGNATURE_FIELDS:
+                value = _clean_text(signature.get(field))
+                if value:
+                    self._postings.setdefault((field, value), set()).add(index)
+
+    @staticmethod
+    def _signature_key(signature: Dict[str, Any]) -> Tuple[Tuple[str, str], ...]:
+        return tuple((field, _clean_text(signature.get(field))) for field in SIGNATURE_FIELDS)
+
+    def candidate_records(self, signature: Dict[str, Any]) -> List[Dict[str, Any]]:
+        indexes = set()
+        for field in SIGNATURE_FIELDS:
+            value = _clean_text(signature.get(field))
+            if value:
+                indexes.update(self._postings.get((field, value), ()))
+        return [self.records[index] for index in sorted(indexes)]
+
+    def find(
+        self,
+        signature: Dict[str, Any],
+        *,
+        min_similarity: float = 0.75,
+    ) -> List[Dict[str, Any]]:
+        cache_key = (self._signature_key(signature), float(min_similarity))
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            self.cache_hits += 1
+            return [dict(item) for item in cached]
+        matches = _find_memory_matches_linear(
+            signature,
+            self.candidate_records(signature),
+            min_similarity=min_similarity,
+        )
+        self._cache[cache_key] = matches
+        return [dict(item) for item in matches]
+
+
+def _find_memory_matches_linear(
     signature: Dict[str, str],
     memory_records: Sequence[Dict[str, Any]],
     *,
@@ -393,6 +445,22 @@ def find_memory_matches(
             matches.append(match)
     matches.sort(key=lambda item: item.get("signature_similarity", 0), reverse=True)
     return matches
+
+
+def find_memory_matches(
+    signature: Dict[str, str],
+    memory_records: Sequence[Dict[str, Any]],
+    *,
+    min_similarity: float = 0.75,
+    index: Optional[MemoryMatchIndex] = None,
+) -> List[Dict[str, Any]]:
+    if index is not None:
+        return index.find(signature, min_similarity=min_similarity)
+    return _find_memory_matches_linear(
+        signature,
+        memory_records,
+        min_similarity=min_similarity,
+    )
 
 
 def _base_rule_route(item: Dict[str, Any]) -> Tuple[Optional[str], List[str], str]:
@@ -538,6 +606,8 @@ def build_operator_route(
     failure_memory: Sequence[Dict[str, Any]] = (),
     full_score_threshold: float = 0.99,
     failure_memory_window_rounds: int = FAILURE_MEMORY_WINDOW_ROUNDS,
+    operator_memory_index: Optional[MemoryMatchIndex] = None,
+    failure_memory_index: Optional[MemoryMatchIndex] = None,
 ) -> Dict[str, Any]:
     action = get_evolution_action(item)
     if action in NON_EVOLUTION_ACTIONS:
@@ -562,12 +632,21 @@ def build_operator_route(
     recommended_next = _recommended_next_methods(item)
 
     signature = build_sample_signature(item)
-    operator_matches = find_memory_matches(signature, operator_memory)
-    failure_matches = find_memory_matches(signature, failure_memory)
+    operator_matches = find_memory_matches(
+        signature,
+        operator_memory,
+        index=operator_memory_index,
+    )
+    failure_matches = find_memory_matches(
+        signature,
+        failure_memory,
+        index=failure_memory_index,
+    )
     failure_memory_actions = build_failure_memory_actions(
         item,
         failure_memory,
         window_rounds=failure_memory_window_rounds,
+        memory_index=failure_memory_index,
     )
 
     if operator_matches:
@@ -663,6 +742,8 @@ def attach_operator_route(
     failure_memory: Sequence[Dict[str, Any]] = (),
     full_score_threshold: float = 0.99,
     failure_memory_window_rounds: int = FAILURE_MEMORY_WINDOW_ROUNDS,
+    operator_memory_index: Optional[MemoryMatchIndex] = None,
+    failure_memory_index: Optional[MemoryMatchIndex] = None,
 ) -> Dict[str, Any]:
     result = dict(item)
     result["operator_route"] = build_operator_route(
@@ -671,6 +752,8 @@ def attach_operator_route(
         failure_memory=failure_memory,
         full_score_threshold=full_score_threshold,
         failure_memory_window_rounds=failure_memory_window_rounds,
+        operator_memory_index=operator_memory_index,
+        failure_memory_index=failure_memory_index,
     )
     return result
 
@@ -683,6 +766,8 @@ def route_records(
     full_score_threshold: float = 0.99,
     failure_memory_window_rounds: int = FAILURE_MEMORY_WINDOW_ROUNDS,
 ) -> List[Dict[str, Any]]:
+    operator_memory_index = MemoryMatchIndex(operator_memory)
+    failure_memory_index = MemoryMatchIndex(failure_memory)
     return [
         attach_operator_route(
             record,
@@ -690,6 +775,8 @@ def route_records(
             failure_memory=failure_memory,
             full_score_threshold=full_score_threshold,
             failure_memory_window_rounds=failure_memory_window_rounds,
+            operator_memory_index=operator_memory_index,
+            failure_memory_index=failure_memory_index,
         )
         for record in records
     ]
@@ -748,22 +835,56 @@ def parse_args() -> argparse.Namespace:
         help="Recent round window used for operator+surface-form failure memory convergence.",
     )
     parser.add_argument("--report-output", default=None, help="Optional operator-router memory action report JSON path.")
+    parser.add_argument("--performance-events", default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    stage = "operator_router"
+    metrics = StageMetrics(stage)
+    metrics.input_bytes = os.path.getsize(args.input)
     operator_memory_path = args.operator_memory or os.path.join(args.memory_dir, "operator_memory_bank.jsonl")
     failure_memory_path = args.failure_memory or os.path.join(args.memory_dir, "failure_memory_bank.jsonl")
+    parse_started = time.monotonic()
     records = load_json_or_jsonl(args.input)
+    operator_memory = load_jsonl_if_exists(operator_memory_path)
+    failure_memory = load_jsonl_if_exists(failure_memory_path)
+    metrics.parse_seconds += time.monotonic() - parse_started
+    compute_started = time.monotonic()
     routed = route_records(
         records,
-        operator_memory=load_jsonl_if_exists(operator_memory_path),
-        failure_memory=load_jsonl_if_exists(failure_memory_path),
+        operator_memory=operator_memory,
+        failure_memory=failure_memory,
         full_score_threshold=args.full_score_threshold,
         failure_memory_window_rounds=max(1, args.failure_memory_window_rounds),
     )
-    write_jsonl(routed, args.output)
+    metrics.compute_seconds += time.monotonic() - compute_started
+    publish_records(
+        routed,
+        args.output,
+        stage=stage,
+        input_path=args.input,
+        config={
+            "operator_memory_path": os.path.abspath(operator_memory_path),
+            "failure_memory_path": os.path.abspath(failure_memory_path),
+            "operator_memory_sha256": (
+                sha256_file(operator_memory_path)
+                if os.path.isfile(operator_memory_path)
+                else None
+            ),
+            "failure_memory_sha256": (
+                sha256_file(failure_memory_path)
+                if os.path.isfile(failure_memory_path)
+                else None
+            ),
+            "full_score_threshold": args.full_score_threshold,
+            "failure_memory_window_rounds": max(1, args.failure_memory_window_rounds),
+        },
+        performance_path=args.performance_events,
+        code_paths=[__file__],
+        metrics=metrics,
+    )
     if args.report_output:
         write_json(build_router_report(routed), args.report_output)
 

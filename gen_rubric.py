@@ -13,6 +13,16 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from local_api_config import get_config_list, get_config_value
+from pipeline_runtime import (
+    AtomicJsonlStageWriter,
+    StageMetrics,
+    append_performance_event,
+    bounded_async_map,
+    ensure_passthrough_reusable,
+    iter_json_records,
+    stable_record_key,
+    validate_published_artifact,
+)
 
 QA_MODEL = (
     os.getenv("RUBRIC_MODEL")
@@ -66,8 +76,6 @@ class RotatingAPIClient:
     
     def _init_client(self):
         """使用当前 key 初始化客户端"""
-        if self.client:
-            asyncio.create_task(self.client.close())
         current_key = self.api_keys[self.current_key_index]
         self.client = AsyncOpenAI(
             api_key=current_key,
@@ -98,6 +106,8 @@ class RotatingAPIClient:
             if self.current_key_index >= len(self.api_keys):
                 logger.error("所有 API Key 额度已用尽！")
                 return False
+            if self.client:
+                await self.client.close()
             self._init_client()
             return True
     
@@ -702,6 +712,7 @@ async def process_item(item, client: RotatingAPIClient, model, writer_queue, fai
         # question_evolution.py 会全量输出；未进化样本的 prompt/reference/rubric
         # 均应沿用上一轮结果，避免 rubric 漂移污染 question evolution 的分数归因。
         if item.get("question_evolved") is False:
+            ensure_passthrough_reusable(item, stage="gen_rubric")
             await writer_queue.put(item)
             try:
                 logger.debug(f"透传未进化样本 index={item['index']}，不重新生成 rubric")
@@ -808,6 +819,8 @@ async def main(
     prompt_version="v3",
     base_url=BASE_URL,
     api_keys=None,
+    performance_path=None,
+    config=None,
 ):
     """
     主处理函数
@@ -815,100 +828,112 @@ async def main(
     api_keys = list(api_keys) if api_keys is not None else parse_api_keys()
     if not api_keys:
         raise ValueError("缺少 RUBRIC_API_KEYS/GPT_API_KEYS/OPENAI_API_KEY 或 --api-key")
-    client = RotatingAPIClient(
-        base_url=base_url,
-        api_keys=api_keys
-    )
+    client = RotatingAPIClient(base_url=base_url, api_keys=api_keys)
     client.request_timeout = request_timeout
 
-    # 读取已存在的输出文件（用于resume功能）
-    existing_prompts = set()
-    if os.path.exists(output_file):
-        try:
-            with open(output_file, 'r', encoding='utf-8') as f:
-                existing_items = []
-                for line in f:
-                    if not line.strip():
-                        continue
-                    item = json.loads(line)
-                    try:
-                        item["rubric"] = validate_and_normalize_rubric(item.get("rubric"))
-                        existing_items.append(item)
-                    except Exception as e:
-                        logger.warning(f"跳过输出文件中的非法 rubric 记录: {str(e)}")
-                existing_prompts = {item.get("prompt") for item in existing_items if item.get("prompt") is not None}
-            logger.info(f"检测到已存在的输出文件，包含 {len(existing_prompts)} 个已处理的prompt")
-        except Exception as e:
-            logger.warning(f"读取已存在的输出文件失败: {str(e)}，将重新开始处理")
-            existing_prompts = set()
-    
-    # 读取输入文件
-    with open(input_file, 'r', encoding='utf-8') as f:
-        items = [json.loads(line) for line in f if line.strip()]
+    stage = "gen_rubric"
+    resolved_config = config or {
+        "model": model,
+        "base_url": base_url,
+        "concurrency": concurrency,
+        "request_timeout": request_timeout,
+        "prompt_version": prompt_version,
+    }
+    valid, _ = validate_published_artifact(
+        output_file,
+        stage=stage,
+        input_path=input_file,
+        config=resolved_config,
+    )
+    if valid:
+        await client.close()
+        logger.info("Verified published rubric artifact; skipping %s", output_file)
+        return
 
-    logger.info(f"读取到 {len(items)} 条原始数据")
-
-    # 过滤掉已经处理过的条目（基于prompt字段）
-    original_count = len(items)
-    items = [item for item in items if item.get("prompt") not in existing_prompts]
-    logger.info(f"跳过 {original_count - len(items)} 个已处理的条目，剩余 {len(items)} 条需要处理")
-
-    # 失败文件路径与打开模式
+    metrics = StageMetrics(stage)
+    metrics.input_bytes = os.path.getsize(input_file)
+    writer = AtomicJsonlStageWriter(
+        output_file,
+        stage=stage,
+        input_path=input_file,
+        config=resolved_config,
+        code_paths=[__file__],
+        metrics=metrics,
+    )
     failed_path = output_file + ".failed"
-    file_mode = 'a' if existing_prompts else 'w'
+    failed_count = 0
+    progress_bar = tqdm_asyncio(total=0, desc="生成评分标准")
 
-    logger.info(f"开始处理 {len(items)} 条数据，输出到 {output_file}，失败文件 {failed_path}")
+    async def worker(item):
+        success_queue = asyncio.Queue(maxsize=1)
+        failed_queue = asyncio.Queue(maxsize=1)
+        await process_item(
+            item,
+            client,
+            model,
+            success_queue,
+            failed_queue,
+            progress_bar,
+            prompt_version=prompt_version,
+        )
+        if not failed_queue.empty():
+            return None, await failed_queue.get()
+        if success_queue.empty():
+            failed = dict(item)
+            failed["rubric_generation_error"] = "stage produced neither success nor failure"
+            return None, failed
+        result = await success_queue.get()
+        try:
+            result["rubric"] = validate_and_normalize_rubric(result.get("rubric"))
+            return compact_generated_item(result), None
+        except Exception as exc:
+            failed = dict(result)
+            failed["rubric_generation_error"] = f"写入前校验失败: {exc}"
+            return None, failed
 
-    # 初始化队列和进度条
-    writer_queue = asyncio.Queue()
-    failed_queue = asyncio.Queue()
-    progress_bar = tqdm_asyncio(total=len(items), desc="生成评分标准")
+    async def on_result(_sequence, item, outcome):
+        nonlocal failed_count
+        result, failed = outcome
+        if result is not None:
+            writer.add_group(stable_record_key(item), [result])
+        if failed is not None:
+            with open(failed_path, "a", encoding="utf-8") as target:
+                target.write(json.dumps(failed, ensure_ascii=False) + "\n")
+                target.flush()
+            failed_count += 1
 
-    # 启动写入工作者
-    writer_task = asyncio.create_task(writer_worker(writer_queue, failed_queue, output_file, file_mode))
-    failed_writer_task = asyncio.create_task(failed_writer_worker(failed_queue, failed_path, file_mode))
+    def pending_records():
+        for item in iter_json_records(input_file, stage=stage):
+            if stable_record_key(item) in writer.processed_keys:
+                continue
+            yield item
 
-    # 信号量控制并发
-    semaphore = asyncio.Semaphore(concurrency)
+    try:
+        await bounded_async_map(
+            pending_records(),
+            worker,
+            concurrency=max(1, concurrency),
+            on_result=on_result,
+            metrics=metrics,
+            ordered_results=True,
+        )
+        if failed_count:
+            raise RuntimeError(
+                f"rubric generation 阶段有 {failed_count}/{metrics.input_records} 条记录失败；"
+                f"失败详情见 {failed_path}，已停止后续流水线。"
+            )
+        writer.publish()
+    except Exception:
+        writer.close()
+        append_performance_event(performance_path, metrics.event(status="failed"))
+        raise
+    finally:
+        progress_bar.close()
+        await client.close()
 
-    # 处理任务
-    tasks = []
-    for item in items:
-        async def process_with_semaphore(item):
-            async with semaphore:
-                await process_item(item, client, model, writer_queue, failed_queue, progress_bar, prompt_version=prompt_version)
-
-        tasks.append(process_with_semaphore(item))
-
-    # 执行所有任务
-    await asyncio.gather(*tasks)
-
-    # 通知写入工作者退出
-    await writer_queue.join()
-    await writer_queue.put(None)
-    await writer_task
-
-    await failed_queue.join()
-    await failed_queue.put(None)
-    failed_count = await failed_writer_task
-
-    # 关闭客户端
-    await client.close()
-
-    progress_bar.close()
-
-    # 清理空失败文件
     if os.path.exists(failed_path) and os.path.getsize(failed_path) == 0:
         os.remove(failed_path)
-    elif os.path.exists(failed_path):
-        logger.warning(f"存在失败的数据，已保存至: {failed_path}")
-
-    if failed_count:
-        raise RuntimeError(
-            f"rubric generation 阶段有 {failed_count}/{len(items)} 条记录失败；"
-            f"失败详情见 {failed_path}，已停止后续流水线。"
-        )
-
+    append_performance_event(performance_path, metrics.event())
     logger.info("所有任务完成")
 
 if __name__ == "__main__":
@@ -923,6 +948,11 @@ if __name__ == "__main__":
     parser.add_argument('--api-key', action='append', default=None, help='API key；可多次传入，默认读取 RUBRIC_API_KEYS/GPT_API_KEYS/OPENAI_API_KEY')
     parser.add_argument('--request-timeout', type=float, default=60.0, help='OpenAI SDK 单次请求 timeout 秒数')
     parser.add_argument('--prompt-version', default='v4', help='rubric prompt 版本: v3=baseline, v4=实验版')
+    parser.add_argument(
+        '--performance-events',
+        default=None,
+        help='Append metrics to this performance_events.jsonl file.',
+    )
     
     args = parser.parse_args()
     
@@ -945,6 +975,14 @@ if __name__ == "__main__":
             prompt_version=args.prompt_version,
             base_url=args.base_url or BASE_URL,
             api_keys=parse_api_keys(args.api_key),
+            performance_path=args.performance_events,
+            config={
+                "model": args.model or QA_MODEL,
+                "base_url": args.base_url or BASE_URL,
+                "concurrency": args.concurrency,
+                "request_timeout": args.request_timeout,
+                "prompt_version": args.prompt_version,
+            },
         ))
     except Exception as e:
         logger.critical(f"程序异常终止: {str(e)}", exc_info=True)

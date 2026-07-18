@@ -7,6 +7,17 @@ import re
 from typing import Any, Dict, Iterable, List, Optional
 
 from local_api_config import get_config_list, get_config_value
+from pipeline_runtime import (
+    AtomicJsonlStageWriter,
+    StageMetrics,
+    TraceStore,
+    append_performance_event,
+    bounded_async_map,
+    iter_json_records,
+    load_json_records,
+    stable_record_key,
+    validate_published_artifact,
+)
 from prompts.profile_prompt import build_profile_prompt
 
 
@@ -286,16 +297,7 @@ def parse_profile_response(response_text: str) -> Dict[str, Any]:
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
-    with open(input_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-    if not content:
-        return []
-    if content.startswith("["):
-        data = json.loads(content)
-        if not isinstance(data, list):
-            raise ValueError("JSON input must be an array")
-        return data
-    return [json.loads(line) for line in content.splitlines() if line.strip()]
+    return load_json_records(input_path, stage="profile_samples")
 
 
 def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str) -> None:
@@ -414,14 +416,18 @@ def attach_profile_result(
     *,
     model: str,
     raw_response: str,
+    raw_response_trace_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     result = dict(item)
     result["sample_profile"] = profile_result["sample_profile"]
     result["overscore_diagnosis"] = profile_result["overscore_diagnosis"]
-    result["profile_metadata"] = {
-        "profile_model": model,
-        "profile_raw_response": raw_response,
-    }
+    result["profile_metadata"] = {"profile_model": model}
+    if raw_response_trace_id:
+        result["profile_metadata"]["profile_raw_response_trace_id"] = raw_response_trace_id
+    else:
+        # Direct helper calls retain their historical shape.  The file stage
+        # always supplies a trace id and keeps the large response in a sidecar.
+        result["profile_metadata"]["profile_raw_response"] = raw_response
     result["profile_source"] = {
         "answer_source": (
             "representative_round0_answer"
@@ -482,11 +488,88 @@ class ProfileProcessor:
         tasks = [self.process_item(item) for item in records]
         return await asyncio.gather(*tasks)
 
-    async def process_file(self, input_path: str, output_path: str) -> None:
-        records = load_json_or_jsonl(input_path)
-        logger.info("Loaded %s records from %s", len(records), input_path)
-        profiled = await self.process_records(records)
-        write_jsonl(profiled, output_path)
+    async def process_file(
+        self,
+        input_path: str,
+        output_path: str,
+        *,
+        performance_path: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        stage = "profile_samples"
+        resolved_config = config or {"model": self.model}
+        valid, _ = validate_published_artifact(
+            output_path,
+            stage=stage,
+            input_path=input_path,
+            config=resolved_config,
+        )
+        if valid:
+            logger.info("Verified published profile artifact; skipping %s", output_path)
+            return
+
+        metrics = StageMetrics(stage)
+        metrics.input_bytes = os.path.getsize(input_path)
+        writer = AtomicJsonlStageWriter(
+            output_path,
+            stage=stage,
+            input_path=input_path,
+            config=resolved_config,
+            code_paths=[__file__],
+            metrics=metrics,
+        )
+        sidecar_path = output_path + ".profile_traces.jsonl.gz"
+        traces = TraceStore(stage, recovery_path=sidecar_path + ".partial")
+
+        async def worker(item: Dict[str, Any]) -> Dict[str, Any]:
+            profiled = await self.profile_once(item)
+            metadata = profiled.get("profile_metadata")
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            raw_response = str(metadata.pop("profile_raw_response", "") or "")
+            metadata["profile_raw_response_trace_id"] = traces.add(
+                record_key=stable_record_key(item),
+                raw_text=raw_response,
+                trace_kind="profile_model_response",
+                metadata={"model": self.model},
+            )
+            profiled["profile_metadata"] = metadata
+            return profiled
+
+        async def on_result(
+            _sequence: int,
+            item: Dict[str, Any],
+            result: Dict[str, Any],
+        ) -> None:
+            writer.add_group(stable_record_key(item), [result])
+
+        def pending_records():
+            for item in iter_json_records(input_path, stage=stage):
+                if stable_record_key(item) in writer.processed_keys:
+                    continue
+                yield item
+
+        try:
+            await bounded_async_map(
+                pending_records(),
+                worker,
+                concurrency=max(1, self.semaphore._value),
+                on_result=on_result,
+                metrics=metrics,
+                ordered_results=True,
+            )
+            trace_path, trace_count = traces.write(sidecar_path)
+            writer.register_sidecar(
+                trace_path,
+                kind="profile_raw_response",
+                record_count=trace_count,
+            )
+            writer.publish()
+            traces.finalize_recovery()
+        except Exception:
+            writer.close()
+            append_performance_event(performance_path, metrics.event(status="failed"))
+            raise
+        append_performance_event(performance_path, metrics.event())
         logger.info("Wrote profiled records to %s", output_path)
 
 
@@ -503,7 +586,17 @@ async def async_main(args: argparse.Namespace) -> None:
             model=args.model or DEFAULT_PROFILE_MODEL,
             max_concurrent=args.concurrency,
         )
-        await processor.process_file(args.input, args.output)
+        await processor.process_file(
+            args.input,
+            args.output,
+            performance_path=args.performance_events,
+            config={
+                "model": args.model or DEFAULT_PROFILE_MODEL,
+                "base_url": args.base_url or DEFAULT_PROFILE_BASE_URL,
+                "concurrency": args.concurrency,
+                "request_timeout": args.request_timeout,
+            },
+        )
     finally:
         await client.close()
 
@@ -516,6 +609,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default=DEFAULT_PROFILE_BASE_URL, help="OpenAI-compatible base URL.")
     parser.add_argument("--api-keys", default=None, help="Comma-separated API keys. Defaults to env vars.")
     parser.add_argument("--concurrency", type=int, default=5, help="Concurrent profile requests.")
+    parser.add_argument(
+        "--performance-events",
+        default=None,
+        help="Append metrics to this performance_events.jsonl file.",
+    )
     parser.add_argument(
         "--request-timeout",
         type=float,

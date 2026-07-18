@@ -1,9 +1,12 @@
 import argparse
 import json
 import os
+import time
 import re
 from collections import defaultdict
 from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from pipeline_runtime import StageMetrics, load_json_records, publish_records, sha256_file
 
 
 DEFAULT_FULL_SCORE_THRESHOLD = 0.99
@@ -29,16 +32,7 @@ FOCUS_STOPWORDS = {
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
-    with open(input_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-    if not content:
-        return []
-    if content.startswith("["):
-        data = json.loads(content)
-        if not isinstance(data, list):
-            raise ValueError("JSON input must be an array")
-        return data
-    return [json.loads(line) for line in content.splitlines() if line.strip()]
+    return load_json_records(input_path, stage="analyze_evolution_effect")
 
 
 def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str) -> None:
@@ -537,13 +531,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-drop-threshold", type=float, default=DEFAULT_SCORE_DROP_THRESHOLD)
     parser.add_argument("--review-drop-threshold", type=float, default=DEFAULT_REVIEW_DROP_THRESHOLD)
     parser.add_argument("--score-increase-threshold", type=float, default=DEFAULT_SCORE_INCREASE_THRESHOLD)
+    parser.add_argument("--performance-events", default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    stage = "analyze_evolution_effect"
+    metrics = StageMetrics(stage)
+    metrics.input_bytes = os.path.getsize(args.input)
+    parse_started = time.monotonic()
     records = load_json_or_jsonl(args.input)
     previous_records = load_json_or_jsonl(args.before) if args.before else None
+    metrics.parse_seconds += time.monotonic() - parse_started
+    compute_started = time.monotonic()
     analyzed = analyze_records(
         records,
         previous_records=previous_records,
@@ -552,7 +553,24 @@ def main() -> None:
         review_drop_threshold=args.review_drop_threshold,
         score_increase_threshold=args.score_increase_threshold,
     )
-    write_jsonl(analyzed, args.output)
+    metrics.compute_seconds += time.monotonic() - compute_started
+    publish_records(
+        analyzed,
+        args.output,
+        stage=stage,
+        input_path=args.input,
+        config={
+            "before": os.path.abspath(args.before) if args.before else None,
+            "before_sha256": sha256_file(args.before) if args.before else None,
+            "full_score_threshold": args.full_score_threshold,
+            "score_drop_threshold": args.score_drop_threshold,
+            "review_drop_threshold": args.review_drop_threshold,
+            "score_increase_threshold": args.score_increase_threshold,
+        },
+        performance_path=args.performance_events,
+        code_paths=[__file__],
+        metrics=metrics,
+    )
     if args.matrix_output:
         write_jsonl(build_effect_matrix(analyzed), args.matrix_output)
 

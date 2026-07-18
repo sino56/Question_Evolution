@@ -1,8 +1,11 @@
 import argparse
 import json
 import os
+import time
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
+
+from pipeline_runtime import StageMetrics, publish_records, sha256_file
 
 from analyze_evolution_effect import (
     get_metadata,
@@ -70,6 +73,42 @@ def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str, *, append: 
     with open(output_path, mode, encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def append_unique_jsonl(records: Iterable[Dict[str, Any]], output_path: str) -> int:
+    """Append only records not already present, making round-end memory writes retry-safe."""
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    seen = set()
+    if os.path.isfile(output_path):
+        with open(output_path, "r", encoding="utf-8") as existing:
+            for line_number, line in enumerate(existing, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    item = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"[update_sample_state:memory] {output_path}:{line_number}: {exc.msg}"
+                    ) from exc
+                seen.add(json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+    appended = 0
+    with open(output_path, "a", encoding="utf-8") as output:
+        for record in records:
+            canonical = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            if canonical in seen:
+                continue
+            output.write(json.dumps(record, ensure_ascii=False) + "\n")
+            seen.add(canonical)
+            appended += 1
+        if appended:
+            output.flush()
+            os.fsync(output.fileno())
+    return appended
 
 
 def _clean_text(value: Any) -> str:
@@ -525,19 +564,64 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--report-output", default=None, help="Optional state-update memory report JSON path.")
     parser.add_argument("--no-memory-output", action="store_true", help="Do not append memory-bank entries.")
+    parser.add_argument("--performance-events", default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    stage = "update_sample_state"
+    metrics = StageMetrics(stage)
+    metrics.input_bytes = os.path.getsize(args.input)
+    parse_started = time.monotonic()
     records = load_json_or_jsonl(args.input)
-    updated, operator_entries, failure_entries, invalid_entries = update_records(records)
     preselection_invalid_cases = load_optional_json_or_jsonl(args.preselection_invalid_input)
+    metrics.parse_seconds += time.monotonic() - parse_started
+    compute_started = time.monotonic()
+    updated, operator_entries, failure_entries, invalid_entries = update_records(records)
     if preselection_invalid_cases:
         preselection_failure_entries, preselection_invalid_entries = classify_preselection_invalid_cases(preselection_invalid_cases)
         failure_entries.extend(preselection_failure_entries)
         invalid_entries.extend(preselection_invalid_entries)
-    write_jsonl(updated, args.output)
+    operator_memory = args.operator_memory or os.path.join(args.memory_dir, "operator_memory_bank.jsonl")
+    failure_memory = args.failure_memory or os.path.join(args.memory_dir, "failure_memory_bank.jsonl")
+    invalid_output = args.invalid_output or os.path.join(args.memory_dir, "invalid_generation_cases.jsonl")
+
+    # Memory is a round-end side effect. Persist it idempotently before publishing the
+    # formal state artifact so a crash can never leave a skippable output with missing memory.
+    if not args.no_memory_output:
+        if operator_entries:
+            append_unique_jsonl(operator_entries, operator_memory)
+        if failure_entries:
+            append_unique_jsonl(failure_entries, failure_memory)
+        if invalid_entries:
+            append_unique_jsonl(invalid_entries, invalid_output)
+    metrics.compute_seconds += time.monotonic() - compute_started
+
+    publish_records(
+        updated,
+        args.output,
+        stage=stage,
+        input_path=args.input,
+        config={
+            "memory_dir": os.path.abspath(args.memory_dir),
+            "preselection_invalid_input": (
+                os.path.abspath(args.preselection_invalid_input)
+                if args.preselection_invalid_input
+                else None
+            ),
+            "preselection_invalid_sha256": (
+                sha256_file(args.preselection_invalid_input)
+                if args.preselection_invalid_input
+                and os.path.isfile(args.preselection_invalid_input)
+                else None
+            ),
+            "no_memory_output": args.no_memory_output,
+        },
+        performance_path=args.performance_events,
+        code_paths=[__file__],
+        metrics=metrics,
+    )
     if args.report_output:
         output_dir = os.path.dirname(os.path.abspath(args.report_output))
         if output_dir:
@@ -545,20 +629,6 @@ def main() -> None:
         with open(args.report_output, "w", encoding="utf-8") as f:
             json.dump(generate_report(updated, operator_entries, failure_entries, invalid_entries), f, ensure_ascii=False, indent=2, sort_keys=True)
             f.write("\n")
-
-    if args.no_memory_output:
-        return
-
-    operator_memory = args.operator_memory or os.path.join(args.memory_dir, "operator_memory_bank.jsonl")
-    failure_memory = args.failure_memory or os.path.join(args.memory_dir, "failure_memory_bank.jsonl")
-    invalid_output = args.invalid_output or os.path.join(args.memory_dir, "invalid_generation_cases.jsonl")
-    if operator_entries:
-        write_jsonl(operator_entries, operator_memory, append=True)
-    if failure_entries:
-        write_jsonl(failure_entries, failure_memory, append=True)
-    if invalid_entries:
-        write_jsonl(invalid_entries, invalid_output, append=True)
-
 
 if __name__ == "__main__":
     main()

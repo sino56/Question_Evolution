@@ -1,7 +1,10 @@
 import argparse
 import json
 import os
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from pipeline_runtime import StageMetrics, load_json_records, publish_records
 
 
 EVOLVE_HIGH_SCORE_OVERSCORE = "evolve_high_score_overscore"
@@ -67,16 +70,7 @@ except ValueError:
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
-    with open(input_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-    if not content:
-        return []
-    if content.startswith("["):
-        data = json.loads(content)
-        if not isinstance(data, list):
-            raise ValueError("JSON input must be an array")
-        return data
-    return [json.loads(line) for line in content.splitlines() if line.strip()]
+    return load_json_records(input_path, stage="select_evolution_candidates")
 
 
 def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str) -> None:
@@ -435,12 +429,19 @@ def parse_args() -> argparse.Namespace:
         help="Minimum stable_score for uncertain_low_probe when enabled.",
     )
     parser.add_argument("--report-output", default=None, help="Optional evolution candidate selection report JSON path.")
+    parser.add_argument("--performance-events", default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    stage = "select_evolution_candidates"
+    metrics = StageMetrics(stage)
+    metrics.input_bytes = os.path.getsize(args.input)
+    parse_started = time.monotonic()
     records = load_json_or_jsonl(args.input)
+    metrics.parse_seconds += time.monotonic() - parse_started
+    compute_started = time.monotonic()
     selected = process_records(
         records,
         high_score_threshold=args.high_score_threshold,
@@ -448,7 +449,22 @@ def main() -> None:
         enable_uncertain_low_probe=args.enable_uncertain_low_probe,
         uncertain_low_probe_min_score=args.uncertain_low_probe_min_score,
     )
-    write_jsonl(selected, args.output)
+    metrics.compute_seconds += time.monotonic() - compute_started
+    publish_records(
+        selected,
+        args.output,
+        stage=stage,
+        input_path=args.input,
+        config={
+            "high_score_threshold": args.high_score_threshold,
+            "low_score_threshold": args.low_score_threshold,
+            "enable_uncertain_low_probe": args.enable_uncertain_low_probe,
+            "uncertain_low_probe_min_score": args.uncertain_low_probe_min_score,
+        },
+        performance_path=args.performance_events,
+        code_paths=[__file__],
+        metrics=metrics,
+    )
     if args.report_output:
         write_json(generate_report(selected), args.report_output)
 

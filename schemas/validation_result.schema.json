@@ -76,6 +76,13 @@
     },
     "llm_validation_reason": {
       "type": "string"
+    },
+    "local_validation_rule_version": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "local_validation_reused": {
+      "type": "boolean"
     }
   }
 }

@@ -1,8 +1,16 @@
 import argparse
 import json
 import os
+import time
 from collections import Counter, defaultdict
 from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from pipeline_runtime import (
+    StageMetrics,
+    load_json_records,
+    publish_records,
+    validate_published_artifact,
+)
 
 
 RISK_SCORE = {"low": 0, "medium": -5, "high": -25}
@@ -63,16 +71,7 @@ NO_GAIN_EXPLORATION_MARGIN = 0.05
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
-    with open(input_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-    if not content:
-        return []
-    if content.startswith("["):
-        data = json.loads(content)
-        if not isinstance(data, list):
-            raise ValueError("JSON input must be an array")
-        return data
-    return [json.loads(line) for line in content.splitlines() if line.strip()]
+    return load_json_records(input_path, stage="candidate_selection")
 
 
 def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str, *, append: bool = False) -> None:
@@ -83,6 +82,21 @@ def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str, *, append: 
     with open(output_path, mode, encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def write_jsonl_atomic(records: Iterable[Dict[str, Any]], output_path: str) -> None:
+    """Replace a stage side output only after its complete content is durable."""
+
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    temporary = output_path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as target:
+        for record in records:
+            target.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        target.flush()
+        os.fsync(target.fileno())
+    os.replace(temporary, output_path)
 
 
 def _clean_text(value: Any) -> str:
@@ -1081,8 +1095,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Output selected evolved JSONL path.")
     parser.add_argument(
         "--invalid-output",
-        default=os.path.join("memory", "invalid_generation_cases.jsonl"),
-        help="Append rejected invalid candidate cases to this JSONL path.",
+        default=None,
+        help="Atomic rejected-candidate sidecar path; defaults next to --output.",
     )
     parser.add_argument(
         "--no-invalid-output",
@@ -1101,20 +1115,64 @@ def parse_args() -> argparse.Namespace:
         help="Maximum weak/manual/no-gain exploration candidates selected in one round.",
     )
     parser.add_argument("--report-output", default=None, help="Optional candidate-selection report JSON path.")
+    parser.add_argument("--performance-events", default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    stage = "candidate_selection"
+    config = {
+        "allow_missing_difficulty_gain": args.allow_missing_difficulty_gain,
+        "max_exploration_candidates_per_round": args.max_exploration_candidates_per_round,
+        "invalid_output": (
+            os.path.abspath(args.invalid_output)
+            if args.invalid_output and not args.no_invalid_output
+            else None
+        ),
+        "no_invalid_output": args.no_invalid_output,
+    }
+    metrics = StageMetrics(stage)
+    metrics.input_bytes = os.path.getsize(args.input)
+    parse_started = time.monotonic()
     records = load_json_or_jsonl(args.input)
+    metrics.parse_seconds += time.monotonic() - parse_started
+    compute_started = time.monotonic()
     selected, invalid_cases = select_candidates(
         records,
         allow_missing_difficulty_gain=args.allow_missing_difficulty_gain,
         max_exploration_candidates_per_round=args.max_exploration_candidates_per_round,
     )
-    write_jsonl(selected, args.output)
-    if invalid_cases and not args.no_invalid_output:
-        write_jsonl(invalid_cases, args.invalid_output, append=True)
+    metrics.compute_seconds += time.monotonic() - compute_started
+    valid, reason = validate_published_artifact(
+        args.output,
+        stage=stage,
+        input_path=args.input,
+        config=config,
+    )
+    if valid:
+        if args.report_output:
+            write_json(generate_report(records, selected, invalid_cases), args.report_output)
+        return
+    if os.path.exists(args.output):
+        raise RuntimeError(f"refusing to overwrite unverified artifact {args.output}: {reason}")
+
+    invalid_output = args.invalid_output or (args.output + ".invalid_generation_cases.jsonl")
+    sidecars = []
+    if not args.no_invalid_output:
+        write_jsonl_atomic(invalid_cases, invalid_output)
+        sidecars.append((invalid_output, "invalid_generation_cases", len(invalid_cases)))
+    publish_records(
+        selected,
+        args.output,
+        stage=stage,
+        input_path=args.input,
+        config=config,
+        performance_path=args.performance_events,
+        code_paths=[__file__],
+        metrics=metrics,
+        sidecars=sidecars,
+    )
     if args.report_output:
         write_json(generate_report(records, selected, invalid_cases), args.report_output)
 

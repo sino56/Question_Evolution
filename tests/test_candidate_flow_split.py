@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -7,7 +8,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+import candidate_selection as candidate_selection_module
 from candidate_selection import select_candidates
+from pipeline_runtime import validate_published_artifact
 
 
 def make_candidate(
@@ -229,6 +232,59 @@ def test_exploration_budget_is_one_per_group_and_five_per_round_by_default():
     assert len(same_group) == 1
     assert selection(same_group[0])["selected_for_exploration"] is True
     assert selection(same_group[0])["selected_candidate_id"] == "flow-one-group::high"
+
+
+def test_candidate_selection_publishes_invalid_sidecar_with_artifact(tmp_path, monkeypatch):
+    candidate = make_candidate(
+        "flow-sidecar",
+        "fatal",
+        "axis_shift",
+        risk_tags=["axis_shift"],
+    )
+    input_path = tmp_path / "validated.jsonl"
+    output_path = tmp_path / "evolved.jsonl"
+    invalid_path = tmp_path / "invalid_generation_cases.jsonl"
+    input_path.write_text(json.dumps(candidate, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    real_publish = candidate_selection_module.publish_records
+    observed = {}
+
+    def publish_after_sidecar(*args, **kwargs):
+        observed["sidecar_exists"] = invalid_path.exists()
+        observed["sidecar_rows"] = [
+            json.loads(line)
+            for line in invalid_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setattr(candidate_selection_module, "publish_records", publish_after_sidecar)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "candidate_selection.py",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--invalid-output",
+            str(invalid_path),
+        ],
+    )
+    candidate_selection_module.main()
+
+    assert observed["sidecar_exists"] is True
+    assert len(observed["sidecar_rows"]) == 1
+    manifest = json.loads(Path(str(output_path) + ".manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sidecars"][0]["kind"] == "invalid_generation_cases"
+    assert manifest["sidecars"][0]["record_count"] == 1
+    assert validate_published_artifact(
+        str(output_path),
+        stage="candidate_selection",
+        input_path=str(input_path),
+        config=manifest["config"],
+    ) == (True, "ok")
 
 
 if __name__ == "__main__":

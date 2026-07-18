@@ -11,7 +11,11 @@ if str(ROOT) not in sys.path:
 from candidate_selection import select_candidates
 from operator_router import route_records
 from question_evolution import QuestionEvolutionProcessor
-from validate_evolved_question import attach_validation_result
+from validate_evolved_question import (
+    attach_validation_result,
+    local_validation_rule_version,
+    validate_record,
+)
 from validate_difficulty_gain import normalize_difficulty_gain_result
 
 
@@ -211,6 +215,7 @@ def test_validate_retry_reuses_operator_and_includes_reject_reason():
     assert metadata["operator_used"] == "O13_minimal_disqualifier"
     assert metadata["validation_retry"]["attempts"] == 1
     assert "完全相同" in metadata["validation_retry"]["first_reject_reason"]
+    assert metadata["local_validation_result"]["local_validation_rule_version"]
 
 
 def test_llm_validation_result_can_reject_unanswerable_candidate():
@@ -272,10 +277,10 @@ def test_dynamic_candidate_budget_allocates_more_to_priority_samples():
     )
     counts = processor.allocate_candidate_counts(items)
 
-    assert counts["|||ordinary prompt"] == 1
-    assert counts["|||high prompt"] == 2
-    assert counts["|||low prompt"] == 2
-    assert counts["|||full prompt"] == 3
+    assert counts["ordinary|||ordinary prompt"] == 1
+    assert counts["high|||high prompt"] == 2
+    assert counts["low|||low prompt"] == 2
+    assert counts["full|||full prompt"] == 3
     assert sum(counts.values()) <= 8
 
 
@@ -395,6 +400,25 @@ def test_all_invalid_candidates_restore_parent_snapshot_for_passthrough():
     assert restored["question_evolved"] is False
     assert restored["candidate_selection"]["selected_operator"] == ""
     assert invalid_cases
+
+
+def test_formal_validation_reuses_generation_result_only_for_same_rule_version():
+    item = {
+        "sample_id": "reuse",
+        "prompt": "根据题干事实判断结论边界，并说明理由。",
+        "question_evolved": True,
+        "meta_info": {"prompt_old": "原题", "question_evolution_metadata": {}},
+    }
+    cached = validate_record(item)
+    item["meta_info"]["question_evolution_metadata"]["local_validation_result"] = cached
+
+    reused = attach_validation_result(item)["validation_result"]
+    assert reused["local_validation_reused"] is True
+    assert reused["local_validation_rule_version"] == local_validation_rule_version()
+
+    recomputed = attach_validation_result(item, max_prompt_chars=10)["validation_result"]
+    assert recomputed["local_validation_reused"] is False
+    assert recomputed["local_validation_rule_version"] != cached["local_validation_rule_version"]
 
 
 if __name__ == "__main__":

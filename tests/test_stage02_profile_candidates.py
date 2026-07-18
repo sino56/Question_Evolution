@@ -129,6 +129,34 @@ def test_profile_processor_and_selector_cover_stage02_actions():
         assert "operator_used" not in record
 
 
+def test_profile_file_stage_publishes_trace_sidecar_and_manifest(tmp_path):
+    records = load_jsonl(ROOT / "tests" / "fixtures" / "stage02_scored.jsonl")[:2]
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "profiled.jsonl"
+    input_path.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records),
+        encoding="utf-8",
+    )
+    fake_client = FakeProfileClient(
+        [
+            profile_response("证据链补强", "漏最小关键事实", "选错最关键缺口", True),
+            profile_response("行为模式识别", "主线切换失败", "错过主线", True),
+        ]
+    )
+    processor = ProfileProcessor(fake_client, model="mock-profile-model", max_concurrent=2)
+    asyncio.run(processor.process_file(str(input_path), str(output_path)))
+
+    published = load_jsonl(output_path)
+    assert len(published) == 2
+    assert all("profile_raw_response" not in item["profile_metadata"] for item in published)
+    assert all(item["profile_metadata"]["profile_raw_response_trace_id"] for item in published)
+    assert Path(str(output_path) + ".profile_traces.jsonl.gz").exists()
+    manifest = json.loads(Path(str(output_path) + ".manifest.json").read_text(encoding="utf-8"))
+    assert manifest["stage"] == "profile_samples"
+    assert manifest["artifact"]["record_count"] == 2
+    assert manifest["sidecars"][0]["record_count"] == 2
+
+
 def test_middle_score_and_cross_round_recommendation_continue_evolution():
     base = {
         "sample_profile": {"core_capability": "边界判断"},

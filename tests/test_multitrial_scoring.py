@@ -1,5 +1,6 @@
 import asyncio
 import gzip
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -178,6 +179,16 @@ def test_trace_sidecar_and_manifest_preserve_raw_responses(tmp_path):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert len(traces) == 12
     assert all(row["raw_response"] for row in traces)
+    assert all(row["raw_text"] == row["raw_response"] for row in traces)
+    assert all(row["record_key"] == "sample-1|||question-1" for row in traces)
+    assert all(row["stage"] == "scoring" for row in traces)
+    assert all(row["trace_kind"] == "judge_model_response" for row in traces)
+    assert all(row["encoding"] == "utf-8" for row in traces)
+    assert all(
+        row["content_sha256"]
+        == hashlib.sha256(row["raw_text"].encode("utf-8")).hexdigest()
+        for row in traces
+    )
     assert manifest["judge_trace_sidecar"]["record_count"] == 12
     assert len(manifest["judge_trace_sidecar"]["sha256"]) == 64
 

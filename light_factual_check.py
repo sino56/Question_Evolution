@@ -2,9 +2,12 @@ import argparse
 import json
 import os
 import re
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
+
+from pipeline_runtime import StageMetrics, load_json_records, publish_records
 
 
 NUMERIC_FACT_PATTERN = re.compile(
@@ -34,16 +37,7 @@ KEY_RESTRICTION_TERMS = ("不得", "不能", "必须", "只能", "仅", "不允�
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
-    with open(input_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-    if not content:
-        return []
-    if content.startswith("["):
-        data = json.loads(content)
-        if not isinstance(data, list):
-            raise ValueError("JSON input must be an array")
-        return data
-    return [json.loads(line) for line in content.splitlines() if line.strip()]
+    return load_json_records(input_path, stage="light_factual_check")
 
 
 def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str) -> None:
@@ -224,14 +218,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", required=True, help="Input validated candidate JSON/JSONL path.")
     parser.add_argument("--output", required=True, help="Output JSONL path with light_factual_check attached.")
     parser.add_argument("--report-output", default=None, help="Optional JSON report path.")
+    parser.add_argument("--performance-events", default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    stage = "light_factual_check"
+    metrics = StageMetrics(stage)
+    metrics.input_bytes = os.path.getsize(args.input)
+    parse_started = time.monotonic()
     records = load_json_or_jsonl(args.input)
+    metrics.parse_seconds += time.monotonic() - parse_started
+    compute_started = time.monotonic()
     checked = process_records(records)
-    write_jsonl(checked, args.output)
+    metrics.compute_seconds += time.monotonic() - compute_started
+    publish_records(
+        checked,
+        args.output,
+        stage=stage,
+        input_path=args.input,
+        config={"check_version": "light_factual_check_v1"},
+        performance_path=args.performance_events,
+        code_paths=[__file__],
+        metrics=metrics,
+    )
     write_json(generate_report(checked), args.report_output or default_report_output(args.output))
 
 

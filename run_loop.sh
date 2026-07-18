@@ -2,9 +2,31 @@
 # Question Evolution 循环流水线
 # 每轮把上一轮 scored/state 结果接入画像、分流、路由、多候选进化、复杂度校验、
 # 标准采答案/rubric/评分闭环、效果统计和状态更新。
-# 支持断点续跑：每一步的目标文件已存在且非空时跳过该步，避免重复写 memory。
+# 支持断点续跑：仅在目标文件及 manifest 完整校验通过时跳过该步。
 
 set -euo pipefail
+
+RESUME_EXP_DIR=${RESUME_EXP_DIR:-}
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --resume-exp-dir)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                echo "--resume-exp-dir 需要已有实验目录路径" >&2
+                exit 2
+            fi
+            RESUME_EXP_DIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: bash run_loop.sh [--resume-exp-dir experiments/YYYY-MM-DD/expN]"
+            exit 0
+            ;;
+        *)
+            echo "未知参数: $1" >&2
+            exit 2
+            ;;
+    esac
+done
 
 # ===================== 可配置参数 =====================
 read_config_value() {
@@ -90,13 +112,14 @@ ANSWER_BASE_URL=${ANSWER_BASE_URL:-$OPENAI_BASE_URL}
 RUBRIC_BASE_URL=${RUBRIC_BASE_URL:-$OPENAI_BASE_URL}
 
 # 并发数
-SCORING_CONCURRENCY=${SCORING_CONCURRENCY:-10}
+SCORING_CONCURRENCY=${SCORING_CONCURRENCY:-20}
 QWEN_SCORING_MAX_CONCURRENT=${QWEN_SCORING_MAX_CONCURRENT:-20}
 GPT_SCORING_MAX_CONCURRENT=${GPT_SCORING_MAX_CONCURRENT:-20}
 PROFILE_CONCURRENCY=${PROFILE_CONCURRENCY:-5}
 DIFFICULTY_GAIN_CONCURRENCY=${DIFFICULTY_GAIN_CONCURRENCY:-$PROFILE_CONCURRENCY}
 EVO_CONCURRENCY=${EVO_CONCURRENCY:-10}
 ANSWER_CONCURRENCY=${ANSWER_CONCURRENCY:-10}
+ANSWER_REQUEST_CONCURRENCY=${ANSWER_REQUEST_CONCURRENCY:-20}
 RUBRIC_CONCURRENCY=${RUBRIC_CONCURRENCY:-10}
 # ======================================================
 
@@ -141,19 +164,29 @@ fi
 #   experiments/YYYY-MM-DD/exp1
 #   experiments/YYYY-MM-DD/exp2
 #   ...
-RUN_DATE=$(date +%F)
-DAY_DIR="$EXP_ROOT/$RUN_DATE"
-mkdir -p "$DAY_DIR"
+IS_RESUME=false
+if [ -n "$RESUME_EXP_DIR" ]; then
+    if [ ! -d "$RESUME_EXP_DIR" ]; then
+        echo "恢复实验目录不存在: $RESUME_EXP_DIR" >&2
+        exit 1
+    fi
+    EXP_DIR=$(cd "$RESUME_EXP_DIR" && pwd)
+    IS_RESUME=true
+else
+    RUN_DATE=$(date +%F)
+    DAY_DIR="$EXP_ROOT/$RUN_DATE"
+    mkdir -p "$DAY_DIR"
 
-EXP_DIR="$DAY_DIR/exp"
-if [ -e "$EXP_DIR" ]; then
-    EXP_INDEX=1
-    while [ -e "$DAY_DIR/exp$EXP_INDEX" ]; do
-        EXP_INDEX=$((EXP_INDEX + 1))
-    done
-    EXP_DIR="$DAY_DIR/exp$EXP_INDEX"
+    EXP_DIR="$DAY_DIR/exp"
+    if [ -e "$EXP_DIR" ]; then
+        EXP_INDEX=1
+        while [ -e "$DAY_DIR/exp$EXP_INDEX" ]; do
+            EXP_INDEX=$((EXP_INDEX + 1))
+        done
+        EXP_DIR="$DAY_DIR/exp$EXP_INDEX"
+    fi
+    mkdir -p "$EXP_DIR"
 fi
-mkdir -p "$EXP_DIR"
 
 MEMORY_DIR="$EXP_DIR/memory"
 mkdir -p "$MEMORY_DIR"
@@ -165,42 +198,35 @@ done
 
 echo "本次实验目录: $EXP_DIR"
 echo "Memory 目录: $MEMORY_DIR"
+if [ "$IS_RESUME" = "true" ]; then
+    echo "运行模式: 从已有实验目录恢复"
+fi
 
 prepare_round_input() {
     local source_file="$1"
     local output_file="$2"
     local round_number="$3"
-    python - "$source_file" "$output_file" "$round_number" <<'PY'
-import json
-import os
-import sys
-
-source_path, output_path, round_text = sys.argv[1:]
-round_number = int(round_text)
-temp_path = output_path + ".tmp"
-
-with open(source_path, "r", encoding="utf-8") as source, \
-     open(temp_path, "w", encoding="utf-8") as target:
-    for line_number, line in enumerate(source, start=1):
-        if not line.strip():
-            continue
-        item = json.loads(line)
-        if not isinstance(item, dict):
-            raise ValueError(f"{source_path}:{line_number} must be a JSON object")
-        item["round"] = round_number
-        target.write(json.dumps(item, ensure_ascii=False) + "\n")
-
-os.replace(temp_path, output_path)
-PY
+    local performance_file="$4"
+    # artifact_cli.py publishes each copied record after: item["round"] = round_number
+    python artifact_cli.py prepare-round-input \
+        --input "$source_file" \
+        --output "$output_file" \
+        --round "$round_number" \
+        --performance-events "$performance_file"
 }
 
 run_if_missing() {
     local output_file="$1"
-    local step_label="$2"
-    shift 2
+    local stage_name="$2"
+    local input_file="$3"
+    local step_label="$4"
+    shift 4
 
-    if [ -f "$output_file" ] && [ -s "$output_file" ]; then
-        echo "检测到已存在 $output_file，跳过 $step_label"
+    if python artifact_cli.py validate --output "$output_file" --stage "$stage_name" --input "$input_file" >/dev/null 2>&1; then
+        echo "检测到已验证产物 $output_file，跳过 $step_label"
+    elif [ -e "$output_file" ]; then
+        echo "已有产物未通过 manifest 校验，拒绝覆盖: $output_file" >&2
+        exit 1
     else
         echo "$step_label"
         "$@"
@@ -313,33 +339,47 @@ PY
 }
 
 SUMMARY_FILE="$EXP_DIR/summary.txt"
-echo "Question Evolution Loop Summary" > "$SUMMARY_FILE"
-echo "================================" >> "$SUMMARY_FILE"
-echo "Input file: $INPUT_FILE" >> "$SUMMARY_FILE"
-echo "Memory dir: $MEMORY_DIR" >> "$SUMMARY_FILE"
-echo "Max rounds: $MAX_ROUNDS" >> "$SUMMARY_FILE"
-echo "Early stop rate: $EARLY_STOP_RATE" >> "$SUMMARY_FILE"
-echo "No-info stop rounds: $NO_INFO_STOP_ROUNDS" >> "$SUMMARY_FILE"
-echo "No-info min delta: $NO_INFO_MIN_DELTA" >> "$SUMMARY_FILE"
-echo "Evolution trigger rate: $MIN_SCORE_RATE" >> "$SUMMARY_FILE"
-echo "Num candidates: $NUM_CANDIDATES" >> "$SUMMARY_FILE"
-echo "Max candidate budget: $MAX_CANDIDATE_BUDGET" >> "$SUMMARY_FILE"
-echo "Validation retries: $VALIDATION_RETRIES" >> "$SUMMARY_FILE"
-echo "Min difficulty gain score: $MIN_DIFFICULTY_GAIN_SCORE" >> "$SUMMARY_FILE"
-echo "Borderline difficulty gain score: $BORDERLINE_DIFFICULTY_GAIN_SCORE" >> "$SUMMARY_FILE"
-echo "Min competitive judgment score: $MIN_COMPETITIVE_JUDGMENT_SCORE" >> "$SUMMARY_FILE"
-echo "Difficulty gain allow borderline: $DIFFICULTY_GAIN_ALLOW_BORDERLINE" >> "$SUMMARY_FILE"
-echo "Difficulty gain weak probe: $DIFFICULTY_GAIN_ENABLE_WEAK_PROBE" >> "$SUMMARY_FILE"
-echo "Uncertain low probe: $ENABLE_UNCERTAIN_LOW_PROBE" >> "$SUMMARY_FILE"
-echo "Failure memory window rounds: $FAILURE_MEMORY_WINDOW_ROUNDS" >> "$SUMMARY_FILE"
-echo "Scoring answer trials: $SCORING_ANSWER_TRIALS" >> "$SUMMARY_FILE"
-echo "Qwen judge repeats: $QWEN_JUDGE_REPEATS" >> "$SUMMARY_FILE"
-echo "GPT judge repeats: $GPT_JUDGE_REPEATS" >> "$SUMMARY_FILE"
-echo "Qwen scoring max concurrent: $QWEN_SCORING_MAX_CONCURRENT" >> "$SUMMARY_FILE"
-echo "GPT scoring max concurrent: $GPT_SCORING_MAX_CONCURRENT" >> "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
-echo "Round | Avg Score Rate | Status" >> "$SUMMARY_FILE"
-echo "------|----------------|--------" >> "$SUMMARY_FILE"
+if [ ! -f "$SUMMARY_FILE" ]; then
+    echo "Question Evolution Loop Summary" > "$SUMMARY_FILE"
+    echo "================================" >> "$SUMMARY_FILE"
+    echo "Input file: $INPUT_FILE" >> "$SUMMARY_FILE"
+    echo "Memory dir: $MEMORY_DIR" >> "$SUMMARY_FILE"
+    echo "Max rounds: $MAX_ROUNDS" >> "$SUMMARY_FILE"
+    echo "Early stop rate: $EARLY_STOP_RATE" >> "$SUMMARY_FILE"
+    echo "No-info stop rounds: $NO_INFO_STOP_ROUNDS" >> "$SUMMARY_FILE"
+    echo "No-info min delta: $NO_INFO_MIN_DELTA" >> "$SUMMARY_FILE"
+    echo "Evolution trigger rate: $MIN_SCORE_RATE" >> "$SUMMARY_FILE"
+    echo "Num candidates: $NUM_CANDIDATES" >> "$SUMMARY_FILE"
+    echo "Max candidate budget: $MAX_CANDIDATE_BUDGET" >> "$SUMMARY_FILE"
+    echo "Validation retries: $VALIDATION_RETRIES" >> "$SUMMARY_FILE"
+    echo "Min difficulty gain score: $MIN_DIFFICULTY_GAIN_SCORE" >> "$SUMMARY_FILE"
+    echo "Borderline difficulty gain score: $BORDERLINE_DIFFICULTY_GAIN_SCORE" >> "$SUMMARY_FILE"
+    echo "Min competitive judgment score: $MIN_COMPETITIVE_JUDGMENT_SCORE" >> "$SUMMARY_FILE"
+    echo "Difficulty gain allow borderline: $DIFFICULTY_GAIN_ALLOW_BORDERLINE" >> "$SUMMARY_FILE"
+    echo "Difficulty gain weak probe: $DIFFICULTY_GAIN_ENABLE_WEAK_PROBE" >> "$SUMMARY_FILE"
+    echo "Uncertain low probe: $ENABLE_UNCERTAIN_LOW_PROBE" >> "$SUMMARY_FILE"
+    echo "Failure memory window rounds: $FAILURE_MEMORY_WINDOW_ROUNDS" >> "$SUMMARY_FILE"
+    echo "Scoring answer trials: $SCORING_ANSWER_TRIALS" >> "$SUMMARY_FILE"
+    echo "Qwen judge repeats: $QWEN_JUDGE_REPEATS" >> "$SUMMARY_FILE"
+    echo "GPT judge repeats: $GPT_JUDGE_REPEATS" >> "$SUMMARY_FILE"
+    echo "Scoring worker concurrency: $SCORING_CONCURRENCY" >> "$SUMMARY_FILE"
+    echo "Qwen scoring max concurrent: $QWEN_SCORING_MAX_CONCURRENT" >> "$SUMMARY_FILE"
+    echo "GPT scoring max concurrent: $GPT_SCORING_MAX_CONCURRENT" >> "$SUMMARY_FILE"
+    echo "Answer worker concurrency: $ANSWER_CONCURRENCY" >> "$SUMMARY_FILE"
+    echo "Answer request concurrency: $ANSWER_REQUEST_CONCURRENCY" >> "$SUMMARY_FILE"
+    echo "" >> "$SUMMARY_FILE"
+    echo "Round | Avg Score Rate | Status" >> "$SUMMARY_FILE"
+    echo "------|----------------|--------" >> "$SUMMARY_FILE"
+fi
+
+append_summary_round_if_missing() {
+    local round_number="$1"
+    local score_rate="$2"
+    local status="$3"
+    if ! grep -Eq "^[[:space:]]*${round_number}[[:space:]]*\\|" "$SUMMARY_FILE"; then
+        printf "%5s | %14s | %s\n" "$round_number" "$score_rate" "$status" >> "$SUMMARY_FILE"
+    fi
+}
 
 # ===================== Round 0: 初始评分 =====================
 ROUND=0
@@ -351,10 +391,10 @@ echo "========================================"
 echo "Round $ROUND: 初始评分（baseline）"
 echo "========================================"
 
-run_if_missing "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 0/2: 准备 baseline input" \
-    prepare_round_input "$INPUT_FILE" "$ROUND_DIR/input.jsonl" "$ROUND"
+run_if_missing "$ROUND_DIR/input.jsonl" "prepare_round_input" "$INPUT_FILE" "[Round $ROUND] Step 0/2: 准备 baseline input" \
+    prepare_round_input "$INPUT_FILE" "$ROUND_DIR/input.jsonl" "$ROUND" "$ROUND_DIR/performance_events.jsonl"
 
-run_if_missing "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 1/2: round0_stability_probe.py baseline" \
+run_if_missing "$ROUND_DIR/scored.jsonl" "round0_stability_probe" "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 1/2: round0_stability_probe.py baseline" \
     python round0_stability_probe.py \
         --input "$ROUND_DIR/input.jsonl" \
         --output "$ROUND_DIR/scored.jsonl" \
@@ -385,11 +425,12 @@ run_if_missing "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 1/2: round0_stabil
         --edge-low "$ROUND0_EDGE_LOW" \
         --edge-high "$ROUND0_EDGE_HIGH" \
         --cache-dir "$ROUND_DIR/round0_cache" \
-        --report-output "$ROUND_DIR/round0_stability_report.json"
+        --report-output "$ROUND_DIR/round0_stability_report.json" \
+        --performance-events "$ROUND_DIR/performance_events.jsonl"
 
 AVG_RATE=$(compute_avg_score_rate "$ROUND_DIR/scored.jsonl")
 echo "Round $ROUND 平均得分率: $AVG_RATE"
-printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "baseline" >> "$SUMMARY_FILE"
+append_summary_round_if_missing "$ROUND" "$AVG_RATE" "baseline"
 
 PREV_SCORED="$ROUND_DIR/scored.jsonl"
 PREV_AVG_RATE="$AVG_RATE"
@@ -405,37 +446,43 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
     echo "Round $ROUND: Question Evolution"
     echo "========================================"
 
-    run_if_missing "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 0/13: 复制上一轮 scored/state 输入" \
-        prepare_round_input "$PREV_SCORED" "$ROUND_DIR/input.jsonl" "$ROUND"
+    run_if_missing "$ROUND_DIR/input.jsonl" "prepare_round_input" "$PREV_SCORED" "[Round $ROUND] Step 0/13: 复制上一轮 scored/state 输入" \
+        prepare_round_input "$PREV_SCORED" "$ROUND_DIR/input.jsonl" "$ROUND" "$ROUND_DIR/performance_events.jsonl"
 
-    if [ -f "$ROUND_DIR/scored.jsonl" ] && [ -s "$ROUND_DIR/scored.jsonl" ]; then
-        echo "检测到已存在 $ROUND_DIR/scored.jsonl，跳过本轮生成闭环"
+    if python artifact_cli.py validate --output "$ROUND_DIR/scored.jsonl" --stage "scoring" --input "$ROUND_DIR/rubric.jsonl" >/dev/null 2>&1; then
+        echo "检测到已验证产物 $ROUND_DIR/scored.jsonl，跳过本轮生成闭环"
+    elif [ -e "$ROUND_DIR/scored.jsonl" ]; then
+        echo "已有 scored 产物未通过 manifest 校验，拒绝继续: $ROUND_DIR/scored.jsonl" >&2
+        exit 1
     else
-        run_if_missing "$ROUND_DIR/profiled.jsonl" "[Round $ROUND] Step 1/13: profile_samples.py" \
+        run_if_missing "$ROUND_DIR/profiled.jsonl" "profile_samples" "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 1/13: profile_samples.py" \
             python profile_samples.py \
                 --input "$ROUND_DIR/input.jsonl" \
                 --output "$ROUND_DIR/profiled.jsonl" \
                 --model "$PROFILE_MODEL" \
                 --base-url "$PROFILE_BASE_URL" \
-                --concurrency "$PROFILE_CONCURRENCY"
+                --concurrency "$PROFILE_CONCURRENCY" \
+                --performance-events "$ROUND_DIR/performance_events.jsonl"
 
-        run_if_missing "$ROUND_DIR/profiled_candidates.jsonl" "[Round $ROUND] Step 2/13: select_evolution_candidates.py" \
+        run_if_missing "$ROUND_DIR/profiled_candidates.jsonl" "select_evolution_candidates" "$ROUND_DIR/profiled.jsonl" "[Round $ROUND] Step 2/13: select_evolution_candidates.py" \
             python select_evolution_candidates.py \
                 --input "$ROUND_DIR/profiled.jsonl" \
                 --output "$ROUND_DIR/profiled_candidates.jsonl" \
                 --high-score-threshold "$MIN_SCORE_RATE" \
                 --report-output "$ROUND_DIR/evolution_candidate_report.json" \
+                --performance-events "$ROUND_DIR/performance_events.jsonl" \
                 "${UNCERTAIN_LOW_PROBE_ARGS[@]}"
 
-        run_if_missing "$ROUND_DIR/routed.jsonl" "[Round $ROUND] Step 3/13: operator_router.py" \
+        run_if_missing "$ROUND_DIR/routed.jsonl" "operator_router" "$ROUND_DIR/profiled_candidates.jsonl" "[Round $ROUND] Step 3/13: operator_router.py" \
             python operator_router.py \
                 --input "$ROUND_DIR/profiled_candidates.jsonl" \
                 --output "$ROUND_DIR/routed.jsonl" \
                 --memory-dir "$MEMORY_DIR" \
                 --failure-memory-window-rounds "$FAILURE_MEMORY_WINDOW_ROUNDS" \
-                --report-output "$ROUND_DIR/operator_router_report.json"
+                --report-output "$ROUND_DIR/operator_router_report.json" \
+                --performance-events "$ROUND_DIR/performance_events.jsonl"
 
-        run_if_missing "$ROUND_DIR/candidates.jsonl" "[Round $ROUND] Step 4/13: question_evolution.py" \
+        run_if_missing "$ROUND_DIR/candidates.jsonl" "question_evolution" "$ROUND_DIR/routed.jsonl" "[Round $ROUND] Step 4/13: question_evolution.py" \
             python question_evolution.py \
                 --input "$ROUND_DIR/routed.jsonl" \
                 --output "$ROUND_DIR/candidates.jsonl" \
@@ -445,21 +492,24 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --concurrency "$EVO_CONCURRENCY" \
                 --num-candidates "$NUM_CANDIDATES" \
                 --max-candidate-budget "$MAX_CANDIDATE_BUDGET" \
-                --validation-retries "$VALIDATION_RETRIES"
+                --validation-retries "$VALIDATION_RETRIES" \
+                --performance-events "$ROUND_DIR/performance_events.jsonl"
         validate_candidate_coverage "$ROUND_DIR/routed.jsonl" "$ROUND_DIR/candidates.jsonl"
 
-        run_if_missing "$ROUND_DIR/validated_candidates.jsonl" "[Round $ROUND] Step 5/13: validate_evolved_question.py" \
+        run_if_missing "$ROUND_DIR/validated_candidates.jsonl" "validate_evolved_question" "$ROUND_DIR/candidates.jsonl" "[Round $ROUND] Step 5/13: validate_evolved_question.py" \
             python validate_evolved_question.py \
                 --input "$ROUND_DIR/candidates.jsonl" \
-                --output "$ROUND_DIR/validated_candidates.jsonl"
+                --output "$ROUND_DIR/validated_candidates.jsonl" \
+                --performance-events "$ROUND_DIR/performance_events.jsonl"
 
-        run_if_missing "$ROUND_DIR/light_factual_checked_candidates.jsonl" "[Round $ROUND] Step 6/13: light_factual_check.py" \
+        run_if_missing "$ROUND_DIR/light_factual_checked_candidates.jsonl" "light_factual_check" "$ROUND_DIR/validated_candidates.jsonl" "[Round $ROUND] Step 6/13: light_factual_check.py" \
             python light_factual_check.py \
                 --input "$ROUND_DIR/validated_candidates.jsonl" \
                 --output "$ROUND_DIR/light_factual_checked_candidates.jsonl" \
-                --report-output "$ROUND_DIR/light_factual_report.json"
+                --report-output "$ROUND_DIR/light_factual_report.json" \
+                --performance-events "$ROUND_DIR/performance_events.jsonl"
 
-        run_if_missing "$ROUND_DIR/difficulty_validated_candidates.jsonl" "[Round $ROUND] Step 7/13: validate_difficulty_gain.py" \
+        run_if_missing "$ROUND_DIR/difficulty_validated_candidates.jsonl" "validate_difficulty_gain" "$ROUND_DIR/light_factual_checked_candidates.jsonl" "[Round $ROUND] Step 7/13: validate_difficulty_gain.py" \
             python validate_difficulty_gain.py \
                 --input "$ROUND_DIR/light_factual_checked_candidates.jsonl" \
                 --output "$ROUND_DIR/difficulty_validated_candidates.jsonl" \
@@ -470,34 +520,39 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --min-gain-score "$MIN_DIFFICULTY_GAIN_SCORE" \
                 --borderline-gain-score "$BORDERLINE_DIFFICULTY_GAIN_SCORE" \
                 --min-competitive-judgment-score "$MIN_COMPETITIVE_JUDGMENT_SCORE" \
+                --performance-events "$ROUND_DIR/performance_events.jsonl" \
                 "${DIFFICULTY_GAIN_ALLOW_BORDERLINE_ARGS[@]}" \
                 "${DIFFICULTY_GAIN_WEAK_PROBE_ARGS[@]}"
 
-        run_if_missing "$ROUND_DIR/evolved.jsonl" "[Round $ROUND] Step 8/13: candidate_selection.py" \
+        run_if_missing "$ROUND_DIR/evolved.jsonl" "candidate_selection" "$ROUND_DIR/difficulty_validated_candidates.jsonl" "[Round $ROUND] Step 8/13: candidate_selection.py" \
             python candidate_selection.py \
                 --input "$ROUND_DIR/difficulty_validated_candidates.jsonl" \
                 --output "$ROUND_DIR/evolved.jsonl" \
                 --invalid-output "$ROUND_DIR/invalid_generation_cases.jsonl" \
-                --report-output "$ROUND_DIR/candidate_selection_report.json"
+                --report-output "$ROUND_DIR/candidate_selection_report.json" \
+                --performance-events "$ROUND_DIR/performance_events.jsonl"
 
-        run_if_missing "$ROUND_DIR/with_answers.jsonl" "[Round $ROUND] Step 9/13: collect_answers.py" \
+        run_if_missing "$ROUND_DIR/with_answers.jsonl" "collect_answers" "$ROUND_DIR/evolved.jsonl" "[Round $ROUND] Step 9/13: collect_answers.py" \
             python collect_answers.py \
                 --input "$ROUND_DIR/evolved.jsonl" \
                 --output "$ROUND_DIR/with_answers.jsonl" \
                 --concurrency "$ANSWER_CONCURRENCY" \
+                --request-concurrency "$ANSWER_REQUEST_CONCURRENCY" \
                 --samples 1 \
                 --model "$GPT_MODEL" \
-                --base-url "$ANSWER_BASE_URL"
+                --base-url "$ANSWER_BASE_URL" \
+                --performance-events "$ROUND_DIR/performance_events.jsonl"
 
-        run_if_missing "$ROUND_DIR/rubric.jsonl" "[Round $ROUND] Step 10/13: gen_rubric.py" \
+        run_if_missing "$ROUND_DIR/rubric.jsonl" "gen_rubric" "$ROUND_DIR/with_answers.jsonl" "[Round $ROUND] Step 10/13: gen_rubric.py" \
             python gen_rubric.py \
                 --input "$ROUND_DIR/with_answers.jsonl" \
                 --output "$ROUND_DIR/rubric.jsonl" \
                 --concurrency "$RUBRIC_CONCURRENCY" \
                 --model "$GPT_MODEL" \
-                --base-url "$RUBRIC_BASE_URL"
+                --base-url "$RUBRIC_BASE_URL" \
+                --performance-events "$ROUND_DIR/performance_events.jsonl"
 
-        run_if_missing "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 11/13: scoring.py" \
+        run_if_missing "$ROUND_DIR/scored.jsonl" "scoring" "$ROUND_DIR/rubric.jsonl" "[Round $ROUND] Step 11/13: scoring.py" \
             python scoring.py \
                 --input "$ROUND_DIR/rubric.jsonl" \
                 --output "$ROUND_DIR/scored.jsonl" \
@@ -516,23 +571,26 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --gpt-judge-repeats "$GPT_JUDGE_REPEATS" \
                 --qwen-max-concurrent "$QWEN_SCORING_MAX_CONCURRENT" \
                 --gpt-max-concurrent "$GPT_SCORING_MAX_CONCURRENT" \
-                --concurrency "$SCORING_CONCURRENCY"
+                --concurrency "$SCORING_CONCURRENCY" \
+                --performance-events "$ROUND_DIR/performance_events.jsonl"
     fi
 
-    run_if_missing "$ROUND_DIR/effect_analysis.jsonl" "[Round $ROUND] Step 12/13: analyze_evolution_effect.py" \
+    run_if_missing "$ROUND_DIR/effect_analysis.jsonl" "analyze_evolution_effect" "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 12/13: analyze_evolution_effect.py" \
         python analyze_evolution_effect.py \
             --before "$PREV_SCORED" \
             --input "$ROUND_DIR/scored.jsonl" \
             --output "$ROUND_DIR/effect_analysis.jsonl" \
-            --matrix-output "$ROUND_DIR/effect_matrix.jsonl"
+            --matrix-output "$ROUND_DIR/effect_matrix.jsonl" \
+            --performance-events "$ROUND_DIR/performance_events.jsonl"
 
-    run_if_missing "$ROUND_DIR/state_updated.jsonl" "[Round $ROUND] Step 13/13: update_sample_state.py" \
+    run_if_missing "$ROUND_DIR/state_updated.jsonl" "update_sample_state" "$ROUND_DIR/effect_analysis.jsonl" "[Round $ROUND] Step 13/13: update_sample_state.py" \
         python update_sample_state.py \
             --input "$ROUND_DIR/effect_analysis.jsonl" \
             --output "$ROUND_DIR/state_updated.jsonl" \
             --memory-dir "$MEMORY_DIR" \
             --preselection-invalid-input "$ROUND_DIR/invalid_generation_cases.jsonl" \
-            --report-output "$ROUND_DIR/state_update_report.json"
+            --report-output "$ROUND_DIR/state_update_report.json" \
+            --performance-events "$ROUND_DIR/performance_events.jsonl"
 
     ROUND_OUTPUT_FOR_NEXT="$ROUND_DIR/scored.jsonl"
     if [ -f "$ROUND_DIR/state_updated.jsonl" ] && [ -s "$ROUND_DIR/state_updated.jsonl" ]; then
@@ -550,7 +608,7 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
     SHOULD_STOP=$(lt_float "$AVG_RATE" "$EARLY_STOP_RATE")
     if [ "$SHOULD_STOP" = "true" ]; then
         echo "提前停止：Round $ROUND 平均得分率 $AVG_RATE < $EARLY_STOP_RATE"
-        printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "early_stop" >> "$SUMMARY_FILE"
+        append_summary_round_if_missing "$ROUND" "$AVG_RATE" "early_stop"
         PREV_SCORED="$ROUND_OUTPUT_FOR_NEXT"
         break
     fi
@@ -563,12 +621,12 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
 
     if [ "$NO_INFO_STREAK" -ge "$NO_INFO_STOP_ROUNDS" ]; then
         echo "提前停止：连续 $NO_INFO_STREAK 轮无新信息（effect_count=0、continue_count=0 且 avg_delta=$AVG_DELTA < $NO_INFO_MIN_DELTA）"
-        printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "no_info_stop" >> "$SUMMARY_FILE"
+        append_summary_round_if_missing "$ROUND" "$AVG_RATE" "no_info_stop"
         PREV_SCORED="$ROUND_OUTPUT_FOR_NEXT"
         break
     fi
 
-    printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "continue" >> "$SUMMARY_FILE"
+    append_summary_round_if_missing "$ROUND" "$AVG_RATE" "continue"
 
     PREV_SCORED="$ROUND_OUTPUT_FOR_NEXT"
     PREV_AVG_RATE="$AVG_RATE"
@@ -577,7 +635,9 @@ done
 # ===================== 保存最终结果 =====================
 FINAL_DIR="$EXP_DIR/final"
 mkdir -p "$FINAL_DIR"
-cp "$PREV_SCORED" "$FINAL_DIR/final_scored.jsonl"
+python artifact_cli.py copy-published \
+    --input "$PREV_SCORED" \
+    --output "$FINAL_DIR/final_scored.jsonl"
 
 echo ""
 echo "========================================"

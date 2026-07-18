@@ -65,6 +65,14 @@ def test_run_loop_defaults_to_admitted_input_with_legacy_fallback():
     assert "请设置 INPUT_FILE 指向" in RUN_LOOP
 
 
+def test_run_loop_can_resume_an_existing_experiment_without_resetting_summary():
+    assert 'RESUME_EXP_DIR=${RESUME_EXP_DIR:-}' in RUN_LOOP
+    assert '--resume-exp-dir)' in RUN_LOOP
+    assert 'EXP_DIR=$(cd "$RESUME_EXP_DIR" && pwd)' in RUN_LOOP
+    assert 'if [ ! -f "$SUMMARY_FILE" ]; then' in RUN_LOOP
+    assert 'append_summary_round_if_missing()' in RUN_LOOP
+
+
 def test_run_loop_injects_the_current_round_into_each_round_input():
     assert "prepare_round_input()" in RUN_LOOP
     assert 'item["round"] = round_number' in RUN_LOOP

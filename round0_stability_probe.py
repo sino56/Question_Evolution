@@ -29,6 +29,15 @@ from scoring import (
     parse_gpt_judge_api_keys,
     resolve_answer_api_key,
 )
+from pipeline_runtime import (
+    AtomicJsonlStageWriter,
+    StageMetrics,
+    append_performance_event,
+    bounded_async_map,
+    iter_json_records,
+    load_json_records,
+    validate_published_artifact,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -62,16 +71,7 @@ PROBE_VERSION = "round0_stability_probe_v1"
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
-    with open(input_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-    if not content:
-        return []
-    if content.startswith("["):
-        data = json.loads(content)
-        if not isinstance(data, list):
-            raise ValueError("JSON input must be an array")
-        return data
-    return [json.loads(line) for line in content.splitlines() if line.strip()]
+    return load_json_records(input_path, stage="round0_stability_probe")
 
 
 def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str) -> None:
@@ -828,6 +828,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", default=None, help="Optional directory for per-trial round0 cache files.")
     parser.add_argument("--force", action="store_true", help="Regenerate trials even when cache entries exist.")
     parser.add_argument("--report-output", default=None, help="Optional JSON path for the stability summary report.")
+    parser.add_argument("--performance-events", default=None)
     return parser.parse_args()
 
 
@@ -856,8 +857,6 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     args = parse_args()
     validate_config(args)
-    records = load_json_or_jsonl(args.input)
-
     answer_client = None
     answer_model_name = ""
     if args.answer_mode == "llm":
@@ -900,12 +899,123 @@ async def main() -> None:
         gpt_max_concurrent=args.gpt_max_concurrent,
     )
 
+    stage = "round0_stability_probe"
+    config = {
+        "initial_trials": args.initial_trials,
+        "extra_trials": args.extra_trials,
+        "max_trials": args.max_trials,
+        "max_concurrent": args.max_concurrent,
+        "retries": args.retries,
+        "answer_mode": args.answer_mode,
+        "answer_model": args.answer_model if args.answer_mode == "llm" else "reference",
+        "judge_model": args.judge_model,
+        "qwen_judge_repeats": args.qwen_judge_repeats,
+        "gpt_judge_model": args.gpt_judge_model,
+        "gpt_judge_repeats": args.gpt_judge_repeats,
+        "qwen_max_concurrent": args.qwen_max_concurrent,
+        "gpt_max_concurrent": args.gpt_max_concurrent,
+        "score_threshold": args.score_threshold,
+        "strong_high_threshold": args.strong_high_threshold,
+        "borderline_low": args.borderline_low,
+        "edge_low": args.edge_low,
+        "edge_high": args.edge_high,
+        "answer_temperature": args.answer_temperature,
+        "answer_top_p": args.answer_top_p,
+        "answer_seed_base": args.answer_seed_base,
+        "judge_temperature": args.judge_temperature,
+    }
+    valid, _ = validate_published_artifact(
+        args.output,
+        stage=stage,
+        input_path=args.input,
+        config=config,
+    )
+    if valid:
+        await judge_client.close()
+        if gpt_judge_client is not None:
+            await gpt_judge_client.close()
+        if answer_client is not None:
+            await answer_client.close()
+        logger.info("Verified published round0 artifact; skipping %s", args.output)
+        return
+
+    metrics = StageMetrics(stage)
+    metrics.input_bytes = os.path.getsize(args.input)
+    writer = AtomicJsonlStageWriter(
+        args.output,
+        stage=stage,
+        input_path=args.input,
+        config=config,
+        code_paths=[__file__],
+        metrics=metrics,
+    )
     processor.load_existing_traces(args.output)
-    processed = await process_records(records, processor, args)
-    write_jsonl(processed, args.output)
-    processor.write_trace_artifacts(args.output)
+    processed: List[Dict[str, Any]] = []
+
+    async def worker(record):
+        return await process_item_with_stability_probe(record, processor, args)
+
+    async def on_result(_sequence, record, result):
+        writer.add_group(processor.get_item_key(record), [result])
+        processed.append(result)
+
+    def pending_records():
+        for record in iter_json_records(args.input, stage=stage):
+            if processor.get_item_key(record) in writer.processed_keys:
+                continue
+            yield record
+
+    try:
+        await bounded_async_map(
+            pending_records(),
+            worker,
+            concurrency=max(1, args.max_concurrent),
+            on_result=on_result,
+            metrics=metrics,
+        )
+        metrics.request_pool_peaks = {
+            "qwen": processor.qwen_request_pool.peak_active,
+            "gpt": processor.gpt_request_pool.peak_active,
+        }
+        sidecar_path, _ = processor.write_trace_artifacts(
+            args.output,
+            write_manifest=False,
+            finalize_recovery=False,
+        )
+        writer.register_sidecar(
+            sidecar_path,
+            kind="judge_raw_response",
+            record_count=len(processor._trace_entries),
+        )
+        writer.publish(
+            extra_manifest={
+                "evaluation_protocol": EVALUATION_PROTOCOL,
+                "judge_trace_sidecar": {
+                    "path": os.path.basename(sidecar_path),
+                    "compression": "gzip",
+                    "record_count": len(processor._trace_entries),
+                    "sha256": processor._sha256_file(sidecar_path),
+                },
+            }
+        )
+        recovery_path = sidecar_path + ".partial"
+        if os.path.exists(recovery_path):
+            os.remove(recovery_path)
+    except Exception:
+        writer.close()
+        append_performance_event(args.performance_events, metrics.event(status="failed"))
+        raise
+    finally:
+        await judge_client.close()
+        if gpt_judge_client is not None:
+            await gpt_judge_client.close()
+        if answer_client is not None:
+            await answer_client.close()
+
     report_output = args.report_output or f"{args.output}.report.json"
-    write_json(build_stability_report(processed, args.score_threshold), report_output)
+    published_records = load_json_or_jsonl(args.output)
+    write_json(build_stability_report(published_records, args.score_threshold), report_output)
+    append_performance_event(args.performance_events, metrics.event())
     logger.info("round0 stability scoring complete: %s", args.output)
     logger.info("round0 stability report complete: %s", report_output)
 

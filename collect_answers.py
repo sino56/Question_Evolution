@@ -14,6 +14,17 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from local_api_config import get_config_list, get_config_value
+from pipeline_runtime import (
+    AtomicJsonlStageWriter,
+    FairRequestPool,
+    StageMetrics,
+    append_performance_event,
+    bounded_async_map,
+    ensure_passthrough_reusable,
+    iter_json_records,
+    stable_record_key,
+    validate_published_artifact,
+)
 
 QA_MODEL = (
     os.getenv("ANSWER_MODEL")
@@ -127,12 +138,16 @@ class AnswerCollector:
         script_gt_guide: bool = False,
         request_timeout: float = REQUEST_TIMEOUT_SECONDS,
         empty_retry_base_sleep: float = EMPTY_RETRY_BASE_SLEEP_SECONDS,
+        request_concurrent: int = None,
     ):
         self.api_keys = api_keys
         self.current_key_index = 0
         self.base_url = base_url
         self.model = model
-        self.semaphore = asyncio.Semaphore(max_concurrent)
+        request_limit = max_concurrent if request_concurrent is None else request_concurrent
+        self.request_pool = FairRequestPool(max(1, request_limit), "reference_answer")
+        # Kept as a compatibility attribute for callers that inspect it.
+        self.semaphore = asyncio.Semaphore(max(1, request_limit))
         self.write_lock = asyncio.Lock()
         self.max_retries = max_retries
         self.key_lock = asyncio.Lock()  # 用于保护 key 切换的锁
@@ -147,17 +162,26 @@ class AnswerCollector:
             timeout=self.request_timeout,
         )
     
-    def _switch_to_next_key(self):
+    async def _switch_to_next_key(self):
         """切换到下一个 API key"""
         self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
         old_key_prefix = self.api_keys[self.current_key_index - 1][:10] + "***" if self.current_key_index > 0 else self.api_keys[0][:10] + "***"
         new_key_prefix = self.api_keys[self.current_key_index][:10] + "***"
         logger.warning(f"API Key 额度用尽，切换到下一个 key: {old_key_prefix} -> {new_key_prefix}")
+        old_client = self.client
         self.client = AsyncOpenAI(
             api_key=self.api_keys[self.current_key_index],
             base_url=self.base_url,
             timeout=self.request_timeout,
         )
+        await old_client.close()
+
+    async def close(self):
+        close = getattr(self.client, "close", None)
+        if close is not None:
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
     
     def _is_token_exhausted_error(self, error: Exception) -> bool:
         """检查错误是否是 token 额度用尽的错误"""
@@ -288,9 +312,9 @@ class AnswerCollector:
             delay = attempt + 1
         return delay + random.uniform(0, 1.0)
 
-    async def call_llm_raw(self, question: str) -> str:
+    async def call_llm_raw(self, question: str, sample_key: str = "unknown") -> str:
         """原生调用 LLM，没有任何额外的 instruction"""
-        async with self.semaphore:
+        async with self.request_pool.request(sample_key):
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
@@ -302,7 +326,7 @@ class AnswerCollector:
             content = extract_answer(response)
             return content.strip() if content else ""
 
-    async def call_llm_with_retry(self, question: str) -> str:
+    async def call_llm_with_retry(self, question: str, sample_key: str = "unknown") -> str:
         """带重试机制的 LLM 调用，支持 key 切换"""
         key_switches = 0  # 记录 key 切换次数
         max_key_switches = len(self.api_keys)  # 最多切换次数
@@ -310,7 +334,7 @@ class AnswerCollector:
         while key_switches < max_key_switches:
             for attempt in range(self.max_retries + 1):
                 try:
-                    answer = await self.call_llm_raw(question)
+                    answer = await self.call_llm_raw(question, sample_key)
                     is_valid, reason = self.validate_answer_quality(answer)
                     if is_valid:
                         return answer
@@ -321,7 +345,7 @@ class AnswerCollector:
                         async with self.key_lock:
                             # 再次检查，避免多个协程同时切换
                             if self._is_token_exhausted_error(e):
-                                self._switch_to_next_key()
+                                await self._switch_to_next_key()
                                 key_switches += 1
                                 break  # 跳出内层循环，使用新 key 重试
                     logger.error(f"第 {attempt + 1} 次尝试失败: {e}")
@@ -336,7 +360,7 @@ class AnswerCollector:
                     return ""
                 # 否则继续尝试下一个 key
                 async with self.key_lock:
-                    self._switch_to_next_key()
+                    await self._switch_to_next_key()
                     key_switches += 1
         
         return ""
@@ -364,7 +388,8 @@ class AnswerCollector:
             )
             question = guide_prefix
 
-        tasks = [self.call_llm_with_retry(question) for _ in range(num_samples)]
+        sample_key = stable_record_key(item)
+        tasks = [self.call_llm_with_retry(question, sample_key) for _ in range(num_samples)]
         answers = await asyncio.gather(*tasks)
 
         item["answer_extra"] = answers
@@ -396,128 +421,127 @@ class AnswerCollector:
                 logger.warning(f"读取已有输出文件时出错: {e}，将从头开始处理")
         return processed_prompts
 
-    async def process_file(self, input_path: str, output_path: str, num_samples: int, max_concurrent_items: int):
-        """处理文件"""
+    async def process_file(
+        self,
+        input_path: str,
+        output_path: str,
+        num_samples: int,
+        max_concurrent_items: int,
+        *,
+        performance_path: str = None,
+        config: Dict[str, Any] = None,
+    ):
+        """Stream records through bounded workers and publish atomically."""
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"输入文件不存在: {input_path}")
 
-        items = []
-        with open(input_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
-                    items.append(json.loads(line))
-
-        # 加载已处理的问题
-        processed_prompts = self.load_processed_prompts(output_path)
-
-        # 过滤掉已处理的条目
-        original_count = len(items)
-        items = [item for item in items if item.get("prompt") not in processed_prompts]
-        skipped_count = original_count - len(items)
-
-        if skipped_count > 0:
-            logger.info(f"跳过 {skipped_count} 条已处理的数据")
-
-        if len(items) == 0:
-            logger.info("所有数据已处理完成，无需继续")
+        stage = "collect_answers"
+        resolved_config = config or {
+            "model": getattr(self, "model", "unknown"),
+            "samples": num_samples,
+            "item_concurrency": max_concurrent_items,
+        }
+        valid, _ = validate_published_artifact(
+            output_path,
+            stage=stage,
+            input_path=input_path,
+            config=resolved_config,
+        )
+        if valid:
+            logger.info("Verified published answer artifact; skipping %s", output_path)
             return
 
-        logger.info(f"开始处理 {len(items)} 条数据，每条采样 {num_samples} 次，并发限制 {max_concurrent_items}")
-
-        # 确保输出目录存在
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        metrics = StageMetrics(stage)
+        metrics.input_bytes = os.path.getsize(input_path)
+        writer = AtomicJsonlStageWriter(
+            output_path,
+            stage=stage,
+            input_path=input_path,
+            config=resolved_config,
+            code_paths=[__file__],
+            metrics=metrics,
+        )
         failed_path = output_path + ".failed"
-
-        # 确定文件打开模式（如果是恢复则追加，否则覆盖）
-        file_mode = 'a' if len(processed_prompts) > 0 else 'w'
-
-        # 控制处理条目的并发
-        item_semaphore = asyncio.Semaphore(max_concurrent_items)
         failed_count = 0
 
-        async def sem_process(item, out_f, fail_f, position):
-            nonlocal failed_count
-            async with item_semaphore:
-                item_index = item.get("index", position)
-
-                # question_evolution.py 会全量输出；未升级的题目仍沿用旧 reference/rubric，
-                # 这里必须原样透传，避免无意义重采答案和后续 index 对齐丢失。
+        async def worker(item: Dict[str, Any]):
+            item_index = item.get("index", item.get("sample_id", "unknown"))
+            try:
                 if item.get("question_evolved") is False:
-                    async with self.write_lock:
-                        out_f.write(json.dumps(item, ensure_ascii=False) + '\n')
-                        out_f.flush()
-                    return item
+                    ensure_passthrough_reusable(item, stage=stage)
+                    return dict(item), None
 
-                try:
-                    processed_item = await self.process_item(item, num_samples)
-                except Exception as e:
-                    # 采集过程中发生未预期的异常（如 API 异常、解析错误等），整条规定为失败
-                    failed_item = dict(item)
-                    failed_item["answer_collection_error"] = str(e)
-                    async with self.write_lock:
-                        fail_f.write(json.dumps(failed_item, ensure_ascii=False) + '\n')
-                        fail_f.flush()
-                        failed_count += 1
-                    logger.error(f"条目 {item_index} 采集异常，已转入失败文件: {e}")
-                    return failed_item
-
+                processed_item = await self.process_item(item, num_samples)
                 answers = processed_item.get("answer_extra", [])
                 answer_quality_issues = processed_item.get("answer_quality_issues", [])
-
-                # 检查是否所有回答都通过质量控制（包括任意一次 API 失败、空回答、格式异常等）
                 is_valid = (
                     len(answer_quality_issues) == 0
                     and len(answers) == num_samples
-                    and all(isinstance(a, str) and a.strip() for a in answers)
+                    and all(isinstance(answer, str) and answer.strip() for answer in answers)
                 )
-
-                meta_info = processed_item.get("meta_info", {})
-                if not isinstance(meta_info, dict):
-                    meta_info = {}
-
-                # 新版结构：将采集到的答案统一放入 meta_info.references
+                meta_info = processed_item.get("meta_info")
+                meta_info = dict(meta_info) if isinstance(meta_info, dict) else {}
                 meta_info["references"] = answers
-                transformed_data = dict(processed_item)
-                transformed_data["index"] = item.get("index", item_index)
-                transformed_data["prompt"] = processed_item.get("prompt") # string, 问题
-                transformed_data["meta_info"] = meta_info
-                transformed_data.pop("answer_extra", None)
-                transformed_data.pop("answer_quality_issues", None)
+                transformed = dict(processed_item)
+                transformed["index"] = item.get("index", item_index)
+                transformed["prompt"] = processed_item.get("prompt")
+                transformed["meta_info"] = meta_info
+                transformed.pop("answer_extra", None)
+                transformed.pop("answer_quality_issues", None)
+                if not is_valid:
+                    transformed["quality_issues"] = answer_quality_issues
+                    return None, transformed
+                return transformed, None
+            except Exception as exc:
+                failed = dict(item)
+                failed["answer_collection_error"] = str(exc)
+                return None, failed
 
-                async with self.write_lock:
-                    if is_valid:
-                        out_f.write(json.dumps(transformed_data, ensure_ascii=False) + '\n')
-                        out_f.flush()
-                    else:
-                        transformed_data["quality_issues"] = answer_quality_issues
-                        logger.error(f"条目 {item_index} 处理失败，存在异常回答: {answer_quality_issues}")
-                        fail_f.write(json.dumps(transformed_data, ensure_ascii=False) + '\n')
-                        fail_f.flush()
-                        failed_count += 1
-                return transformed_data
+        async def on_result(_sequence: int, item: Dict[str, Any], outcome) -> None:
+            nonlocal failed_count
+            result, failed = outcome
+            if result is not None:
+                writer.add_group(stable_record_key(item), [result])
+            if failed is not None:
+                os.makedirs(os.path.dirname(os.path.abspath(failed_path)), exist_ok=True)
+                with open(failed_path, "a", encoding="utf-8") as target:
+                    target.write(json.dumps(failed, ensure_ascii=False) + "\n")
+                    target.flush()
+                failed_count += 1
 
-        with open(output_path, file_mode, encoding='utf-8') as f, \
-             open(failed_path, file_mode, encoding='utf-8') as ff:
-            tasks = [sem_process(item, f, ff, i) for i, item in enumerate(items)]
-            
-            # 使用 tqdm 显示进度（如果安装了的话）
-            try:
-                from tqdm.asyncio import tqdm
-                await tqdm.gather(*tasks)
-            except ImportError:
-                await asyncio.gather(*tasks)
+        def pending_records():
+            for item in iter_json_records(input_path, stage=stage):
+                if stable_record_key(item) in writer.processed_keys:
+                    continue
+                yield item
 
-        logger.info(f"处理完成，结果保存至: {output_path}")
-        if os.path.getsize(failed_path) == 0:
-            os.remove(failed_path)
-        else:
-            logger.warning(f"存在失败的数据，已保存至: {failed_path}")
-
-        if failed_count:
-            raise RuntimeError(
-                f"answer collection 阶段有 {failed_count}/{len(items)} 条记录失败；"
-                f"失败详情见 {failed_path}，已停止后续流水线。"
+        try:
+            await bounded_async_map(
+                pending_records(),
+                worker,
+                concurrency=max(1, max_concurrent_items),
+                on_result=on_result,
+                metrics=metrics,
+                ordered_results=True,
             )
+            request_pool = getattr(self, "request_pool", None)
+            if request_pool is not None:
+                metrics.request_pool_peaks[request_pool.name] = request_pool.peak_active
+            if failed_count:
+                raise RuntimeError(
+                    f"answer collection 阶段有 {failed_count}/{metrics.input_records} 条记录失败；"
+                    f"失败详情见 {failed_path}，已停止后续流水线。"
+                )
+            writer.publish()
+        except Exception:
+            writer.close()
+            append_performance_event(performance_path, metrics.event(status="failed"))
+            raise
+
+        if os.path.exists(failed_path) and os.path.getsize(failed_path) == 0:
+            os.remove(failed_path)
+        append_performance_event(performance_path, metrics.event())
+        logger.info("处理完成，结果保存至: %s", output_path)
 
 async def main():
     parser = argparse.ArgumentParser(description="采集 LLM 对问题的原生回答")
@@ -525,6 +549,12 @@ async def main():
     parser.add_argument("--output", type=str, help="输出的 jsonl 文件路径 (默认在输入文件名后加 _with_answers)")
     parser.add_argument("--samples", type=int, default=1, help="每个问题的采样次数")
     parser.add_argument("--concurrency", type=int, default=20, help="并行处理的问题数量")
+    parser.add_argument(
+        "--request-concurrency",
+        type=int,
+        default=20,
+        help="参考答案服务真实在途请求上限",
+    )
     parser.add_argument("--model", type=str, default=QA_MODEL, help="使用的模型名称")
     parser.add_argument("--base-url", type=str, default=BASE_URL, help="OpenAI-compatible base_url")
     parser.add_argument("--api-key", action="append", default=None, help="API key；可多次传入，默认读取 ANSWER_API_KEYS/GPT_API_KEYS/OPENAI_API_KEY")
@@ -537,6 +567,11 @@ async def main():
         help="空答案重试的基础退避秒数；实际按指数退避并加少量随机抖动",
     )
     parser.add_argument("--script_gt_guide", action="store_true", help="开启时，在原问题前拼接 ground truth 指引以校准标答正确性")
+    parser.add_argument(
+        "--performance-events",
+        default=None,
+        help="Append metrics to this performance_events.jsonl file.",
+    )
 
     args = parser.parse_args()
 
@@ -552,19 +587,33 @@ async def main():
         api_keys=api_keys,
         base_url=args.base_url or BASE_URL,
         model=args.model or QA_MODEL,
-        max_concurrent=args.concurrency * args.samples, # 总并发控制
+        max_concurrent=args.request_concurrency,
         max_retries=args.retries,
         script_gt_guide=args.script_gt_guide,
         request_timeout=args.request_timeout,
         empty_retry_base_sleep=args.empty_retry_base_sleep,
     )
 
-    await collector.process_file(
-        input_path=args.input,
-        output_path=args.output,
-        num_samples=args.samples,
-        max_concurrent_items=args.concurrency
-    )
+    try:
+        await collector.process_file(
+            input_path=args.input,
+            output_path=args.output,
+            num_samples=args.samples,
+            max_concurrent_items=args.concurrency,
+            performance_path=args.performance_events,
+            config={
+                "model": args.model or QA_MODEL,
+                "base_url": args.base_url or BASE_URL,
+                "samples": args.samples,
+                "item_concurrency": args.concurrency,
+                "request_concurrency": args.request_concurrency,
+                "retries": args.retries,
+                "request_timeout": args.request_timeout,
+                "script_gt_guide": args.script_gt_guide,
+            },
+        )
+    finally:
+        await collector.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

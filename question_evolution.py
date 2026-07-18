@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from prompts.operators import build_operator_prompt, get_operator_spec
@@ -16,6 +17,17 @@ from select_evolution_candidates import (
     STOP_EVOLUTION,
 )
 from local_api_config import get_config_list, get_config_value
+from pipeline_runtime import (
+    AtomicJsonlStageWriter,
+    StageMetrics,
+    TraceStore,
+    append_performance_event,
+    bounded_async_map,
+    iter_json_records,
+    load_json_records,
+    stable_record_key,
+    validate_published_artifact,
+)
 import validate_evolved_question as validation_stage
 
 
@@ -511,6 +523,8 @@ class RotatingAPIClient:
             if self.current_key_index >= len(self.api_keys):
                 logger.error("所有 question evolution API Key 额度已用尽")
                 return False
+            if self.client is not None:
+                await self.client.close()
             self._init_client()
             return True
 
@@ -608,22 +622,11 @@ def validate_evolved_question(original_prompt: str, evolved_prompt: str) -> None
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
-    with open(input_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-    if not content:
-        return []
-    if content.startswith("["):
-        data = json.loads(content)
-        if not isinstance(data, list):
-            raise ValueError("JSON 输入必须是数组")
-        return data
-    return [json.loads(line) for line in content.splitlines() if line.strip()]
+    return load_json_records(input_path, stage="question_evolution")
 
 
 def get_item_key(item: Dict[str, Any]) -> str:
-    index = item.get("index", "")
-    prompt = item.get("prompt", "")
-    return f"{index}|||{prompt}"
+    return stable_record_key(item)
 
 
 def load_processed_keys(output_path: str) -> set:
@@ -1129,6 +1132,10 @@ def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rat
     if isinstance(validation_retry, dict):
         metadata["validation_retry"] = validation_retry
 
+    local_validation_result = evolved.get("_local_validation_result")
+    if isinstance(local_validation_result, dict):
+        metadata["local_validation_result"] = dict(local_validation_result)
+
     meta_info["question_evolution_metadata"] = metadata
 
     result["prompt"] = evolved_prompt
@@ -1266,6 +1273,7 @@ class QuestionEvolutionProcessor:
             )
             validation_result = validate_evolved_result_against_stage_rules(item, evolved)
             if validation_result.get("passed") is True:
+                evolved["_local_validation_result"] = validation_result
                 if validation_attempt:
                     evolved["validation_retry"] = {
                         "attempts": validation_attempt,
@@ -1291,6 +1299,7 @@ class QuestionEvolutionProcessor:
                 "first_reject_reason": first_reject_reason,
                 "final_reject_reason": reject_reason,
             }
+            evolved["_local_validation_result"] = validation_result
             return evolved
 
     async def process_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -1437,98 +1446,152 @@ class QuestionEvolutionProcessor:
                 break
         return counts
 
-    async def process_file(self, input_path: str, output_path: str):
+    async def process_file(
+        self,
+        input_path: str,
+        output_path: str,
+        *,
+        performance_path: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ):
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"输入文件不存在: {input_path}")
 
-        items = load_json_or_jsonl(input_path)
-        target_items = [item for item in items if should_evolve(item, self.min_score_rate)]
-        logger.info(
-            f"读取到 {len(items)} 条记录，其中需要 question evolution 的记录 {len(target_items)} 条"
+        stage = "question_evolution"
+        resolved_config = config or {
+            "model": self.model,
+            "min_score_rate": self.min_score_rate,
+            "num_candidates": self.num_candidates,
+            "max_candidate_budget": self.max_candidate_budget,
+            "validation_retries": self.max_validation_retries,
+        }
+        valid, _ = validate_published_artifact(
+            output_path,
+            stage=stage,
+            input_path=input_path,
+            config=resolved_config,
         )
-
-        processed_keys = load_processed_keys(output_path)
-        pending_items = [item for item in items if get_item_key(item) not in processed_keys]
-        if processed_keys:
-            logger.info(f"跳过 {len(items) - len(pending_items)} 条已输出记录")
-
-        if not pending_items:
-            logger.info("所有输入记录均已输出，无需继续")
+        if valid:
+            logger.info("Verified published evolution artifact; skipping %s", output_path)
             return
 
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        metrics = StageMetrics(stage)
+        metrics.input_bytes = os.path.getsize(input_path)
+        # Candidate allocation is intentionally global and therefore still
+        # reads the round input before starting workers.
+        parse_started = time.monotonic()
+        items = list(iter_json_records(input_path, stage=stage))
+        metrics.parse_seconds += time.monotonic() - parse_started
+        target_items = [item for item in items if should_evolve(item, self.min_score_rate)]
+        logger.info(
+            "读取到 %s 条记录，其中需要 question evolution 的记录 %s 条",
+            len(items),
+            len(target_items),
+        )
+
+        writer = AtomicJsonlStageWriter(
+            output_path,
+            stage=stage,
+            input_path=input_path,
+            config=resolved_config,
+            code_paths=[__file__, validation_stage.__file__],
+            metrics=metrics,
+        )
+        # Candidate allocation is derived from the complete round input on every
+        # run.  Recovery only filters execution, so the original per-round budget
+        # cannot be redistributed to the remaining samples.
+        candidate_counts = self.allocate_candidate_counts(items) if self.num_candidates > 1 else {}
+        pending_items = [item for item in items if get_item_key(item) not in writer.processed_keys]
+        sidecar_path = output_path + ".evolution_traces.jsonl.gz"
+        traces = TraceStore(stage, recovery_path=sidecar_path + ".partial")
         failed_path = output_path + ".failed"
-        file_mode = "a" if processed_keys else "w"
-        candidate_counts = self.allocate_candidate_counts(pending_items) if self.num_candidates > 1 else {}
         failed_count = 0
 
-        async def run_one(item: Dict[str, Any], out_f, fail_f):
-            nonlocal failed_count
+        def externalize_trace(record: Dict[str, Any]) -> Dict[str, Any]:
+            result = dict(record)
+            meta_info = result.get("meta_info")
+            if not isinstance(meta_info, dict):
+                return result
+            meta_info = dict(meta_info)
+            metadata = meta_info.get("question_evolution_metadata")
+            if not isinstance(metadata, dict):
+                return result
+            metadata = dict(metadata)
+            raw_response = metadata.pop("question_evolution_raw_response", None)
+            if isinstance(raw_response, str):
+                metadata["question_evolution_raw_response_trace_id"] = traces.add(
+                    record_key=str(result.get("candidate_id") or get_item_key(result)),
+                    raw_text=raw_response,
+                    trace_kind="question_evolution_model_response",
+                    metadata={"model": self.model},
+                )
+            meta_info["question_evolution_metadata"] = metadata
+            result["meta_info"] = meta_info
+            return result
+
+        async def worker(item: Dict[str, Any]):
             try:
                 if self.num_candidates > 1:
-                    processed_items = await self.process_item_candidates(
+                    records = await self.process_item_candidates(
                         item,
                         requested_candidates=candidate_counts.get(get_item_key(item), 1),
                     )
                 else:
-                    processed_items = [await self.process_item(item)]
-                async with self.write_lock:
-                    for processed_item in processed_items:
-                        out_f.write(json.dumps(processed_item, ensure_ascii=False) + "\n")
-                    out_f.flush()
-            except Exception as e:
-                failed_item = dict(item)
-                failed_item["question_evolution_error"] = str(e)
-                requested_candidates = (
-                    candidate_counts.get(get_item_key(item), 1)
+                    records = [await self.process_item(item)]
+                return [externalize_trace(record) for record in records], None
+            except Exception as exc:
+                requested = candidate_counts.get(get_item_key(item), 1) if self.num_candidates > 1 else 1
+                fallback = (
+                    make_generation_failure_passthrough_candidate_record(item, requested, exc)
                     if self.num_candidates > 1
-                    else 1
+                    else make_generation_failure_passthrough_record(item, exc)
                 )
-                if self.num_candidates > 1:
-                    fallback_item = make_generation_failure_passthrough_candidate_record(
-                        item,
-                        requested_candidates,
-                        e,
-                    )
-                else:
-                    fallback_item = make_generation_failure_passthrough_record(item, e)
-                logger.error(
-                    f"question 进化失败 index={item.get('index')}，已写入透传 fallback "
-                    f"prompt={str(item.get('prompt', ''))[:80]} error={e}"
-                )
-                async with self.write_lock:
-                    out_f.write(json.dumps(fallback_item, ensure_ascii=False) + "\n")
-                    out_f.flush()
-                    fail_f.write(json.dumps(failed_item, ensure_ascii=False) + "\n")
-                    fail_f.flush()
-                    failed_count += 1
+                failed = dict(item)
+                failed["question_evolution_error"] = str(exc)
+                return [fallback], failed
 
-        pending_target_count = sum(1 for item in pending_items if should_evolve(item, self.min_score_rate))
-        logger.info(
-            f"开始输出 {len(pending_items)} 条记录，其中待进化记录 {pending_target_count} 条，"
-            f"并发限制 {self.semaphore._value}"
-        )
-        with open(output_path, file_mode, encoding="utf-8") as out_f, \
-             open(failed_path, file_mode, encoding="utf-8") as fail_f:
-            tasks = [run_one(item, out_f, fail_f) for item in pending_items]
-            try:
-                from tqdm.asyncio import tqdm
-                await tqdm.gather(*tasks)
-            except ImportError:
-                await asyncio.gather(*tasks)
+        async def on_result(_sequence: int, item: Dict[str, Any], outcome) -> None:
+            nonlocal failed_count
+            records, failed = outcome
+            if failed is None:
+                writer.add_group(get_item_key(item), records)
+            else:
+                os.makedirs(os.path.dirname(os.path.abspath(failed_path)), exist_ok=True)
+                with open(failed_path, "a", encoding="utf-8") as target:
+                    target.write(json.dumps(failed, ensure_ascii=False) + "\n")
+                    target.flush()
+                failed_count += 1
 
-        if os.path.exists(failed_path) and os.path.getsize(failed_path) == 0:
-            os.remove(failed_path)
-        elif os.path.exists(failed_path):
-            logger.warning(f"存在失败数据，已保存至: {failed_path}")
-
-        if failed_count:
-            raise RuntimeError(
-                f"question evolution 阶段有 {failed_count}/{len(pending_items)} 条记录失败；"
-                f"失败详情见 {failed_path}，已停止后续流水线。"
+        try:
+            await bounded_async_map(
+                pending_items,
+                worker,
+                concurrency=max(1, self.semaphore._value),
+                on_result=on_result,
+                metrics=metrics,
             )
+            if failed_count:
+                raise RuntimeError(
+                    f"question evolution 阶段有 {failed_count}/{len(pending_items)} 条记录失败；"
+                    f"失败详情见 {failed_path}，已停止后续流水线。"
+                )
+            trace_path, trace_count = traces.write(sidecar_path)
+            writer.register_sidecar(
+                trace_path,
+                kind="question_evolution_raw_response",
+                record_count=trace_count,
+            )
+            writer.publish()
+            traces.finalize_recovery()
+        except Exception:
+            writer.close()
+            append_performance_event(performance_path, metrics.event(status="failed"))
+            raise
 
-        logger.info(f"question 进化/全量输出完成，结果保存至: {output_path}")
+        if os.path.exists(failed_path):
+            os.remove(failed_path)
+        append_performance_event(performance_path, metrics.event())
+        logger.info("question 进化/全量输出完成，结果保存至: %s", output_path)
 
 
 async def main():
@@ -1549,6 +1612,11 @@ async def main():
     parser.add_argument("--base-url", type=str, default=EVOLVE_BASE_URL, help="OpenAI 兼容 base_url")
     parser.add_argument("--api-key", action="append", default=None, help="API key；可多次传入覆盖脚本默认 key")
     parser.add_argument("--request-timeout", type=float, default=REQUEST_TIMEOUT_SECONDS, help="单次请求 timeout 秒数")
+    parser.add_argument(
+        "--performance-events",
+        default=None,
+        help="Append metrics to this performance_events.jsonl file.",
+    )
     parser.add_argument(
         "--prompt-version",
         default="v1",
@@ -1605,7 +1673,22 @@ async def main():
     )
 
     try:
-        await processor.process_file(args.input, args.output)
+        await processor.process_file(
+            args.input,
+            args.output,
+            performance_path=args.performance_events,
+            config={
+                "model": args.model or EVOLVE_MODEL,
+                "base_url": args.base_url or EVOLVE_BASE_URL,
+                "concurrency": args.concurrency,
+                "retries": args.retries,
+                "min_score_rate": args.min_score_rate,
+                "prompt_version": args.prompt_version,
+                "num_candidates": args.num_candidates,
+                "max_candidate_budget": args.max_candidate_budget,
+                "validation_retries": args.validation_retries,
+            },
+        )
     finally:
         await client.close()
 
