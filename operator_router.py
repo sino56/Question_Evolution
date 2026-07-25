@@ -6,6 +6,17 @@ from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from pipeline_runtime import StageMetrics, load_json_records, publish_records, sha256_file
+from operator_contracts import (
+    DISABLED,
+    ENABLED,
+    QUALIFICATION_ONLY,
+    SHADOW_ROUTING,
+    VALIDATION_ONLY,
+    collect_referenced_fact_ids,
+    enabled_generation_operator_ids,
+    extract_operator_manifest,
+    get_operator_contract,
+)
 
 from select_evolution_candidates import (
     EVOLVE_HIGH_SCORE_OVERSCORE,
@@ -26,8 +37,23 @@ O15_COUNTERFACTUAL_THRESHOLD_SHIFT = "O15_counterfactual_threshold_shift"
 O16_CLOSE_ALTERNATIVE_NORMALIZATION = "O16_close_alternative_normalization"
 O17_ACTION_VS_FACT_THRESHOLD = "O17_action_vs_fact_threshold"
 O18_BASELINE_SCOPE_MISMATCH = "O18_baseline_scope_mismatch"
+O19_MULTI_ENTITY_ROLE_BINDING = "O19_multi_entity_role_binding"
+O20_MULTISTAGE_EVENT_BREAKPOINT = "O20_multistage_event_breakpoint"
+O21_OBJECT_PROVENANCE_IDENTITY = "O21_object_provenance_identity"
+O22_PATH_TOPOLOGY_REACHABILITY = "O22_path_topology_reachability"
+O23_OBSERVATION_RELIABILITY_CONFLICT = "O23_observation_reliability_conflict"
+O24_MULTI_HYPOTHESIS_RESIDUAL_RANKING = "O24_multi_hypothesis_residual_ranking"
+O25_PROCEDURAL_INVARIANT_FRAME = "O25_procedural_invariant_frame"
+O26_QUANTITATIVE_THRESHOLD_PROPAGATION = "O26_quantitative_threshold_propagation"
+O27_CROSS_LAYER_CONCLUSION_CALIBRATION = "O27_cross_layer_conclusion_calibration"
+O28_MULTIHOP_CHAIN_CLOSURE = "O28_multihop_chain_closure"
+O29_ENTITY_IDENTITY_CONFLICT_RESOLUTION = "O29_entity_identity_conflict_resolution"
+O30_ACTIVE_DISCRIMINATIVE_OBSERVATION = "O30_active_discriminative_observation"
+O31_OBSERVATION_ACCUMULATION_CALIBRATION = "O31_observation_accumulation_calibration"
+O32_ROLE_GRAPH_CRITICAL_EDGE = "O32_role_graph_critical_edge"
+O33_CROSS_MODAL_SUPPORT_BOUNDARY = "O33_cross_modal_support_boundary"
 
-OPERATOR_ORDER = (
+ALL_OPERATOR_ORDER = (
     O10_EVIDENCE_SUFFICIENCY_LADDER,
     O11_UNOBSERVED_STATE_ATTRIBUTION,
     O12_CONJUNCTIVE_NECESSITY,
@@ -37,8 +63,28 @@ OPERATOR_ORDER = (
     O16_CLOSE_ALTERNATIVE_NORMALIZATION,
     O17_ACTION_VS_FACT_THRESHOLD,
     O18_BASELINE_SCOPE_MISMATCH,
+    O19_MULTI_ENTITY_ROLE_BINDING,
+    O20_MULTISTAGE_EVENT_BREAKPOINT,
+    O21_OBJECT_PROVENANCE_IDENTITY,
+    O22_PATH_TOPOLOGY_REACHABILITY,
+    O23_OBSERVATION_RELIABILITY_CONFLICT,
+    O24_MULTI_HYPOTHESIS_RESIDUAL_RANKING,
+    O25_PROCEDURAL_INVARIANT_FRAME,
+    O26_QUANTITATIVE_THRESHOLD_PROPAGATION,
+    O27_CROSS_LAYER_CONCLUSION_CALIBRATION,
+    O28_MULTIHOP_CHAIN_CLOSURE,
+    O29_ENTITY_IDENTITY_CONFLICT_RESOLUTION,
+    O30_ACTIVE_DISCRIMINATIVE_OBSERVATION,
+    O31_OBSERVATION_ACCUMULATION_CALIBRATION,
+    O32_ROLE_GRAPH_CRITICAL_EDGE,
+    O33_CROSS_MODAL_SUPPORT_BOUNDARY,
 )
-OPERATOR_IDS = set(OPERATOR_ORDER)
+OPERATOR_ORDER = tuple(
+    operator_id
+    for operator_id in ALL_OPERATOR_ORDER
+    if operator_id in set(enabled_generation_operator_ids())
+)
+OPERATOR_IDS = set(ALL_OPERATOR_ORDER)
 
 EVOLUTION_REQUIRED_ACTIONS = {
     EVOLVE_HIGH_SCORE_OVERSCORE,
@@ -73,6 +119,21 @@ OPERATOR_SURFACE_FORM_FAMILY = {
     O16_CLOSE_ALTERNATIVE_NORMALIZATION: "close_alternative_normalization",
     O17_ACTION_VS_FACT_THRESHOLD: "action_vs_fact_threshold",
     O18_BASELINE_SCOPE_MISMATCH: "baseline_scope_mismatch",
+    O19_MULTI_ENTITY_ROLE_BINDING: "multi_entity_role_binding",
+    O20_MULTISTAGE_EVENT_BREAKPOINT: "multistage_event_breakpoint",
+    O21_OBJECT_PROVENANCE_IDENTITY: "object_provenance_identity",
+    O22_PATH_TOPOLOGY_REACHABILITY: "path_topology_reachability",
+    O23_OBSERVATION_RELIABILITY_CONFLICT: "observation_reliability_conflict",
+    O24_MULTI_HYPOTHESIS_RESIDUAL_RANKING: "multi_hypothesis_residual_ranking",
+    O25_PROCEDURAL_INVARIANT_FRAME: "procedural_invariant_frame",
+    O26_QUANTITATIVE_THRESHOLD_PROPAGATION: "quantitative_threshold_propagation",
+    O27_CROSS_LAYER_CONCLUSION_CALIBRATION: "cross_layer_conclusion_calibration",
+    O28_MULTIHOP_CHAIN_CLOSURE: "multihop_chain_closure",
+    O29_ENTITY_IDENTITY_CONFLICT_RESOLUTION: "entity_identity_conflict_resolution",
+    O30_ACTIVE_DISCRIMINATIVE_OBSERVATION: "active_discriminative_observation",
+    O31_OBSERVATION_ACCUMULATION_CALIBRATION: "observation_accumulation_calibration",
+    O32_ROLE_GRAPH_CRITICAL_EDGE: "role_graph_critical_edge",
+    O33_CROSS_MODAL_SUPPORT_BOUNDARY: "cross_modal_support_boundary",
 }
 FAILURE_MEMORY_WARN_THRESHOLD = 1
 FAILURE_MEMORY_DOWNRANK_THRESHOLD = 2
@@ -125,6 +186,24 @@ def _remove_values(items: Sequence[str], blocked: Sequence[str]) -> List[str]:
 def _normalize_operator(value: Any) -> Optional[str]:
     text = _clean_text(value)
     return text if text in OPERATOR_IDS else None
+
+
+def _is_enabled_generation_operator(operator_id: Optional[str]) -> bool:
+    if not operator_id:
+        return False
+    try:
+        return get_operator_contract(operator_id).status == ENABLED
+    except ValueError:
+        return False
+
+
+def _operator_registry_status(operator_id: Optional[str]) -> str:
+    if not operator_id:
+        return ""
+    try:
+        return get_operator_contract(operator_id).status
+    except ValueError:
+        return "unknown"
 
 
 def _read_nonnegative_round(value: Any) -> Optional[int]:
@@ -465,9 +544,111 @@ def find_memory_matches(
 
 def _base_rule_route(item: Dict[str, Any]) -> Tuple[Optional[str], List[str], str]:
     diagnosis = get_overscore_diagnosis(item)
+    profile = get_sample_profile(item)
     cause = _clean_text(diagnosis.get("candidate_overscore_cause"))
     target = _clean_text(diagnosis.get("target_failure_mode"))
-    combined = f"{cause} {target}"
+    combined = " ".join(
+        (
+            cause,
+            target,
+            _clean_text(profile.get("core_capability")),
+            _clean_text(profile.get("problem_shape")),
+        )
+    )
+
+    # New families are recognized by their primary reasoning object.  Their
+    # qualification-only status is applied later, so these rules produce a
+    # shadow explanation without silently enabling production traffic.
+    if _has_any(combined, ("跨模态", "多源融合", "来源冲突", "信号与视频", "跨来源")):
+        return (
+            O33_CROSS_MODAL_SUPPORT_BOUNDARY,
+            [O23_OBSERVATION_RELIABILITY_CONFLICT, O27_CROSS_LAYER_CONCLUSION_CALIBRATION],
+            "reasoning object is cross-source scope, alignment, conflict, and fusion ceiling.",
+        )
+    if _has_any(combined, ("观测累积", "独立增量", "同源重复", "观测依赖", "累积支持")):
+        return (
+            O31_OBSERVATION_ACCUMULATION_CALIBRATION,
+            [O23_OBSERVATION_RELIABILITY_CONFLICT, O10_EVIDENCE_SUFFICIENCY_LADDER],
+            "reasoning object is dependency and incremental support across observations.",
+        )
+    if _has_any(combined, ("下一观测", "主动判别", "判别观测", "信息选择", "区分力观测")):
+        return (
+            O30_ACTIVE_DISCRIMINATIVE_OBSERVATION,
+            [O24_MULTI_HYPOTHESIS_RESIDUAL_RANKING, O16_CLOSE_ALTERNATIVE_NORMALIZATION],
+            "reasoning object is selection of the next discriminative observation.",
+        )
+    if _has_any(combined, ("同一性冲突", "冲突绑定", "实体消解", "跨镜头同一性", "全程同一")):
+        return (
+            O29_ENTITY_IDENTITY_CONFLICT_RESOLUTION,
+            [O19_MULTI_ENTITY_ROLE_BINDING, O21_OBJECT_PROVENANCE_IDENTITY],
+            "reasoning object is identity resolution under conflicting bindings.",
+        )
+    if _has_any(combined, ("整体链路闭合", "跨节点链路", "跨阶段链路", "多跳链路", "跨跳绑定")):
+        return (
+            O28_MULTIHOP_CHAIN_CLOSURE,
+            [O20_MULTISTAGE_EVENT_BREAKPOINT, O22_PATH_TOPOLOGY_REACHABILITY],
+            "reasoning object is whole-chain closure across stages and observation nodes.",
+        )
+    if _has_any(combined, ("关系图关键边", "角色关系图", "协同关键边", "有向关系边", "共现不等于协同")):
+        return (
+            O32_ROLE_GRAPH_CRITICAL_EDGE,
+            [O19_MULTI_ENTITY_ROLE_BINDING, O13_MINIMAL_DISQUALIFIER],
+            "reasoning object is directed role relation graph and critical-edge necessity.",
+        )
+    if _has_any(combined, ("跨层结论", "结论层级映射", "证据上推", "支持度上推", "最高允许结论")):
+        return (
+            O27_CROSS_LAYER_CONCLUSION_CALIBRATION,
+            [O13_MINIMAL_DISQUALIFIER, O17_ACTION_VS_FACT_THRESHOLD],
+            "reasoning object is legal propagation across claim layers.",
+        )
+    if _has_any(combined, ("误差传播", "不确定区间", "区间阈值", "容差", "单位换算")):
+        return (
+            O26_QUANTITATIVE_THRESHOLD_PROPAGATION,
+            [O18_BASELINE_SCOPE_MISMATCH, O15_COUNTERFACTUAL_THRESHOLD_SHIFT],
+            "reasoning object is uncertainty propagation and threshold relation.",
+        )
+    if _has_any(combined, ("参照系", "程序不变量", "记录映射", "单位不一致", "步骤依赖")):
+        return (
+            O25_PROCEDURAL_INVARIANT_FRAME,
+            [O12_CONJUNCTIVE_NECESSITY],
+            "reasoning object is procedural, reference-frame, unit, and record-mapping invariance.",
+        )
+    if _has_any(combined, ("多假设残差", "覆盖冲突残差", "假设排序", "额外假设成本", "残差矩阵")):
+        return (
+            O24_MULTI_HYPOTHESIS_RESIDUAL_RANKING,
+            [O16_CLOSE_ALTERNATIVE_NORMALIZATION],
+            "reasoning object is the coverage-conflict-residual structure of competing hypotheses.",
+        )
+    if _has_any(combined, ("观测质量", "可见性", "遮挡可靠性", "视角限制", "模糊观测")):
+        return (
+            O23_OBSERVATION_RELIABILITY_CONFLICT,
+            [O10_EVIDENCE_SUFFICIENCY_LADDER],
+            "reasoning object is observability and source-internal reliability.",
+        )
+    if _has_any(combined, ("路径拓扑", "联合可达", "路径图", "通行时间范围", "多入口多出口")):
+        return (
+            O22_PATH_TOPOLOGY_REACHABILITY,
+            [O11_UNOBSERVED_STATE_ATTRIBUTION],
+            "reasoning object is path topology with time-window and endpoint constraints.",
+        )
+    if _has_any(combined, ("物品来源", "物品同一性", "转移缺口", "竞争来源", "物品连续性")):
+        return (
+            O21_OBJECT_PROVENANCE_IDENTITY,
+            [O19_MULTI_ENTITY_ROLE_BINDING],
+            "reasoning object is object provenance and identity continuity.",
+        )
+    if _has_any(combined, ("多阶段断点", "状态转移断点", "事件链断点", "局部链完整", "状态图")):
+        return (
+            O20_MULTISTAGE_EVENT_BREAKPOINT,
+            [O13_MINIMAL_DISQUALIFIER],
+            "reasoning object is a multistage state-transition graph and its breakpoint.",
+        )
+    if _has_any(combined, ("多实体绑定", "角色绑定", "主体交换", "关系方向", "掩护者与实施者")):
+        return (
+            O19_MULTI_ENTITY_ROLE_BINDING,
+            [O10_EVIDENCE_SUFFICIENCY_LADDER],
+            "reasoning object is entity-to-observation binding and role direction.",
+        )
 
     if _has_any(combined, ("盲区", "不可见区间", "未出现", "端点事实", "不可见状态")):
         return (
@@ -626,10 +807,64 @@ def build_operator_route(
     get_sample_profile(item)
     get_overscore_diagnosis(item)
 
-    primary, backups, reason = _base_rule_route(item)
+    rule_primary, rule_backups, reason = _base_rule_route(item)
+    rule_contract = get_operator_contract(rule_primary) if rule_primary else None
+    rule_manifest = (
+        extract_operator_manifest(item, rule_primary)
+        if rule_primary
+        else {}
+    )
+    required_slots_satisfied = []
+    missing_required_slots = []
+    if rule_contract:
+        for slot in rule_contract.required_fact_slots:
+            current: Any = rule_manifest
+            for part in slot.split("."):
+                if not isinstance(current, dict) or part not in current:
+                    current = None
+                    break
+                current = current[part]
+            if current in (None, "", [], {}):
+                missing_required_slots.append(slot)
+            else:
+                required_slots_satisfied.append(slot)
+    shadow_operator_plan = []
+    for position, operator_id in enumerate([rule_primary] + list(rule_backups)):
+        if not operator_id:
+            continue
+        shadow_operator_plan.append(
+            {
+                "operator_id": operator_id,
+                "route_position": "primary" if position == 0 else f"backup_{position}",
+                "registry_status": _operator_registry_status(operator_id),
+            }
+        )
+
+    enabled_rule_candidates = [
+        operator_id
+        for operator_id in [rule_primary] + list(rule_backups)
+        if _is_enabled_generation_operator(operator_id)
+    ]
+    primary = enabled_rule_candidates[0] if enabled_rule_candidates else None
+    backups = enabled_rule_candidates[1:]
     avoid: List[str] = []
     reason_parts = [reason]
+    if rule_primary and not _is_enabled_generation_operator(rule_primary):
+        reason_parts.append(
+            f"rule primary {rule_primary} is {_operator_registry_status(rule_primary)} and is shadow-only."
+        )
+    if primary is None:
+        primary = next(iter(OPERATOR_ORDER), None)
+        if primary:
+            reason_parts.append(
+                f"no enabled rule candidate remained; using enabled registry fallback {primary}."
+            )
     recommended_next = _recommended_next_methods(item)
+    recommended_next = [
+        operator_id
+        for operator_id in recommended_next
+        if _is_enabled_generation_operator(operator_id)
+    ]
 
     signature = build_sample_signature(item)
     operator_matches = find_memory_matches(
@@ -651,7 +886,11 @@ def build_operator_route(
 
     if operator_matches:
         memory_operator = _normalize_operator(operator_matches[0].get("operator_used"))
-        if memory_operator and memory_operator not in avoid:
+        if (
+            memory_operator
+            and _is_enabled_generation_operator(memory_operator)
+            and memory_operator not in avoid
+        ):
             if primary and primary != memory_operator:
                 _append_unique(backups, [primary])
                 reason_parts.append(
@@ -725,6 +964,37 @@ def build_operator_route(
         "routing_reason": " ".join(reason_parts),
         "is_high_value_sample": _is_high_value_sample(item),
         "should_use_local_tree_search": should_tree,
+        "operator_registry_status": _operator_registry_status(primary),
+        "recognized_operator_id": rule_primary,
+        "recognized_operator_registry_status": _operator_registry_status(rule_primary),
+        "primary_reasoning_object": (
+            rule_contract.reasoning_object if rule_contract else ""
+        ),
+        "required_slots_satisfied": required_slots_satisfied,
+        "missing_required_slots": missing_required_slots,
+        "supporting_fact_ids": collect_referenced_fact_ids(rule_manifest),
+        "excluded_neighbor_operators": [
+            {
+                "operator_id": operator_id,
+                "reason": "less direct match for the recognized primary reasoning object",
+            }
+            for operator_id in (
+                rule_contract.neighbor_operators if rule_contract else ()
+            )
+            if operator_id != rule_primary
+        ],
+        "adapter_version": _clean_text(
+            rule_manifest.get("adapter_version")
+            or rule_manifest.get("adapter_id")
+        ),
+        "recognized_semantic_version": (
+            rule_contract.semantic_version if rule_contract else ""
+        ),
+        "recognized_applicability_version": (
+            rule_contract.applicability_version if rule_contract else ""
+        ),
+        "shadow_operator_plan": shadow_operator_plan,
+        "generation_registry": list(OPERATOR_ORDER),
         "memory_warnings": failure_memory_actions["memory_warnings"],
         "downrank_operator_surface_forms": failure_memory_actions["downrank_operator_surface_forms"],
         "avoid_operator_surface_forms": failure_memory_actions["avoid_operator_surface_forms"],
@@ -850,7 +1120,7 @@ def main() -> None:
     records = load_json_or_jsonl(args.input)
     operator_memory = load_jsonl_if_exists(operator_memory_path)
     failure_memory = load_jsonl_if_exists(failure_memory_path)
-    metrics.parse_seconds += time.monotonic() - parse_started
+    metrics.parse_seconds += max(time.monotonic() - parse_started, 0.000001)
     compute_started = time.monotonic()
     routed = route_records(
         records,
@@ -859,7 +1129,7 @@ def main() -> None:
         full_score_threshold=args.full_score_threshold,
         failure_memory_window_rounds=max(1, args.failure_memory_window_rounds),
     )
-    metrics.compute_seconds += time.monotonic() - compute_started
+    metrics.compute_seconds += max(time.monotonic() - compute_started, 0.000001)
     publish_records(
         routed,
         args.output,

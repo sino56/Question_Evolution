@@ -341,6 +341,46 @@ def build_effect_analysis(
     strong_drop = score_drop >= score_drop_threshold
     review_drop = score_drop >= review_drop_threshold
     score_increased_after_evolution = evolved and delta_score_rate > score_increase_threshold
+    def axis_scores(record: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(record, dict):
+            return {}
+        scoring_result = record.get("scoring_result")
+        if not isinstance(scoring_result, dict):
+            return {}
+        value = scoring_result.get("axis_scores")
+        return value if isinstance(value, dict) else {}
+
+    before_axis_scores = axis_scores(previous_item)
+    after_axis_scores = axis_scores(item)
+    axis_effects = {}
+    for axis_id in sorted(set(before_axis_scores) | set(after_axis_scores)):
+        before_axis = before_axis_scores.get(axis_id)
+        after_axis = after_axis_scores.get(axis_id)
+        before_rate = (
+            before_axis.get("score_rate")
+            if isinstance(before_axis, dict)
+            else None
+        )
+        after_rate = (
+            after_axis.get("score_rate")
+            if isinstance(after_axis, dict)
+            else None
+        )
+        axis_effects[axis_id] = {
+            "score_rate_before": before_rate,
+            "score_rate_after": after_rate,
+            "delta_score_rate": (
+                after_rate - before_rate
+                if isinstance(before_rate, (int, float))
+                and isinstance(after_rate, (int, float))
+                else None
+            ),
+            "answer_contract_ids": list(
+                (after_axis or {}).get("answer_contract_ids") or []
+            )
+            if isinstance(after_axis, dict)
+            else [],
+        }
 
     lightweight_boundary_hit = (
         evolved
@@ -414,6 +454,8 @@ def build_effect_analysis(
         "focus_answer_alignment": focus_alignment,
         "lightweight_hit_reason": reason,
         "effect_label": effect_label,
+        "axis_effects": axis_effects,
+        "candidate_total_is_supplementary": bool(axis_effects),
     }
 
 

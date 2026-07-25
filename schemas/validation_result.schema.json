@@ -8,6 +8,31 @@
     "passed": {
       "type": "boolean"
     },
+    "release_status": {
+      "enum": ["eligible", "reject_candidate", "diagnostic_risk"]
+    },
+    "contract_mode": {
+      "enum": ["legacy", "v2"]
+    },
+    "deterministic_errors": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "information_closure_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "record_only_metrics": {
+      "type": "object",
+      "additionalProperties": true
+    },
     "main_axis_count": {
       "type": "integer",
       "minimum": 0

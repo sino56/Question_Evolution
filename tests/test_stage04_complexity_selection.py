@@ -17,6 +17,7 @@ from validate_evolved_question import (
     validate_record,
 )
 from validate_difficulty_gain import normalize_difficulty_gain_result
+from operator_contract_test_utils import contract_fields_for_prompt
 
 
 def load_jsonl(path: Path):
@@ -61,20 +62,19 @@ class FakeEvolutionClient:
                 "请在原题事实基础上比较两个候选补充事实：A 是否直接决定结论成立，B 是否只是旁证。"
                 "若只能补充一项，哪一项才是最小关键事实？请说明另一个为什么不能单独支撑结论。"
             )
-        content = json.dumps(
-            {
-                "evolved_prompt": evolved_prompt,
-                "evolution_strategy": f"{operator} candidate",
-                "complexity_budget": {
-                    "main_axis_count": 1,
-                    "new_facts_count": 1,
-                    "output_tasks_count": 1,
-                    "candidate_options_count": 2,
-                    "counterfactual_count": 0,
-                },
+        payload = {
+            "evolved_prompt": evolved_prompt,
+            "evolution_strategy": f"{operator} candidate",
+            "complexity_budget": {
+                "main_axis_count": 1,
+                "new_facts_count": 1,
+                "output_tasks_count": 1,
+                "candidate_options_count": 2,
+                "counterfactual_count": 0,
             },
-            ensure_ascii=False,
-        )
+        }
+        payload.update(contract_fields_for_prompt(prompt))
+        content = json.dumps(payload, ensure_ascii=False)
         return FakeResponse(content)
 
 
@@ -95,19 +95,21 @@ class FakeValidateRetryClient:
                 "请比较 A 与 B 两个候选事实：A 是能直接决定结论成立的独立必要条件，"
                 "B 只是辅助旁证。若只能补充一项，哪一项才是最小关键事实？"
             )
+        payload = {
+            "evolved_prompt": evolved_prompt,
+            "evolution_strategy": "validate retry candidate",
+            "complexity_budget": {
+                "main_axis_count": 1,
+                "new_facts_count": 1,
+                "output_tasks_count": 1,
+                "candidate_options_count": 2,
+                "counterfactual_count": 0,
+            },
+        }
+        payload.update(contract_fields_for_prompt(prompt))
         return FakeResponse(
             json.dumps(
-                {
-                    "evolved_prompt": evolved_prompt,
-                    "evolution_strategy": "validate retry candidate",
-                    "complexity_budget": {
-                        "main_axis_count": 1,
-                        "new_facts_count": 1,
-                        "output_tasks_count": 1,
-                        "candidate_options_count": 2,
-                        "counterfactual_count": 0,
-                    },
-                },
+                payload,
                 ensure_ascii=False,
             )
         )
@@ -218,7 +220,7 @@ def test_validate_retry_reuses_operator_and_includes_reject_reason():
     assert metadata["local_validation_result"]["local_validation_rule_version"]
 
 
-def test_llm_validation_result_can_reject_unanswerable_candidate():
+def test_uncalibrated_llm_validation_is_diagnostic_not_hard_reject():
     candidate = make_candidate(
         "stage04-llm",
         "cand_1",
@@ -237,9 +239,10 @@ def test_llm_validation_result_can_reject_unanswerable_candidate():
     )["validation_result"]
 
     assert validation["llm_validation_used"] is True
-    assert validation["passed"] is False
+    assert validation["passed"] is True
+    assert validation["release_status"] == "diagnostic_risk"
     assert validation["answerable"] is False
-    assert "无法仅凭题面回答" in validation["reject_reason"]
+    assert any("无法仅凭题面回答" in reason for reason in validation["diagnostics"])
 
 
 def test_dynamic_candidate_budget_allocates_more_to_priority_samples():
@@ -284,7 +287,7 @@ def test_dynamic_candidate_budget_allocates_more_to_priority_samples():
     assert sum(counts.values()) <= 8
 
 
-def test_validation_rejects_overlong_duplicate_multitask_and_accepts_clean_candidate():
+def test_validation_rejects_duplicate_but_records_quantity_and_format_diagnostics():
     clean = make_candidate(
         "stage04-valid",
         "cand_1",
@@ -306,10 +309,13 @@ def test_validation_rejects_overlong_duplicate_multitask_and_accepts_clean_candi
     assert clean_result["passed"] is True
     assert duplicate_result["passed"] is False
     assert "完全相同" in duplicate_result["reject_reason"]
-    assert overlong_result["passed"] is False
-    assert "题长" in overlong_result["reject_reason"]
-    assert multitask_result["passed"] is False
-    assert "输出任务数" in multitask_result["reject_reason"] or "格式复杂度" in multitask_result["reject_reason"]
+    assert overlong_result["passed"] is True
+    assert overlong_result["release_status"] == "diagnostic_risk"
+    assert any("record_only: 题长" in reason for reason in overlong_result["diagnostics"])
+    assert multitask_result["passed"] is True
+    assert multitask_result["release_status"] == "diagnostic_risk"
+    assert multitask_result["record_only_metrics"]["output_tasks_count"] >= 1
+    assert any("格式复杂度" in reason for reason in multitask_result["diagnostics"])
 
 
 def test_candidate_selection_selects_valid_candidate_and_records_rejections():
@@ -424,9 +430,9 @@ def test_formal_validation_reuses_generation_result_only_for_same_rule_version()
 if __name__ == "__main__":
     test_question_evolution_can_emit_primary_and_backup_candidates()
     test_validate_retry_reuses_operator_and_includes_reject_reason()
-    test_llm_validation_result_can_reject_unanswerable_candidate()
+    test_uncalibrated_llm_validation_is_diagnostic_not_hard_reject()
     test_dynamic_candidate_budget_allocates_more_to_priority_samples()
-    test_validation_rejects_overlong_duplicate_multitask_and_accepts_clean_candidate()
+    test_validation_rejects_duplicate_but_records_quantity_and_format_diagnostics()
     test_candidate_selection_selects_valid_candidate_and_records_rejections()
     test_all_invalid_candidates_restore_parent_snapshot_for_passthrough()
     print("stage04 complexity validation and candidate selection checks passed")

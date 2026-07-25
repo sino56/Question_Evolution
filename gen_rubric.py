@@ -23,6 +23,7 @@ from pipeline_runtime import (
     stable_record_key,
     validate_published_artifact,
 )
+from operator_contracts import answer_contract_hash, get_operator_contract
 
 QA_MODEL = (
     os.getenv("RUBRIC_MODEL")
@@ -385,7 +386,13 @@ def loads_json_with_repair(json_str: str):
                 last_error = error
         raise last_error
 
-def build_user_prompt(question: str, answers: List[str]) -> str:
+def build_user_prompt(
+    question: str,
+    answers: List[str],
+    *,
+    answer_contract: Dict[str, Any] = None,
+    scorer_mapping: Dict[str, Any] = None,
+) -> str:
     """构造 rubric 生成的 user prompt，使用 references 列表的前两项作为 A/B。"""
     cleaned_answers = []
     for answer in answers:
@@ -423,7 +430,164 @@ def build_user_prompt(question: str, answers: List[str]) -> str:
             "补充说明：当前只提供一份参考答案，请严格以参考答案A为准，不要自行补充外部信息。",
         ])
 
+    if answer_contract:
+        parts.extend(
+            [
+                "",
+                "# 冻结答案契约",
+                json.dumps(answer_contract, ensure_ascii=False, indent=2, sort_keys=True),
+                "",
+                "# Scorer mapping",
+                json.dumps(scorer_mapping or {}, ensure_ascii=False, indent=2, sort_keys=True),
+                "",
+                "Rubric 必须消费该冻结契约，不得改写 target_claim、conclusion_layer、answer_key、"
+                "decisive_fact_ids 或 operator_answer。输出 JSON 根对象还必须包含：",
+                json.dumps(
+                    {
+                        "_answer_contract_alignment": {
+                            "answer_contract_hash": answer_contract.get("answer_contract_hash"),
+                            "target_claim": answer_contract.get("target_claim"),
+                            "conclusion_layer": answer_contract.get("conclusion_layer"),
+                            "answer_key": answer_contract.get("answer_key"),
+                            "decisive_fact_ids": answer_contract.get("decisive_fact_ids"),
+                        }
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+            ]
+        )
+        if (scorer_mapping or {}).get("per_axis_attribution_required") is True:
+            parts.extend(
+                [
+                    "",
+                    "每个 rubric item 还必须输出 operator_axis_id 和 "
+                    "answer_contract_id；二者必须来自 Scorer mapping 中的 "
+                    "axis_assignments / axis_answer_contracts。每个实际声明的轴"
+                    "至少映射一个 rubric item，候选总分不得代替分轴归因。",
+                ]
+            )
     return "\n".join(parts)
+
+
+def _question_evolution_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
+    meta_info = item.get("meta_info")
+    if not isinstance(meta_info, dict):
+        return {}
+    metadata = meta_info.get("question_evolution_metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def get_frozen_answer_contract(item: Dict[str, Any]) -> Dict[str, Any]:
+    answer_contract = _question_evolution_metadata(item).get("answer_contract")
+    if not isinstance(answer_contract, dict):
+        return {}
+    if answer_contract.get("frozen") is not True:
+        raise ValueError("answer contract is not frozen")
+    if answer_contract.get("answer_contract_hash") != answer_contract_hash(answer_contract):
+        raise ValueError("answer contract hash mismatch before rubric generation")
+    return dict(answer_contract)
+
+
+def get_scorer_mapping(item: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = _question_evolution_metadata(item)
+    operator_id = str(metadata.get("operator_used") or item.get("candidate_operator") or "").strip()
+    if not operator_id:
+        return {}
+    mapping = dict(get_operator_contract(operator_id).scorer_mapping)
+    if mapping.get("per_axis_attribution_required") is True:
+        envelope = metadata.get("operator_envelope")
+        envelope = envelope if isinstance(envelope, dict) else {}
+        mapping["axis_assignments"] = list(
+            envelope.get("axis_assignments") or []
+        )
+        mapping["axis_answer_contracts"] = dict(
+            envelope.get("axis_answer_contracts") or {}
+        )
+    return mapping
+
+
+def validate_rubric_axis_mapping(
+    rubric: List[Dict[str, Any]],
+    scorer_mapping: Dict[str, Any],
+) -> Dict[str, Any]:
+    if scorer_mapping.get("per_axis_attribution_required") is not True:
+        return {"checked": False, "status": "axis_mapping_not_required"}
+    assignments = scorer_mapping.get("axis_assignments")
+    contracts = scorer_mapping.get("axis_answer_contracts")
+    if not isinstance(assignments, list) or not assignments:
+        raise ValueError("scorer mapping missing axis_assignments")
+    if not isinstance(contracts, dict):
+        raise ValueError("scorer mapping missing axis_answer_contracts")
+    expected = {
+        str(assignment.get("axis_id") or ""): str(
+            assignment.get("answer_contract_id") or ""
+        )
+        for assignment in assignments
+        if isinstance(assignment, dict)
+    }
+    observed = set()
+    for index, item in enumerate(rubric):
+        axis_id = str(item.get("operator_axis_id") or "").strip()
+        contract_id = str(item.get("answer_contract_id") or "").strip()
+        if axis_id not in expected:
+            raise ValueError(
+                f"rubric item {index + 1} has unknown operator_axis_id"
+            )
+        if contract_id != expected[axis_id]:
+            raise ValueError(
+                f"rubric item {index + 1} answer_contract_id mismatch"
+            )
+        if axis_id not in contracts:
+            raise ValueError(f"axis {axis_id} has no frozen answer contract")
+        observed.add(axis_id)
+    missing = sorted(set(expected) - observed)
+    if missing:
+        raise ValueError(
+            "rubric does not cover declared operator axes: "
+            + ", ".join(missing)
+        )
+    return {
+        "checked": True,
+        "status": "axis_aligned",
+        "axis_ids": sorted(observed),
+    }
+
+
+def validate_rubric_answer_contract_alignment(
+    alignment: Any,
+    answer_contract: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not answer_contract:
+        return {
+            "checked": False,
+            "status": "legacy_no_answer_contract",
+        }
+    if not isinstance(alignment, dict):
+        raise ValueError("rubric output missing _answer_contract_alignment")
+    expected = {
+        "answer_contract_hash": answer_contract.get("answer_contract_hash"),
+        "target_claim": answer_contract.get("target_claim"),
+        "conclusion_layer": answer_contract.get("conclusion_layer"),
+        "answer_key": answer_contract.get("answer_key"),
+        "decisive_fact_ids": answer_contract.get("decisive_fact_ids"),
+    }
+    conflicts = [
+        field
+        for field, value in expected.items()
+        if alignment.get(field) != value
+    ]
+    if conflicts:
+        raise ValueError(
+            "rubric conflicts with frozen answer contract fields: "
+            + ", ".join(conflicts)
+        )
+    return {
+        "checked": True,
+        "status": "aligned",
+        "answer_contract_hash": expected["answer_contract_hash"],
+    }
 
 
 def _append_unique_answer(answers: List[str], answer) -> None:
@@ -573,11 +737,18 @@ def validate_and_normalize_rubric(rubric):
             continue
         seen_keys.add(dedup_key)
 
-        normalized_rubric.append({
+        normalized_item = {
             "title": title,
             "description": description,
             "weight": weight,
-        })
+        }
+        for optional_field in ("operator_axis_id", "answer_contract_id"):
+            if optional_field in criterion:
+                normalized_item[optional_field] = _normalize_text_field(
+                    criterion.get(optional_field),
+                    optional_field,
+                )
+        normalized_rubric.append(normalized_item)
 
     if not normalized_rubric:
         raise ValueError("rubric 清洗后不能为空数组")
@@ -646,13 +817,29 @@ def get_rubric_prompt_template(version: str):
     raise ValueError(f"不支持的 rubric prompt 版本: {version}")
 
 
-async def generate_rubric(client: RotatingAPIClient, model, question, answers, max_retries=3, prompt_version="v3"):
+async def generate_rubric(
+    client: RotatingAPIClient,
+    model,
+    question,
+    answers,
+    max_retries=3,
+    prompt_version="v3",
+    *,
+    answer_contract: Dict[str, Any] = None,
+    scorer_mapping: Dict[str, Any] = None,
+):
     """
     调用LLM生成评分标准
     """
-    user_prompt = build_user_prompt(question, answers)
     template = get_rubric_prompt_template(prompt_version)
     user_prompt = template.replace("{question}", question).replace("{reference}", answers[0])
+    if answer_contract:
+        user_prompt += "\n\n" + build_user_prompt(
+            question,
+            answers,
+            answer_contract=answer_contract,
+            scorer_mapping=scorer_mapping,
+        )
     
     for attempt in range(max_retries):
         try:
@@ -678,16 +865,27 @@ async def generate_rubric(client: RotatingAPIClient, model, question, answers, m
             
             # 兼容 v3 模板：提取 _thought_process 后，把 rubric 数组单独传给校验
             thought_process = None
+            alignment = None
             if isinstance(parsed, dict):
                 thought_process = parsed.get("_thought_process")
+                alignment = parsed.get("_answer_contract_alignment")
                 if "rubric" in parsed:
                     parsed = parsed["rubric"]
             
             rubric = validate_and_normalize_rubric(parsed)
             validate_rubric_extra(rubric)
+            axis_check = validate_rubric_axis_mapping(
+                rubric,
+                scorer_mapping or {},
+            )
+            contract_check = validate_rubric_answer_contract_alignment(
+                alignment,
+                answer_contract or {},
+            )
+            contract_check["axis_mapping"] = axis_check
             
             logger.info(f"成功生成评分标准 (尝试次数: {attempt + 1})")
-            return rubric, thought_process
+            return rubric, thought_process, contract_check
             
         except Exception as e:
             error_str = str(e)
@@ -731,7 +929,17 @@ async def process_item(item, client: RotatingAPIClient, model, writer_queue, fai
             raise ValueError("没有有效的参考答案")
 
         # 生成评分标准
-        rubric, thought_process = await generate_rubric(client, model, question, answers, prompt_version=prompt_version)
+        answer_contract = get_frozen_answer_contract(item)
+        scorer_mapping = get_scorer_mapping(item) if answer_contract else {}
+        rubric, thought_process, contract_check = await generate_rubric(
+            client,
+            model,
+            question,
+            answers,
+            prompt_version=prompt_version,
+            answer_contract=answer_contract,
+            scorer_mapping=scorer_mapping,
+        )
 
         # 添加 rubric 字段
         item["rubric"] = rubric
@@ -739,6 +947,7 @@ async def process_item(item, client: RotatingAPIClient, model, writer_queue, fai
         # 单独保存 v3 模板的思维过程（不影响原 rubric 格式）
         if thought_process is not None:
             item["rubric_thought_process"] = thought_process
+        item["rubric_contract_check"] = contract_check
 
         # 组装 score_prompt（待评答案处使用占位符，便于 judger 阶段动态替换）
         item["score_prompt"] = build_score_prompt(item, rubric)

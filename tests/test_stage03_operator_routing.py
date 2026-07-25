@@ -16,6 +16,7 @@ import question_evolution as question_evolution_module
 import operator_router as operator_router_module
 from pipeline_runtime import AtomicJsonlStageWriter
 from question_evolution import QuestionEvolutionProcessor, get_item_key
+from operator_contract_test_utils import contract_fields_for_prompt
 
 
 def load_jsonl(path: Path):
@@ -47,16 +48,16 @@ class FakeEvolutionClient:
 
     async def chat_completions_create(self, **kwargs):
         self.calls.append(kwargs)
-        content = json.dumps(
-            {
-                "evolved_prompt": (
-                    "请在原题基础上判断两个候选依据中哪一个才真正决定结论能否成立，"
-                    "并说明另一个依据为什么不能单独支撑结论。"
-                ),
-                "evolution_strategy": "使用指定 operator 生成单主轴问题。",
-            },
-            ensure_ascii=False,
-        )
+        prompt = kwargs["messages"][0]["content"]
+        payload = {
+            "evolved_prompt": (
+                "请在原题基础上判断两个候选依据中哪一个才真正决定结论能否成立，"
+                "并说明另一个依据为什么不能单独支撑结论。"
+            ),
+            "evolution_strategy": "使用指定 operator 生成单主轴问题。",
+        }
+        payload.update(contract_fields_for_prompt(prompt))
+        content = json.dumps(payload, ensure_ascii=False)
         return FakeResponse(content)
 
 
@@ -70,8 +71,8 @@ class FailingEvolutionClient:
 
 
 def test_operator_registry_covers_o10_to_o18():
-    assert len(OPERATOR_SPECS) == 9
-    for index in range(10, 19):
+    assert len(OPERATOR_SPECS) == 24
+    for index in range(10, 34):
         assert any(operator_id.startswith(f"O{index}_") for operator_id in OPERATOR_SPECS)
 
 
@@ -87,7 +88,12 @@ def test_router_covers_representative_stage03_paths():
     assert "O13_minimal_disqualifier" in routes["stage03-o2"]["avoid_operators"]
 
     assert routes["stage03-o4"]["primary_operator"] == "O10_evidence_sufficiency_ladder"
-    assert routes["stage03-o8"]["primary_operator"] == "O17_action_vs_fact_threshold"
+    assert routes["stage03-o8"]["primary_operator"] == "O12_conjunctive_necessity"
+    assert routes["stage03-o8"]["shadow_operator_plan"][0] == {
+        "operator_id": "O17_action_vs_fact_threshold",
+        "route_position": "primary",
+        "registry_status": "disabled",
+    }
     assert routes["stage03-o9"]["primary_operator"] == "O10_evidence_sufficiency_ladder"
 
     assert routes["stage03-pass"]["primary_operator"] is None
@@ -109,7 +115,7 @@ def test_question_evolution_uses_route_and_skips_passthrough():
     metadata = evolved["meta_info"]["question_evolution_metadata"]
     assert evolved["question_evolved"] is True
     assert metadata["operator_used"] == "O13_minimal_disqualifier"
-    assert metadata["ability_axis"] == "同一判断内的层级改变事实识别"
+    assert metadata["ability_axis"] == "minimal_required_link_failure"
     assert metadata["expected_qwen_failure"] == "选错最关键缺口"
     assert metadata["expected_evaluation_focus"]
     assert len(fake_client.calls) == 1
@@ -220,6 +226,8 @@ def test_question_evolution_resume_preserves_round_candidate_budget(tmp_path):
         "num_candidates": processor.num_candidates,
         "max_candidate_budget": processor.max_candidate_budget,
         "validation_retries": processor.max_validation_retries,
+        "strict_operator_contracts": processor.strict_operator_contracts,
+        "enable_blind_solver": processor.enable_blind_solver,
     }
     writer = AtomicJsonlStageWriter(
         str(output_path),
@@ -342,9 +350,10 @@ def test_state_recommendation_precedes_memory_and_failed_operator_is_avoided():
     }]
 
     route = route_records([item], operator_memory=operator_memory)[0]["operator_route"]
-    assert route["primary_operator"] == "O18_baseline_scope_mismatch"
+    assert route["primary_operator"] == "O16_close_alternative_normalization"
+    assert "O18_baseline_scope_mismatch" not in route["backup_operators"]
     assert "O13_minimal_disqualifier" in route["avoid_operators"]
-    assert "O16_close_alternative_normalization" in route["backup_operators"]
+    assert "O16_close_alternative_normalization" not in route["backup_operators"]
 
 
 def test_memory_index_preserves_linear_match_order_and_caches_signature():

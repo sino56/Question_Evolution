@@ -22,6 +22,67 @@
     "ability_axis": {
       "type": "string"
     },
+    "semantic_version": {
+      "type": "string"
+    },
+    "prompt_version": {
+      "type": "string"
+    },
+    "applicability_version": {
+      "type": "string"
+    },
+    "validation_policy_version": {
+      "type": "string"
+    },
+    "recipe_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "evidence_status": {
+      "type": "string"
+    },
+    "target_claim": {},
+    "conclusion_layer": {
+      "type": "string"
+    },
+    "surface_fact_ids": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "applied_transforms": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "target_error_taxonomy": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "required_reasoning_output": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "preserved_parent_obligations": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "operator_payload": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "surface_leakage_risks": {
+      "type": ["object", "array"]
+    },
+    "answer_contract": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "answer_contract_resolution": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "operator_envelope": {
+      "$ref": "operator_envelope.schema.json"
+    },
     "target_subclaim": {
       "type": "string"
     },

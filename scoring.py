@@ -458,14 +458,52 @@ def normalize_item_scores(item_scores: Any, rubric: List[Dict[str, Any]]) -> Tup
         if not isinstance(brief_reason, str):
             brief_reason = str(brief_reason)
 
-        normalized_scores.append({
+        normalized_item = {
             "title": title,
             "weight": weight,
             "awarded": awarded,
             "brief_reason": brief_reason.strip()
-        })
+        }
+        for field in ("operator_axis_id", "answer_contract_id"):
+            value = rubric_item.get(field)
+            if isinstance(value, str) and value.strip():
+                normalized_item[field] = value.strip()
+        normalized_scores.append(normalized_item)
 
     return normalized_scores, total_awarded
+
+
+def aggregate_axis_scores(
+    item_scores: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    aggregated: Dict[str, Dict[str, Any]] = {}
+    for item in item_scores:
+        axis_id = str(item.get("operator_axis_id") or "").strip()
+        if not axis_id:
+            continue
+        current = aggregated.setdefault(
+            axis_id,
+            {
+                "operator_axis_id": axis_id,
+                "answer_contract_ids": [],
+                "awarded": 0,
+                "possible": 0,
+                "item_count": 0,
+            },
+        )
+        contract_id = str(item.get("answer_contract_id") or "").strip()
+        if contract_id and contract_id not in current["answer_contract_ids"]:
+            current["answer_contract_ids"].append(contract_id)
+        current["awarded"] += int(item.get("awarded", 0) or 0)
+        current["possible"] += max(0, int(item.get("weight", 0) or 0))
+        current["item_count"] += 1
+    for current in aggregated.values():
+        current["score_rate"] = (
+            current["awarded"] / current["possible"]
+            if current["possible"] > 0
+            else None
+        )
+    return aggregated
 
 
 def build_scoring_prompt(score_prompt: str, answer_text: str) -> str:
@@ -768,6 +806,7 @@ class ScoringProcessor:
             "repeat_index": repeat_index,
             "judge_model": judge_model,
             "item_scores": normalized_item_scores,
+            "axis_scores": aggregate_axis_scores(normalized_item_scores),
             "overall_comment": str(parsed.get("overall_comment", "")).strip(),
             "total_awarded": total_awarded,
             "total_possible": total_possible,
@@ -886,6 +925,9 @@ class ScoringProcessor:
             "gpt_score_mean": statistics.fmean(gpt_rates) if gpt_rates else None,
             # Legacy-compatible projection for Round 0 and callers that score one answer.
             "item_scores": deepcopy(representative_qwen["item_scores"]),
+            "axis_scores": aggregate_axis_scores(
+                deepcopy(representative_qwen["item_scores"])
+            ),
             "overall_comment": representative_qwen["overall_comment"],
             "total_awarded": statistics.fmean(qwen_rates) * representative_qwen["total_possible"],
             "total_possible": representative_qwen["total_possible"],
@@ -957,6 +999,9 @@ class ScoringProcessor:
             "answer_model": representative["answer_model"],
             "candidate_answer": representative["candidate_answer"],
             "item_scores": deepcopy(representative_qwen["item_scores"]),
+            "axis_scores": aggregate_axis_scores(
+                deepcopy(representative_qwen["item_scores"])
+            ),
             "overall_comment": representative_qwen["overall_comment"],
             "total_awarded": overall_qwen_mean * total_possible,
             "total_possible": total_possible,

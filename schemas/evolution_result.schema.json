@@ -15,6 +15,36 @@
     "ability_axis": {
       "type": "string"
     },
+    "operator_envelope": {
+      "$ref": "operator_envelope.schema.json"
+    },
+    "target_claim": {},
+    "conclusion_layer": {
+      "type": "string"
+    },
+    "surface_fact_ids": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "applied_transforms": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "operator_payload": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "surface_leakage_risks": {
+      "type": ["object", "array"]
+    },
+    "answer_contract": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "answer_contract_resolution": {
+      "type": "object",
+      "additionalProperties": true
+    },
     "target_subclaim": {
       "type": "string"
     },

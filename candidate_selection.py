@@ -251,31 +251,18 @@ def validation_quality_score(item: Dict[str, Any]) -> float:
     validation = validation_result(item)
     if not validation.get("passed"):
         return 0.0
-    score = 0.50
-    main_axis_count = int(validation.get("main_axis_count", 1) or 0)
-    prompt_chars = int(validation.get("estimated_prompt_chars", len(_clean_text(item.get("prompt")))) or 0)
-    output_tasks = int(validation.get("output_tasks_count", 1) or 0)
-    candidate_options = int(validation.get("candidate_options_count", 0) or 0)
-    counterfactuals = int(validation.get("counterfactual_count", 0) or 0)
-
-    if main_axis_count == 1:
-        score += 0.12
-    if 120 <= prompt_chars <= 900:
+    # Prompt length, task count, candidate count, main-axis count and
+    # counterfactual count are record-only under operator_validation_v2.  They
+    # must not influence admission, ranking or retry.
+    score = 0.75
+    if validation.get("contract_mode") == "v2":
+        score += 0.15
+    if _clean_text(validation.get("release_status")) == "eligible":
         score += 0.10
-    elif prompt_chars <= 1200:
-        score += 0.04
-    if output_tasks <= 1:
-        score += 0.08
-    if candidate_options <= 2:
-        score += 0.04
-    if counterfactuals == 0:
-        score += 0.03
     for field in ("external_knowledge_risk", "format_difficulty_risk", "repeat_pattern_risk"):
         risk = _clean_text(validation.get(field))
-        if risk == "low":
-            score += 0.03
-        elif risk == "high":
-            score -= 0.10
+        if risk == "high":
+            score -= 0.05
     return max(0.0, min(1.0, round(score, 4)))
 
 
@@ -288,14 +275,10 @@ def legacy_score_candidate(item: Dict[str, Any]) -> Tuple[float, List[str]]:
     score = 100.0
     quality = validation_quality_score(item)
     score += quality * 40
-    if validation.get("main_axis_count") == 1:
-        reasons.append("single main axis")
-    if validation.get("output_tasks_count", 1) <= 1:
-        reasons.append("single output task")
-    if validation.get("candidate_options_count", 0) <= 2:
-        reasons.append("limited candidate options")
-    if validation.get("counterfactual_count", 0) == 0:
-        reasons.append("no counterfactual complexity")
+    if validation.get("contract_mode") == "v2":
+        reasons.append("versioned operator contract")
+    if _clean_text(validation.get("release_status")) == "eligible":
+        reasons.append("no deterministic or diagnostic release finding")
     score += _risk_penalty(validation, "external_knowledge_risk")
     score += _risk_penalty(validation, "format_difficulty_risk")
     score += _risk_penalty(validation, "repeat_pattern_risk")
@@ -685,14 +668,21 @@ def _sync_operator_metadata(
     metadata = meta_info.get("question_evolution_metadata")
     metadata = dict(metadata) if isinstance(metadata, dict) else {}
     metadata["operator_used"] = operator_used
+    envelope = metadata.get("operator_envelope")
+    if isinstance(envelope, dict):
+        envelope = dict(envelope)
+        envelope["selected_operator_id"] = operator_used
+        metadata["operator_envelope"] = envelope
     if question_evolved is not None:
         metadata["question_evolved"] = question_evolved
     meta_info["question_evolution_metadata"] = metadata
     result["meta_info"] = meta_info
     if operator_used:
         result["candidate_operator"] = operator_used
+        result["selected_operator_id"] = operator_used
     else:
         result.pop("candidate_operator", None)
+        result.pop("selected_operator_id", None)
         result.pop("operator_used", None)
     return result
 
