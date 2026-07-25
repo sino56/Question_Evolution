@@ -9,18 +9,6 @@ import time
 from typing import Any, Dict, List, Optional
 
 from prompts.operators import build_operator_prompt, get_operator_spec
-from operator_contracts import (
-    ELIGIBLE,
-    OPERATOR_SPACE_EXHAUSTED,
-    build_candidate_envelope,
-    enabled_generation_operator_ids,
-    evaluate_operator_applicability,
-    get_operator_contract,
-)
-from answer_contract_resolver import (
-    build_blind_solver_prompt,
-    resolve_answer_contract_hypotheses,
-)
 from select_evolution_candidates import (
     EVOLVE_HIGH_SCORE_OVERSCORE,
     PASS_THROUGH_OR_SCORING_NOISE,
@@ -624,19 +612,6 @@ def parse_evolution_response(response_text: str) -> Dict[str, Any]:
     raise ValueError(f"无法解析有效 question evolution JSON: {last_error}")
 
 
-def parse_json_object_response(response_text: str, *, label: str) -> Dict[str, Any]:
-    last_error: Optional[Exception] = None
-    for candidate in collect_json_candidate_texts(response_text):
-        try:
-            parsed = loads_json_with_repair(candidate)
-            if not isinstance(parsed, dict):
-                raise ValueError(f"{label} response must be a JSON object")
-            return parsed
-        except Exception as exc:
-            last_error = exc
-    raise ValueError(f"无法解析 {label} JSON: {last_error}")
-
-
 def validate_evolved_question(original_prompt: str, evolved_prompt: str) -> None:
     if not evolved_prompt or not evolved_prompt.strip():
         raise ValueError("进化后的问题不能为空")
@@ -772,40 +747,6 @@ def get_overscore_diagnosis(item: Dict[str, Any]) -> Dict[str, Any]:
     return diagnosis if isinstance(diagnosis, dict) else {}
 
 
-def get_fact_ledger(item: Dict[str, Any]) -> List[Dict[str, Any]]:
-    ledger = item.get("fact_ledger")
-    if isinstance(ledger, list):
-        return [dict(fact) for fact in ledger if isinstance(fact, dict)]
-    meta_info = item.get("meta_info")
-    if isinstance(meta_info, dict):
-        ledger = meta_info.get("fact_ledger")
-        if isinstance(ledger, list):
-            return [dict(fact) for fact in ledger if isinstance(fact, dict)]
-    return []
-
-
-def get_operator_manifest(
-    item: Dict[str, Any],
-    operator_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    sources: List[Any] = [item.get("operator_manifest")]
-    meta_info = item.get("meta_info")
-    if isinstance(meta_info, dict):
-        manifests = meta_info.get("operator_manifests")
-        if operator_id and isinstance(manifests, dict):
-            sources.append(manifests.get(operator_id))
-        sources.extend(
-            [
-                meta_info.get("operator_manifest"),
-                meta_info.get("qualification_manifest"),
-            ]
-        )
-    for source in sources:
-        if isinstance(source, dict):
-            return dict(source)
-    return {}
-
-
 def resolve_operator_id(item: Dict[str, Any]) -> str:
     action = get_evolution_action(item)
     if action not in EVOLUTION_REQUIRED_ACTIONS:
@@ -867,105 +808,8 @@ def resolve_candidate_operator_ids(item: Dict[str, Any], max_candidates: int) ->
     return candidates
 
 
-class OperatorSpaceExhaustedError(ValueError):
-    def __init__(self, attempts: List[Dict[str, Any]]):
-        self.attempts = [dict(attempt) for attempt in attempts]
-        details = "; ".join(
-            f"{attempt.get('operator_id')}={attempt.get('status')}"
-            for attempt in self.attempts
-        )
-        super().__init__(
-            f"{OPERATOR_SPACE_EXHAUSTED}: all enabled operators were inapplicable"
-            + (f" ({details})" if details else "")
-        )
-
-
-def resolve_operator_plan(
-    item: Dict[str, Any],
-    max_candidates: int,
-    *,
-    strict_contracts: bool,
-    qualification_operator_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    if qualification_operator_id:
-        get_operator_spec(qualification_operator_id)
-        applicability = evaluate_operator_applicability(
-            item,
-            qualification_operator_id,
-            allow_disabled=True,
-        )
-        attempt = dict(applicability)
-        if applicability.get("status") != ELIGIBLE:
-            raise OperatorSpaceExhaustedError([attempt])
-        attempt["candidate_budget_consumed"] = True
-        return {
-            "operator_ids": [qualification_operator_id],
-            "applicability_attempts": [attempt],
-            "qualification_mode": True,
-            "fallback_disabled": True,
-        }
-    if not strict_contracts:
-        operator_ids = resolve_candidate_operator_ids(item, max_candidates)
-        return {
-            "operator_ids": operator_ids,
-            "applicability_attempts": [
-                {
-                    "operator_id": operator_id,
-                    "status": ELIGIBLE,
-                    "reason": "legacy compatibility mode",
-                    "candidate_budget_consumed": True,
-                }
-                for operator_id in operator_ids
-            ],
-        }
-
-    if max_candidates < 1:
-        raise ValueError("--num-candidates 必须大于等于 1")
-    route = get_operator_route(item)
-    if not route:
-        raise ValueError("缺少 operator_route；请先运行 operator_router.py")
-    avoid = {
-        str(operator).strip()
-        for operator in route.get("avoid_operators", [])
-        if isinstance(operator, str) and operator.strip()
-    }
-    ordered: List[str] = []
-    for operator_id in (
-        [route.get("primary_operator")]
-        + list(route.get("backup_operators", []))
-        + list(enabled_generation_operator_ids())
-    ):
-        if (
-            isinstance(operator_id, str)
-            and operator_id.strip()
-            and operator_id.strip() not in avoid
-            and operator_id.strip() not in ordered
-        ):
-            ordered.append(operator_id.strip())
-
-    attempts: List[Dict[str, Any]] = []
-    eligible: List[str] = []
-    for operator_id in ordered:
-        applicability = evaluate_operator_applicability(item, operator_id)
-        attempt = dict(applicability)
-        if applicability.get("status") == ELIGIBLE:
-            attempt["candidate_budget_consumed"] = True
-            eligible.append(operator_id)
-        attempts.append(attempt)
-        if len(eligible) >= max_candidates:
-            break
-    if not eligible:
-        raise OperatorSpaceExhaustedError(attempts)
-    return {
-        "operator_ids": eligible,
-        "applicability_attempts": attempts,
-    }
-
-
 def classify_generation_failure(error: Exception) -> str:
     error_text = str(error)
-    if isinstance(error, OperatorSpaceExhaustedError) or OPERATOR_SPACE_EXHAUSTED in error_text:
-        return OPERATOR_SPACE_EXHAUSTED
     no_operator_markers = (
         "operator_route",
         "primary_operator",
@@ -1046,18 +890,11 @@ def make_passthrough_candidate_record(
 
 def make_generation_failure_passthrough_record(item: Dict[str, Any], error: Exception) -> Dict[str, Any]:
     status = classify_generation_failure(error)
-    result = make_passthrough_record(
+    return make_passthrough_record(
         item,
         generation_status=status,
         failure_reason=str(error),
     )
-    if isinstance(error, OperatorSpaceExhaustedError):
-        result["operator_space_exhausted"] = {
-            "status": OPERATOR_SPACE_EXHAUSTED,
-            "applicability_attempts": error.attempts,
-            "parent_preserved": True,
-        }
-    return result
 
 
 def make_generation_failure_passthrough_candidate_record(
@@ -1066,21 +903,12 @@ def make_generation_failure_passthrough_candidate_record(
     error: Exception,
 ) -> Dict[str, Any]:
     status = classify_generation_failure(error)
-    result = make_passthrough_candidate_record(
+    return make_passthrough_candidate_record(
         item,
         requested_candidates,
         generation_status=status,
         failure_reason=str(error),
     )
-    if isinstance(error, OperatorSpaceExhaustedError):
-        exhaustion = {
-            "status": OPERATOR_SPACE_EXHAUSTED,
-            "applicability_attempts": error.attempts,
-            "parent_preserved": True,
-        }
-        result["operator_space_exhausted"] = exhaustion
-        result["candidate_generation"]["applicability_attempts"] = error.attempts
-    return result
 
 
 def should_evolve(item: Dict[str, Any], min_score_rate: float) -> bool:
@@ -1148,8 +976,6 @@ def build_evolution_prompt(
             overscore_diagnosis=get_overscore_diagnosis(item),
             evolution_state=get_evolution_state(item),
             operator_route=get_operator_route(item),
-            operator_manifest=get_operator_manifest(item, operator_id),
-            fact_ledger=get_fact_ledger(item),
         )
         return append_validation_retry_instruction(user_prompt, validation_reject_reason)
 
@@ -1212,8 +1038,6 @@ def enrich_evolution_result_with_operator(
     evolved: Dict[str, Any],
     item: Dict[str, Any],
     operator_id: str,
-    *,
-    require_blind_resolution: bool = False,
 ) -> Dict[str, Any]:
     spec = get_operator_spec(operator_id)
     route = get_operator_route(item)
@@ -1234,17 +1058,6 @@ def enrich_evolution_result_with_operator(
         enriched.get("expected_evaluation_focus", enriched.get("evaluation_focus"))
     ):
         enriched["expected_evaluation_focus"] = list(spec.default_evaluation_focus)
-    envelope = build_candidate_envelope(
-        enriched,
-        operator_id=operator_id,
-        source_record=item,
-        operator_manifest=get_operator_manifest(item, operator_id),
-        require_blind_resolution=require_blind_resolution,
-    )
-    enriched["operator_envelope"] = envelope
-    # Keep the shared fields directly available for existing downstream
-    # consumers while preserving the complete, versioned envelope as a unit.
-    enriched.update(envelope)
     return enriched
 
 
@@ -1306,34 +1119,10 @@ def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rat
         "target_subclaim",
         "boundary_hypothesis",
         "expected_qwen_failure",
-        "semantic_version",
-        "prompt_version",
-        "applicability_version",
-        "validation_policy_version",
-        "recipe_hash",
-        "evidence_status",
-        "target_claim",
-        "conclusion_layer",
     ):
         value = evolved.get(field)
         if isinstance(value, str) and value.strip():
             metadata[field] = value.strip()
-
-    for field in (
-        "target_error_taxonomy",
-        "required_reasoning_output",
-        "preserved_parent_obligations",
-        "surface_fact_ids",
-        "applied_transforms",
-        "operator_payload",
-        "surface_leakage_risks",
-        "answer_contract",
-        "answer_contract_resolution",
-        "operator_envelope",
-    ):
-        value = evolved.get(field)
-        if isinstance(value, (dict, list)):
-            metadata[field] = value
 
     complexity_budget = evolved.get("complexity_budget")
     if isinstance(complexity_budget, dict):
@@ -1364,7 +1153,6 @@ def make_evolved_candidate_record(
     candidate_index: int,
     requested_candidates: int,
     operator_id: Optional[str],
-    applicability_attempts: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     result = make_evolved_record(item, evolved, score_rate, model)
     group_id = get_candidate_group_id(item)
@@ -1373,7 +1161,6 @@ def make_evolved_candidate_record(
     result["candidate_group_id"] = group_id
     result["candidate_id"] = f"{group_id}::cand_{candidate_index}"
     result["candidate_operator"] = candidate_operator
-    result["selected_operator_id"] = candidate_operator
     if candidate_operator:
         meta_info = result.get("meta_info")
         meta_info = dict(meta_info) if isinstance(meta_info, dict) else {}
@@ -1381,26 +1168,14 @@ def make_evolved_candidate_record(
         metadata = dict(metadata) if isinstance(metadata, dict) else {}
         metadata["operator_used"] = candidate_operator
         metadata["question_evolved"] = True
-        envelope = metadata.get("operator_envelope")
-        if isinstance(envelope, dict):
-            envelope = dict(envelope)
-            envelope["candidate_group_id"] = group_id
-            envelope["candidate_id"] = result["candidate_id"]
-            envelope["selected_operator_id"] = candidate_operator
-            metadata["operator_envelope"] = envelope
         meta_info["question_evolution_metadata"] = metadata
         result["meta_info"] = meta_info
     result["candidate_generation"] = {
         "candidate_index": candidate_index,
         "num_candidates_requested": requested_candidates,
         "operator_id": operator_id,
-        "selected_operator_id": candidate_operator,
         "operator_source": "primary" if candidate_index == 1 else f"backup_{candidate_index - 1}",
     }
-    if applicability_attempts is not None:
-        result["candidate_generation"]["applicability_attempts"] = [
-            dict(attempt) for attempt in applicability_attempts
-        ]
     return result
 
 
@@ -1416,9 +1191,6 @@ class QuestionEvolutionProcessor:
         num_candidates: int = 1,
         max_validation_retries: int = DEFAULT_MAX_VALIDATION_RETRIES,
         max_candidate_budget: int = 0,
-        strict_operator_contracts: bool = False,
-        enable_blind_solver: bool = False,
-        qualification_operator_id: Optional[str] = None,
     ):
         self.client = client
         self.model = model
@@ -1430,29 +1202,6 @@ class QuestionEvolutionProcessor:
         self.num_candidates = num_candidates
         self.max_validation_retries = max(0, max_validation_retries)
         self.max_candidate_budget = max_candidate_budget
-        self.strict_operator_contracts = bool(strict_operator_contracts)
-        self.enable_blind_solver = bool(enable_blind_solver)
-        self.qualification_operator_id = qualification_operator_id
-
-    async def solve_blind(
-        self,
-        item: Dict[str, Any],
-        evolved: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        blind_prompt = build_blind_solver_prompt(
-            evolved_prompt=str(evolved.get("evolved_prompt") or ""),
-            fact_ledger=get_fact_ledger(item),
-        )
-        response = await self.client.chat_completions_create(
-            model=self.model,
-            messages=[{"role": "user", "content": blind_prompt}],
-            temperature=0,
-            max_tokens=4096,
-        )
-        return parse_json_object_response(
-            extract_answer(response),
-            label="blind solver",
-        )
 
     async def evolve_once(
         self,
@@ -1481,30 +1230,7 @@ class QuestionEvolutionProcessor:
         content = extract_answer(response)
         evolved = parse_evolution_response(content)
         if operator_id:
-            if self.enable_blind_solver:
-                blind_result = await self.solve_blind(item, evolved)
-                resolution = resolve_answer_contract_hypotheses(
-                    target_claim=evolved.get("target_claim"),
-                    conclusion_layer=str(evolved.get("conclusion_layer") or ""),
-                    generator_answer_contract=evolved.get("answer_contract", {}),
-                    blind_solver_result=blind_result,
-                )
-                if resolution.get("status") != "resolved":
-                    raise ValueError(
-                        "blind solver disagrees with generator answer contract: "
-                        + ", ".join(resolution.get("conflict_fields") or [])
-                    )
-                evolved["answer_contract"] = resolution.pop(
-                    "resolved_answer_contract"
-                )
-                resolution["required"] = True
-                evolved["answer_contract_resolution"] = resolution
-            evolved = enrich_evolution_result_with_operator(
-                evolved,
-                item,
-                operator_id,
-                require_blind_resolution=self.strict_operator_contracts,
-            )
+            evolved = enrich_evolution_result_with_operator(evolved, item, operator_id)
         evolved["question_evolution_raw_response"] = content
         return evolved
 
@@ -1584,16 +1310,7 @@ class QuestionEvolutionProcessor:
 
             score_rate = get_score_rate(item)
             try:
-                operator_id = None
-                if uses_stage_action_contract(item) and self.strict_operator_contracts:
-                    plan = resolve_operator_plan(
-                        item,
-                        1,
-                        strict_contracts=True,
-                        qualification_operator_id=self.qualification_operator_id,
-                    )
-                    operator_id = plan["operator_ids"][0]
-                evolved = await self.evolve_with_retry(item, operator_id=operator_id)
+                evolved = await self.evolve_with_retry(item)
                 return make_evolved_record(item, evolved, score_rate, self.model)
             except Exception as e:
                 logger.error(
@@ -1615,17 +1332,9 @@ class QuestionEvolutionProcessor:
             score_rate = get_score_rate(item)
             try:
                 if uses_stage_action_contract(item):
-                    plan = resolve_operator_plan(
-                        item,
-                        candidate_count,
-                        strict_contracts=self.strict_operator_contracts,
-                        qualification_operator_id=self.qualification_operator_id,
-                    )
-                    operator_ids = plan["operator_ids"]
-                    applicability_attempts = plan["applicability_attempts"]
+                    operator_ids = resolve_candidate_operator_ids(item, candidate_count)
                 else:
                     operator_ids = [None]
-                    applicability_attempts = []
             except Exception as e:
                 logger.error(
                     f"候选算子解析失败，改为透传 index={item.get('index')} "
@@ -1647,7 +1356,6 @@ class QuestionEvolutionProcessor:
                             candidate_index=candidate_index,
                             requested_candidates=candidate_count,
                             operator_id=operator_id,
-                            applicability_attempts=applicability_attempts,
                         )
                     )
                 except Exception as e:
@@ -1756,8 +1464,6 @@ class QuestionEvolutionProcessor:
             "num_candidates": self.num_candidates,
             "max_candidate_budget": self.max_candidate_budget,
             "validation_retries": self.max_validation_retries,
-            "strict_operator_contracts": self.strict_operator_contracts,
-            "enable_blind_solver": self.enable_blind_solver,
         }
         valid, _ = validate_published_artifact(
             output_path,
@@ -1934,42 +1640,6 @@ async def main():
         default=DEFAULT_MAX_VALIDATION_RETRIES,
         help="候选题未通过 validate_evolved_question 规则校验时，使用同一 operator 带 reject_reason 重试的次数"
     )
-    parser.add_argument(
-        "--forced-qualification-operator",
-        default=None,
-        help=(
-            "Force one qualification-only operator for every candidate record. "
-            "The selected operator is never replaced by a fallback."
-        ),
-    )
-    contract_mode = parser.add_mutually_exclusive_group()
-    contract_mode.add_argument(
-        "--strict-operator-contracts",
-        dest="strict_operator_contracts",
-        action="store_true",
-        help="Require fact-ledger/operator-manifest applicability before generation (default).",
-    )
-    contract_mode.add_argument(
-        "--allow-legacy-operator-fallback",
-        dest="strict_operator_contracts",
-        action="store_false",
-        help="Compatibility mode for historical records without operator manifests.",
-    )
-    parser.set_defaults(strict_operator_contracts=True)
-    blind_mode = parser.add_mutually_exclusive_group()
-    blind_mode.add_argument(
-        "--enable-blind-solver",
-        dest="enable_blind_solver",
-        action="store_true",
-        help="Resolve generator answers with an independent blind solve before freezing the contract (default).",
-    )
-    blind_mode.add_argument(
-        "--disable-blind-solver",
-        dest="enable_blind_solver",
-        action="store_false",
-        help="Legacy/debug mode only; incompatible with strict operator contracts.",
-    )
-    parser.set_defaults(enable_blind_solver=True)
     args = parser.parse_args()
 
     if args.min_score_rate < 0 or args.min_score_rate > 1:
@@ -1978,10 +1648,6 @@ async def main():
         raise ValueError("--num-candidates 必须在 [1, 4] 之间")
     if args.validation_retries < 0 or args.validation_retries > 1:
         raise ValueError("--validation-retries 当前只允许 0 或 1，避免无限修正循环")
-    if args.strict_operator_contracts and not args.enable_blind_solver:
-        raise ValueError("strict operator contracts require the independent blind solver")
-    if args.forced_qualification_operator:
-        get_operator_spec(args.forced_qualification_operator)
 
     if not args.output:
         base, ext = os.path.splitext(args.input)
@@ -2004,9 +1670,6 @@ async def main():
         num_candidates=args.num_candidates,
         max_validation_retries=args.validation_retries,
         max_candidate_budget=args.max_candidate_budget,
-        strict_operator_contracts=args.strict_operator_contracts,
-        enable_blind_solver=args.enable_blind_solver,
-        qualification_operator_id=args.forced_qualification_operator,
     )
 
     try:
@@ -2020,13 +1683,10 @@ async def main():
                 "concurrency": args.concurrency,
                 "retries": args.retries,
                 "min_score_rate": args.min_score_rate,
-                "forced_qualification_operator": args.forced_qualification_operator,
                 "prompt_version": args.prompt_version,
                 "num_candidates": args.num_candidates,
                 "max_candidate_budget": args.max_candidate_budget,
                 "validation_retries": args.validation_retries,
-                "strict_operator_contracts": args.strict_operator_contracts,
-                "enable_blind_solver": args.enable_blind_solver,
             },
         )
     finally:

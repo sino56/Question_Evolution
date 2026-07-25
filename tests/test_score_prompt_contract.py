@@ -1,7 +1,6 @@
 import sys
 import types
 import importlib.util
-import pytest
 from pathlib import Path
 
 
@@ -69,49 +68,7 @@ def test_item_score_title_matching_tolerates_quote_style_drift():
     assert normalized_scores[0]["title"] == "法律研判深度与“排除合理怀疑”原则"
 
 
-def test_rubric_alignment_must_match_frozen_answer_contract():
-    install_dependency_stubs()
-    from gen_rubric import (
-        build_user_prompt,
-        validate_rubric_answer_contract_alignment,
-    )
-
-    answer_contract = {
-        "answer_contract_hash": "a" * 64,
-        "target_claim": {"claim_id": "C1"},
-        "conclusion_layer": "overall_claim",
-        "answer_key": {"claim_level_effect": "local_link_broken_overall_supported"},
-        "decisive_fact_ids": ["F2", "F3"],
-    }
-    prompt = build_user_prompt(
-        "问题",
-        ["参考答案"],
-        answer_contract=answer_contract,
-        scorer_mapping={"rubric_fields": ["claim_level_effect"]},
-    )
-    assert "冻结答案契约" in prompt
-    assert answer_contract["answer_contract_hash"] in prompt
-
-    aligned = {
-        field: answer_contract[field]
-        for field in (
-            "answer_contract_hash",
-            "target_claim",
-            "conclusion_layer",
-            "answer_key",
-            "decisive_fact_ids",
-        )
-    }
-    assert validate_rubric_answer_contract_alignment(aligned, answer_contract)["status"] == "aligned"
-
-    conflicting = dict(aligned)
-    conflicting["conclusion_layer"] = "local_link"
-    with pytest.raises(ValueError, match="conclusion_layer"):
-        validate_rubric_answer_contract_alignment(conflicting, answer_contract)
-
-
 if __name__ == "__main__":
     test_score_prompt_placeholder_contract_is_shared()
     test_item_score_title_matching_tolerates_quote_style_drift()
-    test_rubric_alignment_must_match_frozen_answer_contract()
     print("score prompt placeholder contract checks passed")

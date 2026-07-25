@@ -12,15 +12,6 @@ from local_api_config import get_config_list, get_config_value
 from prompts.validation_prompt import build_validation_prompt
 from schema_validation import validate_records_against_schema
 from pipeline_runtime import StageMetrics, load_json_records, publish_records
-from operator_contracts import (
-    DIAGNOSTIC_RISK,
-    ELIGIBLE,
-    REJECT_CANDIDATE,
-    collect_referenced_fact_ids,
-    extract_fact_ledger,
-    get_operator_contract,
-    validate_candidate_envelope,
-)
 
 
 FORMAT_DIFFICULTY_TERMS = (
@@ -67,8 +58,6 @@ def local_validation_rule_version(
     max_counterfactuals: int = 1,
 ) -> str:
     payload = {
-        "validation_policy_version": "operator_validation_v2",
-        "quantity_fields_policy": "record_only",
         "format_difficulty_terms": FORMAT_DIFFICULTY_TERMS,
         "external_knowledge_terms": EXTERNAL_KNOWLEDGE_TERMS,
         "counterfactual_terms": COUNTERFACTUAL_TERMS,
@@ -204,28 +193,36 @@ def merge_llm_validation_result(
         result.setdefault("format_difficulty_dominant", result.get("format_difficulty_risk") == "high")
         return result
 
-    diagnostics = list(result.get("diagnostics") or [])
+    reject_reasons = list(result.get("reject_reasons") or [])
+    invalid_type = result.get("invalid_type")
 
     if normalized.get("main_axis_clear") is False:
-        diagnostics.append("LLM 校验认为主轴不清晰")
+        reject_reasons.append("LLM 校验认为主轴不清晰")
+        invalid_type = invalid_type or "multi_axis"
     if normalized.get("answerable") is False:
-        diagnostics.append("LLM 校验认为题目不可回答")
+        reject_reasons.append("LLM 校验认为题目不可回答")
+        invalid_type = invalid_type or "unanswerable"
     if normalized.get("external_knowledge_required") is True:
-        diagnostics.append("LLM 校验认为需要题干外知识")
+        reject_reasons.append("LLM 校验认为需要题干外知识")
+        invalid_type = invalid_type or "external_knowledge_required"
     if normalized.get("repeated_pattern_with_previous_round") is True:
-        diagnostics.append("LLM 校验认为与上一轮题型重复")
+        reject_reasons.append("LLM 校验认为与上一轮题型重复")
+        invalid_type = invalid_type or "repeated_pattern"
     if normalized.get("format_difficulty_dominant") is True:
-        diagnostics.append("LLM 校验认为难度主要来自格式复杂度")
+        reject_reasons.append("LLM 校验认为难度主要来自格式复杂度")
+        invalid_type = invalid_type or "format_difficulty_dominant"
 
     llm_reject_reason = _clean_text(normalized.get("reject_reason"))
-    if llm_reject_reason and llm_reject_reason not in diagnostics:
-        diagnostics.append(llm_reject_reason)
+    if llm_reject_reason and llm_reject_reason not in reject_reasons:
+        reject_reasons.append(llm_reject_reason)
 
+    passed = not reject_reasons
     result.update(normalized)
-    result["diagnostics"] = diagnostics
-    if result.get("passed") is True and diagnostics:
-        result["release_status"] = DIAGNOSTIC_RISK
-    if result.get("passed") is True and normalized.get("llm_validation_reason"):
+    result["passed"] = passed
+    result["reject_reasons"] = reject_reasons
+    result["reject_reason"] = None if passed else "；".join(reject_reasons)
+    result["invalid_type"] = None if passed else invalid_type or "llm_validation_failed"
+    if passed and normalized.get("llm_validation_reason"):
         result["why_passed"] = normalized["llm_validation_reason"]
     return result
 
@@ -394,157 +391,6 @@ def detect_repeat_pattern_risk(item: Dict[str, Any], prompt: str) -> Tuple[str, 
     return "low", None
 
 
-def _operator_envelope(item: Dict[str, Any]) -> Dict[str, Any]:
-    envelope = _metadata(item).get("operator_envelope")
-    return dict(envelope) if isinstance(envelope, dict) else {}
-
-
-def _fact_type(fact: Dict[str, Any]) -> str:
-    return _clean_text(fact.get("fact_type") or fact.get("type")).lower()
-
-
-def information_closure_findings(
-    item: Dict[str, Any],
-    envelope: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    if not envelope:
-        return []
-    findings: List[Dict[str, Any]] = []
-    ledger = extract_fact_ledger(item)
-    ledger_by_id = {
-        _clean_text(fact.get("fact_id")): fact
-        for fact in ledger
-        if _clean_text(fact.get("fact_id"))
-    }
-    referenced_ids = collect_referenced_fact_ids(
-        {
-            "surface_fact_ids": envelope.get("surface_fact_ids"),
-            "operator_payload": envelope.get("operator_payload"),
-            "answer_contract": envelope.get("answer_contract"),
-            "axis_assignments": envelope.get("axis_assignments"),
-            "axis_answer_contracts": envelope.get("axis_answer_contracts"),
-        }
-    )
-    for fact_id in envelope.get("surface_fact_ids", []):
-        if isinstance(fact_id, str) and fact_id.strip() and fact_id.strip() not in referenced_ids:
-            referenced_ids.append(fact_id.strip())
-    for fact_id in referenced_ids:
-        if fact_id not in ledger_by_id:
-            findings.append(
-                {
-                    "code": "unmapped_fact_id",
-                    "severity": "blocking",
-                    "fact_id": fact_id,
-                    "message": f"fact ID {fact_id} is not present in the fact ledger",
-                }
-            )
-            continue
-        fact = ledger_by_id[fact_id]
-        if _fact_type(fact) in {"example", "suggestion", "external_knowledge"}:
-            findings.append(
-                {
-                    "code": "forbidden_fact_type_promoted",
-                    "severity": "blocking",
-                    "fact_id": fact_id,
-                    "message": f"fact ID {fact_id} uses forbidden type {_fact_type(fact)}",
-                }
-            )
-
-    operator_id = _clean_text(envelope.get("operator_id"))
-    if operator_id:
-        try:
-            contract = get_operator_contract(operator_id)
-        except ValueError:
-            contract = None
-        transforms = envelope.get("applied_transforms")
-        if contract and isinstance(transforms, list):
-            allowed = set(contract.transformation_contract.get("allowed_transforms", []))
-            for transform in transforms:
-                if _clean_text(transform) not in allowed:
-                    findings.append(
-                        {
-                            "code": "unauthorized_transform",
-                            "severity": "blocking",
-                            "transform": transform,
-                            "message": f"transform {transform!r} is not authorized by the operator contract",
-                        }
-                    )
-    return findings
-
-
-def _answer_key_payload_conflicts(envelope: Dict[str, Any]) -> List[str]:
-    payload = envelope.get("operator_payload")
-    answer_contract = envelope.get("answer_contract")
-    if not isinstance(payload, dict) or not isinstance(answer_contract, dict):
-        return []
-    answer_key = answer_contract.get("answer_key")
-    if not isinstance(answer_key, dict):
-        return []
-    operator_id = _clean_text(envelope.get("operator_id"))
-    try:
-        fields = get_operator_contract(operator_id).scorer_mapping.get("rubric_fields", [])
-    except ValueError:
-        fields = []
-    conflicts = []
-    for field in fields:
-        if field in answer_key and field in payload and answer_key[field] != payload[field]:
-            conflicts.append(
-                f"answer_contract.answer_key.{field} conflicts with operator_payload.{field}"
-            )
-    return conflicts
-
-
-def contract_release_validation(item: Dict[str, Any]) -> Dict[str, Any]:
-    envelope = _operator_envelope(item)
-    if not envelope:
-        return {
-            "contract_mode": "legacy",
-            "deterministic_errors": [],
-            "diagnostics": ["legacy candidate has no operator_envelope"],
-            "information_closure_findings": [],
-        }
-
-    deterministic_errors = validate_candidate_envelope(
-        envelope,
-        operator_id=_current_operator(item) or None,
-    )
-    deterministic_errors.extend(_answer_key_payload_conflicts(envelope))
-    findings = information_closure_findings(item, envelope)
-    deterministic_errors.extend(
-        finding["message"]
-        for finding in findings
-        if finding.get("severity") == "blocking"
-    )
-
-    operator_id = _clean_text(envelope.get("operator_id"))
-    payload = envelope.get("operator_payload")
-    payload = payload if isinstance(payload, dict) else {}
-    if operator_id == "O15_counterfactual_threshold_shift":
-        quantity = payload.get("comparison_quantity")
-        if not isinstance(quantity, str) or not quantity.strip():
-            deterministic_errors.append("O15 comparison_quantity must contain exactly one semantic quantity")
-        direction = _clean_text(payload.get("direction_or_order")).lower()
-        if direction in {"flip", "flipped", "reversed", "overall_reversal"} and payload.get("threshold_given") is not True:
-            deterministic_errors.append("O15 cannot force an overall reversal without an explicit threshold")
-
-    leakage = envelope.get("surface_leakage_risks")
-    diagnostics: List[str] = []
-    if isinstance(leakage, dict):
-        diagnostics.extend(
-            f"surface diagnostic: {name}"
-            for name, value in leakage.items()
-            if value is True
-        )
-    elif isinstance(leakage, list):
-        diagnostics.extend(f"surface diagnostic: {_clean_text(value)}" for value in leakage if _clean_text(value))
-    return {
-        "contract_mode": "v2",
-        "deterministic_errors": list(dict.fromkeys(deterministic_errors)),
-        "diagnostics": list(dict.fromkeys(diagnostics)),
-        "information_closure_findings": findings,
-    }
-
-
 def validate_record(
     item: Dict[str, Any],
     *,
@@ -597,9 +443,7 @@ def validate_record(
     format_risk = _risk_from_terms(prompt, FORMAT_DIFFICULTY_TERMS)
     repeat_risk, repeat_reason = detect_repeat_pattern_risk(item, prompt)
 
-    contract_validation = contract_release_validation(item)
-    reject_reasons: List[str] = list(contract_validation["deterministic_errors"])
-    diagnostics: List[str] = list(contract_validation["diagnostics"])
+    reject_reasons: List[str] = []
     invalid_type = None
     if not prompt:
         reject_reasons.append("进化题为空")
@@ -608,37 +452,33 @@ def validate_record(
         reject_reasons.append("进化题与原题完全相同")
         invalid_type = invalid_type or "repeated_original"
     if prompt_chars > max_prompt_chars:
-        diagnostics.append(f"record_only: 题长 {prompt_chars} 超过参考值 {max_prompt_chars}")
+        reject_reasons.append(f"题长 {prompt_chars} 超过上限 {max_prompt_chars}")
+        invalid_type = invalid_type or "invalid_complexity"
     if main_axis_count > 1:
-        diagnostics.append(f"record_only: 主轴数 {main_axis_count} 超过参考值 1")
+        reject_reasons.append(f"主轴数 {main_axis_count} 超过 1")
+        invalid_type = invalid_type or "multi_axis"
     if output_tasks_count > max_output_tasks:
-        diagnostics.append(f"record_only: 输出任务数 {output_tasks_count} 超过参考值 {max_output_tasks}")
+        reject_reasons.append(f"输出任务数 {output_tasks_count} 超过上限 {max_output_tasks}")
+        invalid_type = invalid_type or "too_many_tasks"
     if candidate_options_count > max_candidate_options:
-        diagnostics.append(f"record_only: 候选项数 {candidate_options_count} 超过参考值 {max_candidate_options}")
+        reject_reasons.append(f"候选项数 {candidate_options_count} 超过上限 {max_candidate_options}")
+        invalid_type = invalid_type or "too_many_options"
     if counterfactual_count > max_counterfactuals:
-        diagnostics.append(f"record_only: 反事实数 {counterfactual_count} 超过参考值 {max_counterfactuals}")
+        reject_reasons.append(f"反事实数 {counterfactual_count} 超过上限 {max_counterfactuals}")
+        invalid_type = invalid_type or "too_many_counterfactuals"
     if external_risk == "high":
-        diagnostics.append("surface diagnostic: 存在题外知识依赖风险")
+        reject_reasons.append("存在题外知识依赖风险")
+        invalid_type = invalid_type or "external_knowledge_required"
     if format_risk == "high":
-        diagnostics.append("surface diagnostic: 存在格式复杂度压分风险")
+        reject_reasons.append("存在格式复杂度压分风险")
+        invalid_type = invalid_type or "format_difficulty_dominant"
     if repeat_risk == "high":
-        diagnostics.append(repeat_reason or "surface diagnostic: 存在重复题型风险")
+        reject_reasons.append(repeat_reason or "存在重复题型风险")
+        invalid_type = invalid_type or "repeated_pattern"
 
     passed = not reject_reasons
-    release_status = (
-        REJECT_CANDIDATE
-        if reject_reasons
-        else DIAGNOSTIC_RISK
-        if diagnostics
-        else ELIGIBLE
-    )
     rule_result = {
         "passed": passed,
-        "release_status": release_status,
-        "contract_mode": contract_validation["contract_mode"],
-        "deterministic_errors": reject_reasons,
-        "diagnostics": list(dict.fromkeys(diagnostics)),
-        "information_closure_findings": contract_validation["information_closure_findings"],
         "main_axis_count": main_axis_count,
         "new_facts_count": new_facts_count,
         "output_tasks_count": output_tasks_count,
@@ -648,21 +488,10 @@ def validate_record(
         "external_knowledge_risk": external_risk,
         "format_difficulty_risk": format_risk,
         "repeat_pattern_risk": repeat_risk,
-        "record_only_metrics": {
-            "prompt_chars": prompt_chars,
-            "main_axis_count": main_axis_count,
-            "output_tasks_count": output_tasks_count,
-            "candidate_options_count": candidate_options_count,
-            "counterfactual_count": counterfactual_count,
-        },
-        "why_passed": (
-            "未发现确定性契约错误；数量字段和未校准概率性风险仅记录为诊断。"
-            if passed
-            else ""
-        ),
+        "why_passed": "主轴、题长、任务数、候选项、反事实、题外知识和重复题型均在预算内。" if passed else "",
         "reject_reason": None if passed else "；".join(reject_reasons),
         "reject_reasons": reject_reasons,
-        "invalid_type": None if passed else invalid_type or "operator_contract_violation",
+        "invalid_type": None if passed else invalid_type or "invalid_complexity",
     }
     result = merge_llm_validation_result(rule_result, llm_validation)
     result["local_validation_rule_version"] = rule_version

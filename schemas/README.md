@@ -63,14 +63,3 @@ writes low-risk Stage 5 entries after effect analysis: effective operator
 experience, failed operator experience, and invalid generation cases. Low
 confidence hits must keep `needs_manual_review=true` and must not be treated as
 strong success examples without review.
-
-## Operator Contracts
-
-`operator_contracts.py` owns the mechanism-level O10-O33 registry.
-`operator_envelope.schema.json` covers the versioned candidate envelope,
-one selected operator, per-axis payloads and frozen answer contracts.
-`scene_adapter.schema.json` covers the four-scenario metadata normalization
-boundary and explicitly excludes operator selection, answers and error
-taxonomy. Payload
-field completeness is validated in Python against the selected operator's
-semantic version because each operator intentionally has a distinct payload.

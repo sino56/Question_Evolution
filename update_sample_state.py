@@ -6,7 +6,6 @@ from collections import Counter
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from pipeline_runtime import StageMetrics, publish_records, sha256_file
-from operator_contracts import ENABLED, enabled_generation_operator_ids, get_operator_contract
 
 from analyze_evolution_effect import (
     get_metadata,
@@ -53,7 +52,6 @@ NEXT_OPERATOR_HINTS = {
     "O17_action_vs_fact_threshold": ["O11_unobserved_state_attribution", "O12_conjunctive_necessity"],
     "O18_baseline_scope_mismatch": ["O10_evidence_sufficiency_ladder", "O14_information_closure"],
 }
-ENABLED_NEXT_OPERATORS = set(enabled_generation_operator_ids())
 OPERATOR_SURFACE_FORM_FAMILY = {
     "O1_gap_choice": "evidence_relation_comparison",
     "O2_subclaim_localization": "fact_conclusion_support_review",
@@ -249,11 +247,7 @@ def _stop_status(
 def _recommended_next_methods(operator_used: str, label: str, full_score_count: int) -> List[str]:
     if label == "effective_boundary_probe":
         return []
-    hints = [
-        operator_id
-        for operator_id in NEXT_OPERATOR_HINTS.get(operator_used, [])
-        if operator_id in ENABLED_NEXT_OPERATORS
-    ]
+    hints = list(NEXT_OPERATOR_HINTS.get(operator_used, []))
     if full_score_count >= 2 and "O10_evidence_sufficiency_ladder" not in hints:
         hints.append("O10_evidence_sufficiency_ladder")
     return hints
@@ -510,20 +504,7 @@ def classify_memory_entries(
     for record in records:
         effect = _effect(record)
         label = _clean_text(effect.get("effect_label"))
-        operator_id = _clean_text(effect.get("operator_used")) or get_operator_used(record)
-        try:
-            formal_memory_eligible = (
-                not operator_id
-                or get_operator_contract(operator_id).status == ENABLED
-            )
-        except ValueError:
-            formal_memory_eligible = True
-        if (
-            label == "effective_boundary_probe"
-            and effect.get("complexity_passed")
-            and is_question_evolved(record)
-            and formal_memory_eligible
-        ):
+        if label == "effective_boundary_probe" and effect.get("complexity_passed") and is_question_evolved(record):
             operator_entries.append(build_operator_memory_entry(record))
         if label in FAILURE_EFFECT_LABELS and effect.get("complexity_passed") and is_question_evolved(record):
             failure_entries.append(build_failure_memory_entry(record))

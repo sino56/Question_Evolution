@@ -20,7 +20,6 @@ from select_evolution_candidates import process_records as select_evolution_reco
 from update_sample_state import update_records
 from validate_evolved_question import attach_validation_result
 from validate_difficulty_gain import validate_records_rule_only
-from operator_contract_test_utils import contract_fields_for_prompt
 
 
 class FakeMessage:
@@ -80,22 +79,20 @@ class FakeEvolutionClient:
                 "并说明另一个为什么不足或已被吸收。"
             )
             strategy = "O13 新增事实改变原评价"
-        payload = {
-            "evolved_prompt": evolved_prompt,
-            "evolution_strategy": strategy,
-            "complexity_budget": {
-                "main_axis_count": 1,
-                "new_facts_count": 1,
-                "output_tasks_count": 1,
-                "candidate_options_count": 2,
-                "counterfactual_count": 0,
-            },
-            "notes_for_reference": "需要围绕最小关键事实补充参考答案。",
-        }
-        payload.update(contract_fields_for_prompt(prompt))
         return FakeResponse(
             json.dumps(
-                payload,
+                {
+                    "evolved_prompt": evolved_prompt,
+                    "evolution_strategy": strategy,
+                    "complexity_budget": {
+                        "main_axis_count": 1,
+                        "new_facts_count": 1,
+                        "output_tasks_count": 1,
+                        "candidate_options_count": 2,
+                        "counterfactual_count": 0,
+                    },
+                    "notes_for_reference": "需要围绕最小关键事实补充参考答案。",
+                },
                 ensure_ascii=False,
             )
         )
@@ -123,11 +120,6 @@ def make_seed_record():
         "index": 801,
         "prompt": "原题：根据现有证据判断结论是否成立，并说明还缺什么关键事实。",
         "meta_info": {"references": ["参考答案应指出最小关键事实，而不是泛泛说证据不足。"]},
-        "fact_ledger": [
-            {"fact_id": "F_selected", "fact_type": "observed"},
-            {"fact_id": "F_support", "fact_type": "observed"},
-            {"fact_id": "F_changed", "fact_type": "observed"},
-        ],
         "rubric": [{"title": "核心判断", "description": "识别最小关键事实。", "weight": 10}],
         "score_prompt": "请按 rubric 对 <<<待评答案>> 评分。",
     }
