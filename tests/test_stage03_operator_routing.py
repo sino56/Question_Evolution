@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from operator_router import MemoryMatchIndex, find_memory_matches, route_records
-from prompts.operators import OPERATOR_SPECS
+from prompts.operators import OPERATOR_SPECS, build_operator_prompt
 import question_evolution as question_evolution_module
 import operator_router as operator_router_module
 from pipeline_runtime import AtomicJsonlStageWriter
@@ -69,8 +69,8 @@ class FailingEvolutionClient:
         raise RuntimeError("mock generation failed")
 
 
-def test_operator_registry_covers_o10_to_o18():
-    assert len(OPERATOR_SPECS) == 9
+def test_operator_registry_covers_o10_to_o33():
+    assert len(OPERATOR_SPECS) == 24
     for index in range(10, 19):
         assert any(operator_id.startswith(f"O{index}_") for operator_id in OPERATOR_SPECS)
 
@@ -93,6 +93,65 @@ def test_router_covers_representative_stage03_paths():
     assert routes["stage03-pass"]["primary_operator"] is None
 
 
+@pytest.mark.parametrize(
+    ("diagnosis_text", "expected_operator"),
+    (
+        ("最小充分集合成员消融", "O10_evidence_sufficiency_ladder"),
+        ("可见端点与时间窗的时序一致", "O11_unobserved_state_attribution"),
+        ("仅 X、仅 Y 与 X+Y 的共同闭合", "O12_conjunctive_necessity"),
+        ("必要连接失效及整体命题后果", "O13_minimal_disqualifier"),
+        ("题干外中间状态导致信息闭包问题", "O14_information_closure"),
+        ("单一比较量距离固定门槛的裕量", "O15_counterfactual_threshold_shift"),
+        ("竞争解释的覆盖关系与残差", "O16_close_alternative_normalization"),
+        ("两套规则的适用对象与范围", "O17_action_vs_fact_threshold"),
+        ("候选基线的纳入口径与异常性", "O18_baseline_scope_mismatch"),
+    ),
+)
+def test_router_recognizes_each_operator_primary_reasoning_object(
+    diagnosis_text,
+    expected_operator,
+):
+    item = {
+        "sample_id": f"route-{expected_operator}",
+        "prompt": "根据题面材料作出业务判断。",
+        "score_rate": 0.9,
+        "evolution_action": "evolve_high_score_overscore",
+        "sample_profile": {
+            "core_capability": "证据边界",
+            "claim_level": "业务判断",
+            "problem_shape": "开放判断",
+            "external_knowledge_risk": "low",
+        },
+        "overscore_diagnosis": {
+            "is_worth_evolving": True,
+            "candidate_overscore_cause": diagnosis_text,
+            "target_failure_mode": diagnosis_text,
+        },
+    }
+    route = route_records([item])[0]["operator_route"]
+    assert route["primary_operator"] == expected_operator
+
+
+def test_every_generation_operator_uses_the_unified_prompt_entrypoint():
+    generating_specs = [spec for spec in OPERATOR_SPECS.values() if spec.generates_question]
+    assert len(generating_specs) == len(OPERATOR_SPECS) - 1
+    for spec in generating_specs:
+        rendered = build_operator_prompt(
+            spec.operator_id,
+            prompt="原题要求综合事实作出判断。",
+            reference_answer="应根据完整材料控制结论边界。",
+            candidate_answer="候选答案遗漏了关键关系。",
+            rubric=[],
+            sample_profile={},
+            overscore_diagnosis={},
+            evolution_state={},
+            operator_route={"primary_operator": spec.operator_id},
+        )
+        assert spec.operator_id in rendered
+        assert spec.ability_axis in rendered
+        assert spec.content_transformation in rendered
+
+
 def test_question_evolution_uses_route_and_skips_passthrough():
     records = load_jsonl(ROOT / "tests" / "fixtures" / "stage03_routing_input.jsonl")
     routed = route_records(records)
@@ -109,7 +168,7 @@ def test_question_evolution_uses_route_and_skips_passthrough():
     metadata = evolved["meta_info"]["question_evolution_metadata"]
     assert evolved["question_evolved"] is True
     assert metadata["operator_used"] == "O13_minimal_disqualifier"
-    assert metadata["ability_axis"] == "同一判断内的层级改变事实识别"
+    assert metadata["ability_axis"] == "minimal_required_link_failure"
     assert metadata["expected_qwen_failure"] == "选错最关键缺口"
     assert metadata["expected_evaluation_focus"]
     assert len(fake_client.calls) == 1
@@ -118,6 +177,45 @@ def test_question_evolution_uses_route_and_skips_passthrough():
     passed = asyncio.run(processor.process_item(by_id["stage03-pass"]))
     assert passed["question_evolved"] is False
     assert len(fake_client.calls) == 1
+
+
+def test_question_evolution_calls_new_operator_through_existing_entrypoint():
+    item = {
+        "sample_id": "stage03-o33",
+        "prompt": "综合不同来源材料作出业务判断。",
+        "reference_answer": "只形成对齐后的材料共同支持的结论。",
+        "candidate_answer": "候选答案直接叠加了来源数量。",
+        "rubric": [],
+        "score_rate": 0.9,
+        "evolution_action": "evolve_high_score_overscore",
+        "sample_profile": {
+            "core_capability": "跨来源证据边界",
+            "claim_level": "业务判断",
+            "problem_shape": "开放判断",
+            "external_knowledge_risk": "low",
+        },
+        "overscore_diagnosis": {
+            "is_worth_evolving": True,
+            "candidate_overscore_cause": "跨模态材料需要时间与实体对齐后再融合",
+            "target_failure_mode": "多源融合越过共同支持边界",
+        },
+    }
+    routed = route_records([item])[0]
+    fake_client = FakeEvolutionClient()
+    processor = QuestionEvolutionProcessor(
+        fake_client,
+        model="mock-evolution-model",
+        max_concurrent=1,
+        max_retries=0,
+    )
+
+    evolved = asyncio.run(processor.process_item(routed))
+    metadata = evolved["meta_info"]["question_evolution_metadata"]
+    assert evolved["question_evolved"] is True
+    assert metadata["operator_used"] == "O33_cross_modal_support_boundary"
+    assert metadata["ability_axis"] == "cross_modal_support_boundary"
+    assert "O33_cross_modal_support_boundary" in fake_client.calls[0]["messages"][0]["content"]
+    assert '"semantic_axes"' in fake_client.calls[0]["messages"][0]["content"]
 
 
 def test_question_evolution_file_stage_checkpoints_candidate_group_and_externalizes_trace(tmp_path):
@@ -402,7 +500,7 @@ def test_operator_router_performance_event_covers_parse_compute_and_windows_rss(
 
 
 if __name__ == "__main__":
-    test_operator_registry_covers_o10_to_o18()
+    test_operator_registry_covers_o10_to_o33()
     test_router_covers_representative_stage03_paths()
     test_question_evolution_uses_route_and_skips_passthrough()
     test_candidate_generation_falls_back_when_no_operator_available()

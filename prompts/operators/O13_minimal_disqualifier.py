@@ -3,23 +3,98 @@ from .base import OperatorPromptSpec
 
 SPEC = OperatorPromptSpec(
     operator_id="O13_minimal_disqualifier",
-    name="边界诱发式最小推翻事实",
-    ability_axis="同一判断内的层级改变事实识别",
+    name="必要连接破坏与推翻层级",
+    ability_axis="minimal_required_link_failure",
     goal=(
-        "测试模型能否在多个都影响同一原评价的近似新增事实中，识别哪个真正改变结论层级，"
-        "而不是把只改变置信度或处置优先级的事实当成推翻事实。"
+        "在多个与同一推理链相关的可观察事实中，识别会破坏必要连接的最小事实，"
+        "并区分连接失效对局部承接和整体目标命题的不同影响。"
     ),
     required_question_shape=(
-        "先给一个原评价或原报告表述，再给 2-3 个同样贴近原判断的新增事实；"
-        "要求判断原评价是否仍可保留、需要下调到哪一层，而不是显式问哪个最会迫使下调。"
+        "围绕同一目标业务判断，自然混合若干同观察类别、同证据类型且粒度相近的复核事实；"
+        "只询问复核后目标判断是否仍成立及依据，不公开事实的内部逻辑角色。"
     ),
     avoid=(
-        "不要要求列完整推理路径；不要让一个候选明显同人同地、其他候选明显外围；"
-        "不要把\"直接推翻/削弱/外围/无关\"等答案标签写进题面。"
+        "不要公开“保持连接/降低置信度/破坏连接/仍有其他路径”等角色；"
+        "不要声明存在唯一破坏项，不要把局部连接失效直接写成整体结论翻转。"
     ),
     default_evaluation_focus=(
-        "是否识别真正改变原评价层级的最小事实",
-        "是否区分结论层级改变与置信度或处置优先级改变",
-        "是否避免被同样贴近但非决定性的事实带偏",
+        "是否识别真正破坏必要连接的事实",
+        "是否区分必要连接失效与一般置信度下降",
+        "是否分别判断局部连接和整体目标命题的后果",
+    ),
+    reasoning_object="同一推理链中的必要连接，以及该连接与整体目标命题之间的承接关系",
+    content_transformation=(
+        "在保持目标命题不变的前提下，引入同粒度复核事实：部分事实保持连接，部分只降低置信度，"
+        "一个事实破坏必要连接；并在内容设计中决定是否仍存在支持整体命题的其他独立路径。"
+    ),
+    invariants=(
+        "主体、时段和目标命题保持不变",
+        "候选事实属于同一观察类别和证据类型",
+        "候选事实的信息粒度与语法显著性保持可比",
+        "局部连接层级与整体命题层级不得混写",
+    ),
+    competition_structure=(
+        "所有复核事实都与原推理链相关并具有部分影响，错误项不能因明显外围或无关而排除；"
+        "真正破坏连接的事实也不能独占否定词、极端词或完整因果链。"
+    ),
+    preserved_parent_obligations=(
+        "保留父题组织事实并说明事实如何支撑业务判断的义务",
+        "保留父题控制结论边界、避免从局部证据过推整体结论的义务",
+    ),
+    required_reasoning_tasks=(
+        "自行识别原判断依赖的必要连接",
+        "判断复核事实对该连接是保持、降置信还是破坏",
+        "判断连接失效是否足以改变整体目标命题",
+    ),
+    target_error_taxonomy=(
+        "missed_required_link_failure",
+        "confidence_drop_vs_link_failure_confusion",
+        "local_failure_vs_overall_claim_confusion",
+        "unsupported_full_reversal",
+    ),
+    excluded_error_taxonomy=(
+        "single_fact_direction_shift",
+        "general_minimal_sufficient_set_discovery",
+        "multi_stage_event_chain_break",
+    ),
+    forbidden_shortcuts=(
+        "直接标出事实逻辑角色或必要连接",
+        "让破坏项成为唯一主体、唯一时段或唯一否定表述",
+        "预告存在唯一推翻事实",
+        "把答案拆成逐项事实分类步骤",
+    ),
+    adjacent_operator_boundaries=(
+        "一般最小充分事实集发现归 O10",
+        "单事实变化造成的支持度或门槛距离变化归 O15",
+        "多阶段状态链断点不属于当前事实-命题算子，应进入事件链 family",
+    ),
+    positive_controls=(
+        "必要连接被破坏且整体命题随之失去支持",
+        "必要连接被破坏但整体命题仍由另一条独立路径支持",
+    ),
+    conclusion_invariant_negative_controls=(
+        "复核事实只降低连接可信度但不破坏必要连接",
+        "复核事实改变处置优先级但不改变事实结论",
+    ),
+    adjacent_operator_controls=(
+        "同样包含事实增删但求解任务是发现最小充分集合的 O10 近邻",
+        "同样包含单事实变化但只比较支持度方向的 O15 近邻",
+    ),
+    surface_swap_controls=(
+        "交换复核事实呈现顺序不改变逻辑角色和答案",
+        "使用等价措辞改写各事实不改变局部与整体结论",
+    ),
+    hidden_role_balance_controls=(
+        "破坏项不独占否定词、极端词或更长解释",
+        "保持项和降置信项同样与原链条紧密相关",
+    ),
+    allowed_answer_shapes=(
+        "自然业务判断加开放式依据",
+        "在论证中自行说明失效连接及整体结论是否仍有其他支持",
+    ),
+    forbidden_answer_shapes=(
+        "让回答者按预给角色逐项分类",
+        "仅选择“保持/减弱/翻转”方向标签",
+        "要求复述完整内部答案链",
     ),
 )

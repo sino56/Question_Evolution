@@ -26,8 +26,23 @@ O15_COUNTERFACTUAL_THRESHOLD_SHIFT = "O15_counterfactual_threshold_shift"
 O16_CLOSE_ALTERNATIVE_NORMALIZATION = "O16_close_alternative_normalization"
 O17_ACTION_VS_FACT_THRESHOLD = "O17_action_vs_fact_threshold"
 O18_BASELINE_SCOPE_MISMATCH = "O18_baseline_scope_mismatch"
+O19_MULTI_ENTITY_ROLE_BINDING = "O19_multi_entity_role_binding"
+O20_MULTISTAGE_EVENT_BREAKPOINT = "O20_multistage_event_breakpoint"
+O21_OBJECT_PROVENANCE_IDENTITY = "O21_object_provenance_identity"
+O22_PATH_TOPOLOGY_REACHABILITY = "O22_path_topology_reachability"
+O23_OBSERVATION_RELIABILITY_CONFLICT = "O23_observation_reliability_conflict"
+O24_MULTI_HYPOTHESIS_RESIDUAL_RANKING = "O24_multi_hypothesis_residual_ranking"
+O25_PROCEDURAL_INVARIANT_FRAME = "O25_procedural_invariant_frame"
+O26_QUANTITATIVE_THRESHOLD_PROPAGATION = "O26_quantitative_threshold_propagation"
+O27_CROSS_LAYER_CONCLUSION_CALIBRATION = "O27_cross_layer_conclusion_calibration"
+O28_MULTIHOP_CHAIN_CLOSURE = "O28_multihop_chain_closure"
+O29_ENTITY_IDENTITY_CONFLICT_RESOLUTION = "O29_entity_identity_conflict_resolution"
+O30_ACTIVE_DISCRIMINATIVE_OBSERVATION = "O30_active_discriminative_observation"
+O31_OBSERVATION_ACCUMULATION_CALIBRATION = "O31_observation_accumulation_calibration"
+O32_ROLE_GRAPH_CRITICAL_EDGE = "O32_role_graph_critical_edge"
+O33_CROSS_MODAL_SUPPORT_BOUNDARY = "O33_cross_modal_support_boundary"
 
-OPERATOR_ORDER = (
+LEGACY_OPERATOR_ORDER = (
     O10_EVIDENCE_SUFFICIENCY_LADDER,
     O11_UNOBSERVED_STATE_ATTRIBUTION,
     O12_CONJUNCTIVE_NECESSITY,
@@ -38,6 +53,24 @@ OPERATOR_ORDER = (
     O17_ACTION_VS_FACT_THRESHOLD,
     O18_BASELINE_SCOPE_MISMATCH,
 )
+NEW_CONTENT_OPERATOR_ORDER = (
+    O19_MULTI_ENTITY_ROLE_BINDING,
+    O20_MULTISTAGE_EVENT_BREAKPOINT,
+    O21_OBJECT_PROVENANCE_IDENTITY,
+    O22_PATH_TOPOLOGY_REACHABILITY,
+    O23_OBSERVATION_RELIABILITY_CONFLICT,
+    O24_MULTI_HYPOTHESIS_RESIDUAL_RANKING,
+    O25_PROCEDURAL_INVARIANT_FRAME,
+    O26_QUANTITATIVE_THRESHOLD_PROPAGATION,
+    O27_CROSS_LAYER_CONCLUSION_CALIBRATION,
+    O28_MULTIHOP_CHAIN_CLOSURE,
+    O29_ENTITY_IDENTITY_CONFLICT_RESOLUTION,
+    O30_ACTIVE_DISCRIMINATIVE_OBSERVATION,
+    O31_OBSERVATION_ACCUMULATION_CALIBRATION,
+    O32_ROLE_GRAPH_CRITICAL_EDGE,
+    O33_CROSS_MODAL_SUPPORT_BOUNDARY,
+)
+OPERATOR_ORDER = LEGACY_OPERATOR_ORDER + NEW_CONTENT_OPERATOR_ORDER
 OPERATOR_IDS = set(OPERATOR_ORDER)
 
 EVOLUTION_REQUIRED_ACTIONS = {
@@ -73,7 +106,118 @@ OPERATOR_SURFACE_FORM_FAMILY = {
     O16_CLOSE_ALTERNATIVE_NORMALIZATION: "close_alternative_normalization",
     O17_ACTION_VS_FACT_THRESHOLD: "action_vs_fact_threshold",
     O18_BASELINE_SCOPE_MISMATCH: "baseline_scope_mismatch",
+    O19_MULTI_ENTITY_ROLE_BINDING: "multi_entity_role_binding",
+    O20_MULTISTAGE_EVENT_BREAKPOINT: "multistage_event_breakpoint",
+    O21_OBJECT_PROVENANCE_IDENTITY: "object_provenance_identity",
+    O22_PATH_TOPOLOGY_REACHABILITY: "path_topology_reachability",
+    O23_OBSERVATION_RELIABILITY_CONFLICT: "observation_reliability_conflict",
+    O24_MULTI_HYPOTHESIS_RESIDUAL_RANKING: "multi_hypothesis_residual_ranking",
+    O25_PROCEDURAL_INVARIANT_FRAME: "procedural_invariant_frame",
+    O26_QUANTITATIVE_THRESHOLD_PROPAGATION: "quantitative_threshold_propagation",
+    O27_CROSS_LAYER_CONCLUSION_CALIBRATION: "cross_layer_conclusion_calibration",
+    O28_MULTIHOP_CHAIN_CLOSURE: "multihop_chain_closure",
+    O29_ENTITY_IDENTITY_CONFLICT_RESOLUTION: "entity_identity_conflict_resolution",
+    O30_ACTIVE_DISCRIMINATIVE_OBSERVATION: "active_discriminative_observation",
+    O31_OBSERVATION_ACCUMULATION_CALIBRATION: "observation_accumulation_calibration",
+    O32_ROLE_GRAPH_CRITICAL_EDGE: "role_graph_critical_edge",
+    O33_CROSS_MODAL_SUPPORT_BOUNDARY: "cross_modal_support_boundary",
 }
+
+# First-part integration only: explicit diagnosis recognition for the new
+# content operators. This does not qualify, validate, shadow-route, or release
+# an operator; unmatched samples retain the legacy O10-O18 fallback behavior.
+NEW_CONTENT_RULES = (
+    (
+        O33_CROSS_MODAL_SUPPORT_BOUNDARY,
+        (O27_CROSS_LAYER_CONCLUSION_CALIBRATION, O23_OBSERVATION_RELIABILITY_CONFLICT),
+        ("跨模态", "多源融合", "来源范围对齐", "时间与实体对齐", "视频与记录", "信号与文本"),
+        "diagnosis indicates a cross-modal alignment and support-boundary problem.",
+    ),
+    (
+        O32_ROLE_GRAPH_CRITICAL_EDGE,
+        (O19_MULTI_ENTITY_ROLE_BINDING, O13_MINIMAL_DISQUALIFIER),
+        ("角色关系图", "关系图关键边", "关系边方向", "必要关系边", "共现不等于协同", "替代关系路径"),
+        "diagnosis indicates a critical directed edge in a role graph.",
+    ),
+    (
+        O31_OBSERVATION_ACCUMULATION_CALIBRATION,
+        (O23_OBSERVATION_RELIABILITY_CONFLICT, O10_EVIDENCE_SUFFICIENCY_LADDER),
+        ("观测累积", "累积观测", "同源重复", "独立增量", "来源依赖", "重复观测"),
+        "diagnosis indicates dependent or repeated observation accumulation.",
+    ),
+    (
+        O30_ACTIVE_DISCRIMINATIVE_OBSERVATION,
+        (O24_MULTI_HYPOTHESIS_RESIDUAL_RANKING, O16_CLOSE_ALTERNATIVE_NORMALIZATION),
+        ("下一步观测", "主动判别观测", "判别力观测", "区分力观测", "下一步看什么", "观测结果分支"),
+        "diagnosis calls for the next discriminative observation.",
+    ),
+    (
+        O29_ENTITY_IDENTITY_CONFLICT_RESOLUTION,
+        (O19_MULTI_ENTITY_ROLE_BINDING, O21_OBJECT_PROVENANCE_IDENTITY),
+        ("实体同一性冲突", "身份线索冲突", "冲突绑定", "局部绑定全程", "身份连续性冲突", "排他身份线索"),
+        "diagnosis indicates conflicting entity-identity evidence.",
+    ),
+    (
+        O28_MULTIHOP_CHAIN_CLOSURE,
+        (O20_MULTISTAGE_EVENT_BREAKPOINT, O22_PATH_TOPOLOGY_REACHABILITY),
+        ("多跳链路", "整体链路闭合", "跨阶段跨节点", "局部链当整体链", "跨节点承接", "多跳闭合"),
+        "diagnosis indicates incomplete multi-hop chain closure.",
+    ),
+    (
+        O27_CROSS_LAYER_CONCLUSION_CALIBRATION,
+        (O33_CROSS_MODAL_SUPPORT_BOUNDARY, O17_ACTION_VS_FACT_THRESHOLD),
+        ("跨层结论", "结论层级传导", "支持到事实", "事实到可写结论", "可写结论到行动", "局部失效整体翻转"),
+        "diagnosis indicates an overreach across conclusion layers.",
+    ),
+    (
+        O26_QUANTITATIVE_THRESHOLD_PROPAGATION,
+        (O25_PROCEDURAL_INVARIANT_FRAME, O18_BASELINE_SCOPE_MISMATCH),
+        ("误差传播", "不确定区间", "结果区间跨阈值", "单位换算误差", "容差传播", "点估计替代区间"),
+        "diagnosis indicates quantitative threshold and error propagation.",
+    ),
+    (
+        O25_PROCEDURAL_INVARIANT_FRAME,
+        (O26_QUANTITATIVE_THRESHOLD_PROPAGATION, O18_BASELINE_SCOPE_MISMATCH),
+        ("程序不变量", "参照系一致", "记录对象映射", "步骤依赖倒置", "单位语义不一致", "结果可比性"),
+        "diagnosis indicates a procedural invariant or reference-frame mismatch.",
+    ),
+    (
+        O24_MULTI_HYPOTHESIS_RESIDUAL_RANKING,
+        (O30_ACTIVE_DISCRIMINATIVE_OBSERVATION, O16_CLOSE_ALTERNATIVE_NORMALIZATION),
+        ("多假设残差", "残差排序", "覆盖冲突残差", "假设覆盖与冲突", "额外假设成本", "解释过早锁定"),
+        "diagnosis indicates multi-hypothesis coverage and residual ranking.",
+    ),
+    (
+        O23_OBSERVATION_RELIABILITY_CONFLICT,
+        (O31_OBSERVATION_ACCUMULATION_CALIBRATION, O29_ENTITY_IDENTITY_CONFLICT_RESOLUTION),
+        ("观测可靠性", "观测质量限制", "可见性与清晰度", "遮挡视角限制", "来源可靠性冲突", "受限观测过度结论"),
+        "diagnosis indicates a conflict in observation reliability.",
+    ),
+    (
+        O22_PATH_TOPOLOGY_REACHABILITY,
+        (O28_MULTIHOP_CHAIN_CLOSURE, O11_UNOBSERVED_STATE_ATTRIBUTION),
+        ("路径拓扑", "联合可达性", "候选路径约束", "端点方向约束", "拓扑连通与时间窗", "单向边可达"),
+        "diagnosis indicates joint reachability under topology and time constraints.",
+    ),
+    (
+        O21_OBJECT_PROVENANCE_IDENTITY,
+        (O29_ENTITY_IDENTITY_CONFLICT_RESOLUTION, O19_MULTI_ENTITY_ROLE_BINDING),
+        ("对象来源链", "物品同一性", "竞争来源", "转移缺口", "遮挡后重现对象", "来源与对象连续性"),
+        "diagnosis indicates object provenance and identity tracking.",
+    ),
+    (
+        O20_MULTISTAGE_EVENT_BREAKPOINT,
+        (O28_MULTIHOP_CHAIN_CLOSURE, O13_MINIMAL_DISQUALIFIER),
+        ("多阶段事件链", "状态转移图", "链路断点", "阶段状态承接", "局部链整体成立", "断点后果传播"),
+        "diagnosis indicates a breakpoint in a multistage event chain.",
+    ),
+    (
+        O19_MULTI_ENTITY_ROLE_BINDING,
+        (O29_ENTITY_IDENTITY_CONFLICT_RESOLUTION, O21_OBJECT_PROVENANCE_IDENTITY),
+        ("多实体角色绑定", "主体角色交换", "实体行为绑定", "角色方向错误", "节点实体绑定", "实施与协助混淆"),
+        "diagnosis indicates a multi-entity role-binding failure.",
+    ),
+)
 FAILURE_MEMORY_WARN_THRESHOLD = 1
 FAILURE_MEMORY_DOWNRANK_THRESHOLD = 2
 FAILURE_MEMORY_AVOID_THRESHOLD = 3
@@ -469,35 +613,76 @@ def _base_rule_route(item: Dict[str, Any]) -> Tuple[Optional[str], List[str], st
     target = _clean_text(diagnosis.get("target_failure_mode"))
     combined = f"{cause} {target}"
 
-    if _has_any(combined, ("盲区", "不可见区间", "未出现", "端点事实", "不可见状态")):
+    for primary, backups, terms, reason in NEW_CONTENT_RULES:
+        if _has_any(combined, terms):
+            return primary, list(backups), reason
+
+    if _has_any(
+        combined,
+        (
+            "盲区",
+            "不可见区间",
+            "未出现",
+            "端点事实",
+            "可见端点",
+            "时间窗",
+            "路径约束",
+            "时序一致",
+            "不可见状态",
+        ),
+    ):
         return (
             O11_UNOBSERVED_STATE_ATTRIBUTION,
             [O17_ACTION_VS_FACT_THRESHOLD],
             "diagnosis indicates unobserved-state attribution risk.",
         )
 
-    if _has_any(combined, ("基线", "样本口径", "统计口径", "范围错配", "基准范围")):
+    if _has_any(
+        combined,
+        ("基线", "样本口径", "统计口径", "纳入口径", "可比基线", "范围错配", "基准范围", "异常性"),
+    ):
         return (
             O18_BASELINE_SCOPE_MISMATCH,
             [O10_EVIDENCE_SUFFICIENCY_LADDER],
             "diagnosis indicates baseline-scope mismatch.",
         )
 
-    if _has_any(combined, ("正常解释", "替代解释", "风险消失", "异常强度下降")):
+    if _has_any(
+        combined,
+        ("正常解释", "替代解释", "竞争解释", "覆盖关系", "残差", "discriminator", "风险消失", "异常强度下降"),
+    ):
         return (
             O16_CLOSE_ALTERNATIVE_NORMALIZATION,
             [O15_COUNTERFACTUAL_THRESHOLD_SHIFT],
             "diagnosis indicates over-normalization by a close alternative.",
         )
 
-    if _has_any(combined, ("反事实", "单变量", "变量变化", "门槛迁移", "保留范围")):
+    if _has_any(
+        combined,
+        ("反事实", "单变量", "变量变化", "单一比较量", "固定门槛", "门槛裕量", "门槛迁移", "保留范围"),
+    ):
         return (
             O15_COUNTERFACTUAL_THRESHOLD_SHIFT,
             [O16_CLOSE_ALTERNATIVE_NORMALIZATION],
             "diagnosis calls for a single-variable threshold shift.",
         )
 
-    if _has_any(combined, ("处置", "事实定性", "行动门槛", "报告表述", "动作层与性质层")):
+    if _has_any(
+        combined,
+        (
+            "两套规则",
+            "双规则",
+            "规则适用对象",
+            "规则范围",
+            "处置规则",
+            "事实定性规则",
+            "处置",
+            "事实定性",
+            "行动门槛",
+            "报告表述",
+            "动作层与性质层",
+        ),
+    ):
         return (
             O17_ACTION_VS_FACT_THRESHOLD,
             [O11_UNOBSERVED_STATE_ATTRIBUTION, O12_CONJUNCTIVE_NECESSITY],
@@ -511,21 +696,66 @@ def _base_rule_route(item: Dict[str, Any]) -> Tuple[Optional[str], List[str], st
             "diagnosis indicates an information-closure violation.",
         )
 
-    if _has_any(combined, ("原评价", "新增事实", "推翻", "下调", "最小否决", "最小关键事实", "最关键缺口")):
+    if _has_any(
+        combined,
+        (
+            "必要连接",
+            "连接失效",
+            "局部连接",
+            "整体命题",
+            "原评价",
+            "新增事实",
+            "推翻",
+            "下调",
+            "最小否决",
+            "最小关键事实",
+            "最关键缺口",
+        ),
+    ):
         return (
             O13_MINIMAL_DISQUALIFIER,
             [O15_COUNTERFACTUAL_THRESHOLD_SHIFT],
             "diagnosis calls for testing whether a new fact changes an existing evaluation.",
         )
 
-    if _has_any(combined, ("强线索", "共同必要", "必要条件", "门槛未闭合", "层级越推", "抓显眼点漏关键层")):
+    if _has_any(
+        combined,
+        (
+            "仅 X",
+            "仅 Y",
+            "X+Y",
+            "独立贡献",
+            "共同闭合",
+            "联合必要",
+            "共同必要",
+            "强线索",
+            "必要条件",
+            "门槛未闭合",
+            "层级越推",
+            "抓显眼点漏关键层",
+        ),
+    ):
         return (
             O12_CONJUNCTIVE_NECESSITY,
             [O17_ACTION_VS_FACT_THRESHOLD],
             "diagnosis indicates that a strong clue is replacing an unclosed threshold.",
         )
 
-    if _has_any(combined, ("反常线索", "主线切换", "受干扰信息带偏", "近似项分层", "层级混淆")):
+    if _has_any(
+        combined,
+        (
+            "最小充分集",
+            "最小充分集合",
+            "集合成员",
+            "成员消融",
+            "证明力跃迁",
+            "反常线索",
+            "主线切换",
+            "受干扰信息带偏",
+            "近似项分层",
+            "层级混淆",
+        ),
+    ):
         return (
             O10_EVIDENCE_SUFFICIENCY_LADDER,
             [O15_COUNTERFACTUAL_THRESHOLD_SHIFT, O14_INFORMATION_CLOSURE],
@@ -702,7 +932,7 @@ def build_operator_route(
             primary = replacement
             backups = _remove_values(backups, [primary])
         else:
-            primary = next((operator for operator in OPERATOR_ORDER if operator not in avoid), None)
+            primary = next((operator for operator in LEGACY_OPERATOR_ORDER if operator not in avoid), None)
 
     primary, backups, memory_action_reasons = _apply_surface_form_memory_actions(
         primary,

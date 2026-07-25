@@ -10,6 +10,7 @@ from .O16_close_alternative_normalization import SPEC as O16_SPEC
 from .O17_action_vs_fact_threshold import SPEC as O17_SPEC
 from .O18_baseline_scope_mismatch import SPEC as O18_SPEC
 from .base import OperatorPromptSpec, build_prompt
+from .new_operator_specs import NEW_OPERATOR_SPECS
 
 
 OPERATOR_SPECS = {
@@ -24,6 +25,7 @@ OPERATOR_SPECS = {
         O16_SPEC,
         O17_SPEC,
         O18_SPEC,
+        *NEW_OPERATOR_SPECS,
     )
 }
 

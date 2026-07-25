@@ -3,22 +3,100 @@ from .base import OperatorPromptSpec
 
 SPEC = OperatorPromptSpec(
     operator_id="O15_counterfactual_threshold_shift",
-    name="反事实门槛迁移",
-    ability_axis="单变量变化后的保留与撤回边界",
+    name="单一比较量与结论门槛",
+    ability_axis="single_quantity_threshold_shift",
     goal=(
-        "只改变一个核心事实，观察模型能否说明原风险判断哪一部分仍可保留、哪一部分必须降级或撤回，"
-        "而不是整体保留或整体推翻。"
+        "在其他事实和规则门槛保持不变时，判断一个核心事实变化如何影响同一语义量、"
+        "同一结论层级及其相对门槛的位置。"
     ),
     required_question_shape=(
-        "明确只新增或替换一个题干事实，要求比较变化前后同一风险或业务判断的可支持层级；"
-        "重点观察异常强度、处置触发和事实定性三者是否被分别处理。"
+        "自然呈现事实变化前后的可比业务场景，只比较一个声明明确的量；"
+        "题面询问变化后同一业务判断应如何调整及依据，不把内部方向标签或层级分解写成作答步骤。"
     ),
     avoid=(
-        "不要加入多变量反事实；不要提供完整改判链条；不要诱导模型整体撤回风险判断或整体保留原判断。"
+        "不要混用事件可能性、证据支持度、命题成立度、行动门槛和事实认定门槛；"
+        "不要把事实变化写成规则阈值变化；没有明确阈值时不得强制整体结论翻转。"
     ),
     default_evaluation_focus=(
-        "是否只根据单一变量变化重排结论层级",
-        "是否识别原判断中应保留与应撤回的部分",
-        "是否避免整体保留或整体推翻风险判断",
+        "是否始终比较同一个语义量和同一结论层级",
+        "是否保持既定门槛不变并正确判断门槛状态或裕量",
+        "是否在无明确阈值时只给出有依据的偏序变化",
+    ),
+    reasoning_object="单个可观察事实、一个被比较语义量、同一结论层级和固定规则门槛",
+    content_transformation=(
+        "只新增、删除或替换一个核心事实，保持其他材料和适用规则不变；"
+        "让该事实影响既定量的支持方向、大小或距离固定门槛的程度。"
+    ),
+    invariants=(
+        "主体、时段、目标命题和其他事实保持不变",
+        "被比较的语义量在变化前后保持唯一且一致",
+        "题目要求判断的结论层级保持一致",
+        "若题面给出规则门槛，门槛值和适用范围保持不变",
+    ),
+    competition_structure=(
+        "事实变化应能支持相邻的多种合理判断，例如支持减少但尚未跨过门槛；"
+        "正确答案不能由“新增/删除”或正负措辞直接决定。"
+    ),
+    preserved_parent_obligations=(
+        "保留父题基于完整事实判断目标命题的义务",
+        "保留父题区分证据支持、事实结论和处置判断边界的义务",
+    ),
+    required_reasoning_tasks=(
+        "识别题目实际比较的唯一语义量",
+        "判断单个事实变化对该量的方向或幅度",
+        "在给定门槛时判断是否跨越固定门槛；无门槛时只形成偏序结论",
+    ),
+    target_error_taxonomy=(
+        "comparison_quantity_switch",
+        "conclusion_layer_switch",
+        "fact_change_vs_threshold_change_confusion",
+        "unsupported_threshold_crossing",
+        "unsupported_full_reversal",
+    ),
+    excluded_error_taxonomy=(
+        "dual_rule_scope_mapping",
+        "required_link_failure",
+        "multi_variable_counterfactual",
+        "cross_layer_calibration",
+    ),
+    forbidden_shortcuts=(
+        "在题面标注保持、增强、减弱或翻转",
+        "同时改变多个核心事实",
+        "把行动门槛和事实认定门槛混成同一量",
+        "无明确阈值时预设整体翻转",
+    ),
+    adjacent_operator_boundaries=(
+        "两套明示规则的适用范围判断归 O17",
+        "必要连接是否断裂及局部/整体后果归 O13",
+        "证据支持、事实认定和行动处置之间的跨层映射应进入跨层校准 family",
+    ),
+    positive_controls=(
+        "单事实变化使同一量跨过题面明示的固定门槛",
+        "单事实变化使同一量增加或减少但未跨越门槛",
+    ),
+    conclusion_invariant_negative_controls=(
+        "事实变化影响解释细节但不改变被比较量的顺序",
+        "支持度下降但整体结论仍处于原门槛同侧",
+    ),
+    adjacent_operator_controls=(
+        "题面含两套规则且需要区分规则对象的 O17 近邻",
+        "事实破坏必要连接但存在其他支持路径的 O13 近邻",
+    ),
+    surface_swap_controls=(
+        "交换变化前后场景的呈现顺序不改变语义关系",
+        "用等价表述替换增加或减少事实，不改变比较量和结论",
+    ),
+    hidden_role_balance_controls=(
+        "变化事实不独占极端词或显性否定",
+        "变化前后信息量和句式保持可比",
+    ),
+    allowed_answer_shapes=(
+        "围绕单一业务判断说明支持变化及其门槛后果",
+        "无明确门槛时使用支持不增、减少或增加等有序结论",
+    ),
+    forbidden_answer_shapes=(
+        "把多个结论层级拆成固定清单",
+        "同时回答多个不同语义量",
+        "无阈值时直接判定整体翻转",
     ),
 )
