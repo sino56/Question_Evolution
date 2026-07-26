@@ -3,6 +3,7 @@ import gzip
 import hashlib
 import json
 import sys
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,14 +23,18 @@ def response(content):
 
 
 class FakeAnswerClient:
-    def __init__(self):
+    def __init__(self, prefix="answer", fail=False):
         self.calls = 0
+        self.prefix = prefix
+        self.fail = fail
 
     async def generate_answer(self, question):
         self.calls += 1
         call_index = self.calls
         await asyncio.sleep(0)
-        return f"answer-{call_index}"
+        if self.fail:
+            raise RuntimeError(f"{self.prefix} answer unavailable")
+        return f"{self.prefix}-{call_index}"
 
 
 class FakeJudgeClient:
@@ -67,14 +72,31 @@ def sample(index=1, evolved=True):
     }
 
 
-def processor(*, gpt_fail=False, qwen_fail=False, qwen_limit=20, gpt_limit=20, qwen_scores=None):
-    answer_client = FakeAnswerClient()
+def processor(
+    *,
+    gpt_fail=False,
+    gpt_answer_fail=False,
+    qwen_fail=False,
+    qwen_limit=20,
+    gpt_limit=20,
+    qwen_scores=None,
+    gpt_score_qwen_answers=True,
+):
+    answer_client = FakeAnswerClient("qwen-answer")
+    gpt_answer_client = FakeAnswerClient("gpt-answer", fail=gpt_answer_fail)
     qwen_client = FakeJudgeClient(
-        qwen_scores or {"answer-1": 2, "answer-2": 6, "answer-3": 10},
+        qwen_scores or {"qwen-answer-1": 2, "qwen-answer-2": 6, "qwen-answer-3": 10},
         fail=qwen_fail,
     )
     gpt_client = FakeJudgeClient(
-        {"answer-1": 9, "answer-2": 9, "answer-3": 9},
+        {
+            "qwen-answer-1": 9,
+            "qwen-answer-2": 9,
+            "qwen-answer-3": 9,
+            "gpt-answer-1": 8,
+            "gpt-answer-2": 8,
+            "gpt-answer-3": 8,
+        },
         fail=gpt_fail,
     )
     instance = ScoringProcessor(
@@ -85,41 +107,62 @@ def processor(*, gpt_fail=False, qwen_fail=False, qwen_limit=20, gpt_limit=20, q
         max_retries=0,
         answer_client=answer_client,
         answer_model_name="qwen-answer",
+        gpt_answer_client=gpt_answer_client,
+        gpt_answer_model_name="gpt-answer",
         force_generate_answer=True,
         gpt_judge_client=gpt_client,
         gpt_judge_model="gpt-judge",
         answer_trials=3,
+        gpt_answer_trials=3,
         qwen_judge_repeats=2,
         gpt_judge_repeats=2,
+        gpt_score_qwen_answers=gpt_score_qwen_answers,
         qwen_max_concurrent=qwen_limit,
         gpt_max_concurrent=gpt_limit,
     )
-    return instance, answer_client, qwen_client, gpt_client
+    return instance, answer_client, gpt_answer_client, qwen_client, gpt_client
 
 
 def test_qwen_aggregate_drives_online_score_and_representative_trial():
-    instance, answer_client, qwen_client, gpt_client = processor()
+    instance, answer_client, gpt_answer_client, qwen_client, gpt_client = processor()
     result = asyncio.run(instance.process_item(sample()))
 
     assert answer_client.calls == 3
+    assert gpt_answer_client.calls == 3
     assert qwen_client.calls == 6
-    assert gpt_client.calls == 6
+    assert gpt_client.calls == 12
     assert result["evaluation_protocol"] == EVALUATION_PROTOCOL
     assert result["score_rate"] == 0.6
     assert result["qwen_score_summary"]["score_mean"] == 0.6
     assert result["gpt_score_summary"]["score_mean"] == 0.9
+    assert round(result["gpt_answer_score_summary"]["score_mean"], 6) == 0.8
     assert result["representative_trial_index"] == 2
-    assert result["scoring_result"]["candidate_answer"] == "answer-2"
+    assert result["scoring_result"]["candidate_answer"] == "qwen-answer-2"
     assert result["scoring_result"]["item_scores"][0]["awarded"] == 6
     assert result["scoring_result"]["total_awarded"] == 6
     assert "judge_raw_response" not in result["scoring_result"]
     assert len(result["scoring_result"]["answer_trials"]) == 3
+    assert len(result["scoring_result"]["gpt_answer_trials"]) == 3
     assert [row["repeat_index"] for row in result["scoring_result"]["answer_trials"][0]["qwen_judge_results"]] == [1, 2]
-    assert qwen_client.prompts == gpt_client.prompts
+    assert all(
+        [row["repeat_index"] for row in trial["gpt_judge_results"]] == [1, 2]
+        for trial in result["scoring_result"]["answer_trials"]
+    )
+    assert all(
+        [row["repeat_index"] for row in trial["gpt_judge_results"]] == [1, 2]
+        for trial in result["scoring_result"]["gpt_answer_trials"]
+    )
+    assert all(
+        trial["qwen_judge_results"] == []
+        for trial in result["scoring_result"]["gpt_answer_trials"]
+    )
+    assert all("gpt-answer-" not in prompt for prompt in qwen_client.prompts)
+    assert sum("qwen-answer-" in prompt for prompt in gpt_client.prompts) == 6
+    assert sum("gpt-answer-" in prompt for prompt in gpt_client.prompts) == 6
 
 
 def test_gpt_failures_are_recorded_without_blocking_qwen_decision():
-    instance, _, _, _ = processor(gpt_fail=True)
+    instance, _, _, _, _ = processor(gpt_fail=True)
     result = asyncio.run(instance.process_item(sample()))
 
     assert result["score_rate"] == 0.6
@@ -132,13 +175,28 @@ def test_gpt_failures_are_recorded_without_blocking_qwen_decision():
         "score_min": None,
         "score_max": None,
         "experimental": True,
+        "answer_source": "qwen",
+        "judge_source": "gpt",
     }
     gpt_results = result["scoring_result"]["answer_trials"][0]["gpt_judge_results"]
     assert all("error" in row for row in gpt_results)
+    assert result["gpt_answer_score_summary"]["failed_count"] == 6
+    assert result["gpt_answer_score_summary"]["score_mean"] is None
+
+
+def test_gpt_answer_generation_failure_is_recorded_without_blocking_qwen_decision():
+    instance, _, gpt_answer_client, _, _ = processor(gpt_answer_fail=True)
+    result = asyncio.run(instance.process_item(sample()))
+
+    assert gpt_answer_client.calls == 3
+    assert result["score_rate"] == 0.6
+    assert result["gpt_answer_generation_summary"]["failed_count"] == 3
+    assert result["gpt_answer_score_summary"]["score_mean"] is None
+    assert all("error" in trial for trial in result["scoring_result"]["gpt_answer_trials"])
 
 
 def test_required_qwen_failure_fails_the_sample():
-    instance, _, _, _ = processor(qwen_fail=True)
+    instance, _, _, _, _ = processor(qwen_fail=True)
 
     try:
         asyncio.run(instance.process_item(sample()))
@@ -149,7 +207,7 @@ def test_required_qwen_failure_fails_the_sample():
 
 
 def test_pass_through_reuses_existing_scoring_without_network_calls():
-    instance, answer_client, qwen_client, gpt_client = processor()
+    instance, answer_client, gpt_answer_client, qwen_client, gpt_client = processor()
     item = sample(evolved=False)
     item["scoring_result"] = {
         "candidate_answer": "old",
@@ -159,11 +217,11 @@ def test_pass_through_reuses_existing_scoring_without_network_calls():
     result = asyncio.run(instance.process_item(item))
 
     assert result["score_rate"] == 0.8
-    assert answer_client.calls == qwen_client.calls == gpt_client.calls == 0
+    assert answer_client.calls == gpt_answer_client.calls == qwen_client.calls == gpt_client.calls == 0
 
 
 def test_trace_sidecar_and_manifest_preserve_raw_responses(tmp_path):
-    instance, _, _, _ = processor()
+    instance, _, _, _, _ = processor()
     input_path = tmp_path / "input.jsonl"
     output_path = tmp_path / "scored.jsonl"
     input_path.write_text(json.dumps(sample(), ensure_ascii=False) + "\n", encoding="utf-8")
@@ -177,7 +235,7 @@ def test_trace_sidecar_and_manifest_preserve_raw_responses(tmp_path):
     with gzip.open(sidecar_path, "rt", encoding="utf-8") as trace_file:
         traces = [json.loads(line) for line in trace_file if line.strip()]
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert len(traces) == 12
+    assert len(traces) == 18
     assert all(row["raw_response"] for row in traces)
     assert all(row["raw_text"] == row["raw_response"] for row in traces)
     assert all(row["record_key"] == "sample-1|||question-1" for row in traces)
@@ -189,12 +247,12 @@ def test_trace_sidecar_and_manifest_preserve_raw_responses(tmp_path):
         == hashlib.sha256(row["raw_text"].encode("utf-8")).hexdigest()
         for row in traces
     )
-    assert manifest["judge_trace_sidecar"]["record_count"] == 12
+    assert manifest["judge_trace_sidecar"]["record_count"] == 18
     assert len(manifest["judge_trace_sidecar"]["sha256"]) == 64
 
 
 def test_scoring_preserves_distinct_sample_ids_with_same_prompt(tmp_path):
-    instance, _, _, _ = processor()
+    instance, _, _, _, _ = processor()
     first = sample(index=1)
     second = sample(index=1)
     first["sample_id"] = "sample-a"
@@ -213,7 +271,7 @@ def test_scoring_preserves_distinct_sample_ids_with_same_prompt(tmp_path):
 
 
 def test_qwen_and_gpt_request_pools_have_independent_limits():
-    instance, _, _, _ = processor(qwen_limit=2, gpt_limit=1)
+    instance, _, _, _, _ = processor(qwen_limit=2, gpt_limit=1)
 
     async def run_all():
         await asyncio.gather(*(instance.process_item(sample(index)) for index in range(1, 4)))
@@ -226,7 +284,10 @@ def test_qwen_and_gpt_request_pools_have_independent_limits():
 
 
 def test_round0_uses_all_qwen_repeats_for_online_score():
-    instance, _, _, _ = processor(qwen_scores={"answer-1": 2, "answer-2": 4, "answer-3": 10})
+    instance, _, _, qwen_client, gpt_client = processor(
+        qwen_scores={"qwen-answer-1": 2, "qwen-answer-2": 4, "qwen-answer-3": 10},
+        gpt_score_qwen_answers=False,
+    )
     config = SimpleNamespace(
         initial_trials=3,
         extra_trials=0,
@@ -247,6 +308,10 @@ def test_round0_uses_all_qwen_repeats_for_online_score():
         gpt_judge_model="gpt-judge",
         gpt_judge_temperature=0.0,
         gpt_judge_repeats=2,
+        gpt_answer_trials=3,
+        gpt_answer_model="gpt-answer",
+        gpt_answer_temperature=0.7,
+        gpt_answer_top_p=0.95,
         cache_dir=None,
         force=True,
     )
@@ -256,6 +321,120 @@ def test_round0_uses_all_qwen_repeats_for_online_score():
     assert result["round0_score_summary"]["stable_score"] == 0.4
     assert result["score_rate"] == 16 / 30
     assert result["qwen_score_summary"]["successful_count"] == 6
-    assert result["gpt_score_summary"]["successful_count"] == 6
+    assert result["gpt_score_summary"]["requested_count"] == 0
+    assert result["gpt_score_summary"]["successful_count"] == 0
+    assert result["gpt_answer_score_summary"]["successful_count"] == 6
+    assert len(result["round0_gpt_answer_trials"]) == 3
+    assert all(
+        [row["repeat_index"] for row in trial["gpt_judge_results"]] == [1, 2]
+        and trial["qwen_judge_results"] == []
+        for trial in result["round0_gpt_answer_trials"]
+    )
+    assert all("gpt-answer-" not in prompt for prompt in qwen_client.prompts)
+    assert all("qwen-answer-" not in prompt for prompt in gpt_client.prompts)
     assert result["representative_round0_answer"]["trial_id"] == 2
     assert result["representative_round0_answer"]["selection_reason"] == "closest_to_qwen_overall_mean"
+
+
+def test_deferred_gpt_evaluation_does_not_block_qwen_decision():
+    instance, answer_client, gpt_answer_client, qwen_client, gpt_client = processor()
+    decision = asyncio.run(instance.process_decision_item(sample()))
+
+    assert decision["decision_evaluation_status"] == "completed"
+    assert decision["experimental_evaluation_status"] == "pending"
+    assert decision["score_rate"] == 0.6
+    assert answer_client.calls == 3
+    assert qwen_client.calls == 6
+    assert gpt_answer_client.calls == 0
+    assert gpt_client.calls == 0
+    assert decision["gpt_score_summary"]["pending_count"] == 6
+    assert decision["gpt_answer_generation_summary"]["pending_count"] == 3
+
+    completed = asyncio.run(instance.process_experimental_item(decision))
+    assert completed["decision_evaluation_status"] == "completed"
+    assert completed["experimental_evaluation_status"] == "completed"
+    assert completed["score_rate"] == 0.6
+    assert answer_client.calls == 3
+    assert qwen_client.calls == 6
+    assert gpt_answer_client.calls == 3
+    assert gpt_client.calls == 12
+    assert [
+        trial["trial_index"]
+        for trial in completed["scoring_result"]["answer_trials"]
+    ] == [1, 2, 3]
+    assert all(
+        [row["repeat_index"] for row in trial["gpt_judge_results"]] == [1, 2]
+        for trial in completed["scoring_result"]["answer_trials"]
+    )
+
+
+def test_deferred_and_synchronous_modes_have_equivalent_business_projection():
+    synchronous_processor, *_ = processor()
+    deferred_processor, *_ = processor()
+
+    synchronous = asyncio.run(synchronous_processor.process_item(sample()))
+    decision = asyncio.run(deferred_processor.process_decision_item(sample()))
+    deferred = asyncio.run(
+        deferred_processor.process_experimental_item(deepcopy(decision))
+    )
+
+    for field in (
+        "score_rate",
+        "qwen_score_summary",
+        "gpt_score_summary",
+        "qwen_answer_gpt_score_summary",
+        "gpt_answer_score_summary",
+        "gpt_answer_generation_summary",
+        "representative_trial_index",
+    ):
+        assert deferred[field] == synchronous[field]
+    assert (
+        deferred["scoring_result"]["answer_trials"]
+        == synchronous["scoring_result"]["answer_trials"]
+    )
+    assert (
+        deferred["scoring_result"]["gpt_answer_trials"]
+        == synchronous["scoring_result"]["gpt_answer_trials"]
+    )
+
+
+def test_decision_checkpoint_and_experimental_publish_are_independently_recoverable(tmp_path):
+    input_path = tmp_path / "rubric.jsonl"
+    decision_path = tmp_path / "decision.jsonl"
+    complete_path = tmp_path / "scored.jsonl"
+    input_path.write_text(
+        json.dumps(sample(), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    decision_processor, *_ = processor()
+    asyncio.run(
+        decision_processor.process_file(
+            str(input_path),
+            str(decision_path),
+            evaluation_mode="decision",
+        )
+    )
+    decision_manifest = json.loads(
+        (tmp_path / "decision.jsonl.manifest.json").read_text(encoding="utf-8")
+    )
+    assert decision_manifest["stage"] == "scoring_decision"
+    assert decision_manifest["evaluation_mode"] == "decision"
+    assert decision_manifest["judge_trace_sidecar"]["record_count"] == 6
+
+    experimental_processor, *_ = processor()
+    asyncio.run(
+        experimental_processor.process_file(
+            str(decision_path),
+            str(complete_path),
+            evaluation_mode="experimental",
+        )
+    )
+    complete = json.loads(complete_path.read_text(encoding="utf-8"))
+    complete_manifest = json.loads(
+        (tmp_path / "scored.jsonl.manifest.json").read_text(encoding="utf-8")
+    )
+    assert complete["experimental_evaluation_status"] == "completed"
+    assert complete_manifest["stage"] == "scoring"
+    assert complete_manifest["evaluation_mode"] == "experimental"
+    assert complete_manifest["judge_trace_sidecar"]["record_count"] == 18

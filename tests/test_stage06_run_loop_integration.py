@@ -109,6 +109,10 @@ def test_run_loop_uses_existing_stage_cli_flags():
     assert "--gpt-judge-api-key \"$GPT_JUDGE_API_KEY\"" in RUN_LOOP
     assert "--gpt-judge-model \"$GPT_JUDGE_MODEL\"" in RUN_LOOP
     assert "--gpt-judge-repeats \"$GPT_JUDGE_REPEATS\"" in RUN_LOOP
+    assert "--gpt-answer-trials \"$GPT_ANSWER_TRIALS\"" in RUN_LOOP
+    assert "--gpt-answer-base-url \"$GPT_ANSWER_BASE_URL\"" in RUN_LOOP
+    assert "--gpt-answer-api-key \"$GPT_ANSWER_API_KEY\"" in RUN_LOOP
+    assert "--gpt-answer-model \"$GPT_ANSWER_MODEL\"" in RUN_LOOP
     assert "--qwen-max-concurrent \"$QWEN_SCORING_MAX_CONCURRENT\"" in RUN_LOOP
     assert "--gpt-max-concurrent \"$GPT_SCORING_MAX_CONCURRENT\"" in RUN_LOOP
     assert "--base-url \"$ANSWER_BASE_URL\"" in RUN_LOOP
@@ -119,6 +123,14 @@ def test_run_loop_uses_existing_stage_cli_flags():
     assert route_call_start != -1
     select_call = RUN_LOOP[select_call_start:route_call_start]
     assert "--min-score-rate" not in select_call
+
+
+def test_run_loop_defaults_to_exact_three_answer_trials_per_model():
+    assert "SCORING_ANSWER_TRIALS=${SCORING_ANSWER_TRIALS:-3}" in RUN_LOOP
+    assert "GPT_ANSWER_TRIALS=${GPT_ANSWER_TRIALS:-3}" in RUN_LOOP
+    assert "ROUND0_INITIAL_TRIALS=${ROUND0_INITIAL_TRIALS:-3}" in RUN_LOOP
+    assert "ROUND0_EXTRA_TRIALS=${ROUND0_EXTRA_TRIALS:-0}" in RUN_LOOP
+    assert "ROUND0_MAX_TRIALS=${ROUND0_MAX_TRIALS:-3}" in RUN_LOOP
 
 
 def test_run_loop_keeps_rubric_and_scoring_as_closed_loop_steps_only():

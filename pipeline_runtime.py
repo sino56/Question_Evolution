@@ -266,22 +266,42 @@ class StageMetrics:
     request_pool_peaks: Dict[str, int] = field(default_factory=dict)
 
     def event(self, *, status: str = "completed") -> Dict[str, Any]:
+        def rounded_duration(value: float, *, had_activity: bool = False) -> float:
+            if value <= 0:
+                return 0.000001 if had_activity else 0.0
+            return max(0.000001, round(value, 6))
+
         return {
             "event_type": "stage_performance",
             "stage": self.stage,
             "status": status,
             "created_at": utc_now(),
-            "elapsed_seconds": round(time.monotonic() - self.started_at, 6),
+            "elapsed_seconds": rounded_duration(time.monotonic() - self.started_at),
             "input_records": self.input_records + self.checkpoint_hits,
             "processed_input_records": self.input_records,
             "input_bytes": self.input_bytes,
             "output_records": self.output_records,
             "output_bytes": self.output_bytes,
-            "parse_seconds": round(self.parse_seconds, 6),
-            "compute_seconds": round(self.compute_seconds, 6),
-            "serialize_seconds": round(self.serialize_seconds, 6),
-            "recovery_seconds": round(self.recovery_seconds, 6),
-            "flush_seconds": round(self.flush_seconds, 6),
+            "parse_seconds": rounded_duration(
+                self.parse_seconds,
+                had_activity=(self.input_records + self.checkpoint_hits) > 0,
+            ),
+            "compute_seconds": rounded_duration(
+                self.compute_seconds,
+                had_activity=self.input_records > 0,
+            ),
+            "serialize_seconds": rounded_duration(
+                self.serialize_seconds,
+                had_activity=self.output_records > 0,
+            ),
+            "recovery_seconds": rounded_duration(
+                self.recovery_seconds,
+                had_activity=self.checkpoint_hits > 0,
+            ),
+            "flush_seconds": rounded_duration(
+                self.flush_seconds,
+                had_activity=self.flush_count > 0,
+            ),
             "flush_count": self.flush_count,
             "checkpoint_hits": self.checkpoint_hits,
             "input_queue_peak": self.input_queue_peak,
@@ -730,10 +750,31 @@ class FairRequestPool:
         self.active = 0
         self.peak_active = 0
         self.peak_waiters = 0
+        self._utilization_started_at = time.monotonic()
+        self._utilization_changed_at = self._utilization_started_at
+        self._active_seconds = 0.0
         self._waiters: Dict[str, deque[asyncio.Future[None]]] = {}
         self._sample_order: deque[str] = deque()
         self._lock = asyncio.Lock()
         self._dispatch_scheduled = False
+
+    def _update_utilization_clock(self) -> None:
+        now = time.monotonic()
+        self._active_seconds += self.active * max(
+            0.0,
+            now - self._utilization_changed_at,
+        )
+        self._utilization_changed_at = now
+
+    @property
+    def average_utilization(self) -> float:
+        now = time.monotonic()
+        active_seconds = self._active_seconds + self.active * max(
+            0.0,
+            now - self._utilization_changed_at,
+        )
+        elapsed = max(0.0, now - self._utilization_started_at)
+        return active_seconds / (self.limit * elapsed) if elapsed > 0 else 0.0
 
     def _waiting_count(self) -> int:
         return sum(len(waiters) for waiters in self._waiters.values())
@@ -757,6 +798,7 @@ class FairRequestPool:
                 self._waiters.pop(sample_key, None)
             if future.cancelled():
                 continue
+            self._update_utilization_clock()
             self.active += 1
             self.peak_active = max(self.peak_active, self.active)
             future.set_result(None)
@@ -798,12 +840,14 @@ class FairRequestPool:
                         self._waiters.pop(normalized_key, None)
                         self._remove_sample_from_order(normalized_key)
                 else:
+                    self._update_utilization_clock()
                     self.active = max(0, self.active - 1)
                 self._dispatch_locked()
             raise
 
     async def release(self) -> None:
         async with self._lock:
+            self._update_utilization_clock()
             self.active = max(0, self.active - 1)
             self._dispatch_locked()
 

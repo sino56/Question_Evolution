@@ -598,6 +598,21 @@ def parse_evolution_response(response_text: str) -> Dict[str, Any]:
             parsed = loads_json_with_repair(candidate)
             if not isinstance(parsed, dict):
                 raise ValueError("evolution 响应必须是 JSON 对象")
+            status = str(parsed.get("status") or "").strip().lower()
+            applicable = parsed.get("applicable")
+            if status == "not_applicable" or applicable is False:
+                reason = str(
+                    parsed.get("not_applicable_reason")
+                    or parsed.get("reason")
+                    or ""
+                ).strip()
+                if not reason:
+                    raise ValueError("not_applicable 必须包含非空原因")
+                return {
+                    "status": "not_applicable",
+                    "not_applicable": True,
+                    "not_applicable_reason": reason,
+                }
             if "evolved_prompt" not in parsed:
                 raise ValueError("evolution 响应缺少 evolved_prompt 字段")
             evolved_prompt = str(parsed["evolved_prompt"]).strip()
@@ -765,7 +780,7 @@ def resolve_operator_id(item: Dict[str, Any]) -> str:
 
 
 def get_candidate_group_id(item: Dict[str, Any]) -> str:
-    for field in ("sample_id", "index"):
+    for field in ("candidate_group_id", "parent_node_id", "sample_id", "index"):
         value = item.get(field)
         if value is not None and str(value).strip():
             return str(value).strip()
@@ -912,6 +927,24 @@ def make_generation_failure_passthrough_candidate_record(
 
 
 def should_evolve(item: Dict[str, Any], min_score_rate: float) -> bool:
+    search_state = item.get("search_state")
+    if not isinstance(search_state, dict):
+        search_state = item.get("multi_operator_search_state")
+    if isinstance(search_state, dict):
+        search_status = str(search_state.get("status") or "").strip()
+        termination_reason = str(search_state.get("termination_reason") or "").strip()
+        if search_status in {"completed", "aborted", "partial"} or termination_reason in {
+            "boundary_target_reached",
+            "candidate_list_exhausted",
+            "operator_space_exhausted",
+            "partial_coverage",
+            "evaluation_budget_exhausted",
+            "request_budget_exhausted",
+            "timeout",
+            "fatal_error",
+            "aborted",
+        }:
+            return False
     if uses_stage_action_contract(item):
         budget = get_round0_recommended_budget(item)
         if budget == 0:
@@ -1030,6 +1063,12 @@ def validate_evolved_result_against_stage_rules(
     item: Dict[str, Any],
     evolved: Dict[str, Any],
 ) -> Dict[str, Any]:
+    if evolved.get("not_applicable") is True:
+        return {
+            "passed": True,
+            "not_applicable": True,
+            "not_applicable_reason": evolved.get("not_applicable_reason"),
+        }
     probe = build_validation_probe_record(item, evolved)
     return validation_stage.validate_record(probe)
 
@@ -1045,6 +1084,8 @@ def enrich_evolution_result_with_operator(
     enriched = dict(evolved)
     enriched["operator_used"] = operator_id
     enriched["ability_axis"] = spec.ability_axis
+    if enriched.get("not_applicable") is True:
+        return enriched
 
     target_failure = str(diagnosis.get("target_failure_mode", "") or "").strip()
     cause = str(diagnosis.get("candidate_overscore_cause", "") or "").strip()
@@ -1159,7 +1200,12 @@ def make_evolved_candidate_record(
     candidate_operator = operator_id or evolved.get("operator_used")
     candidate_operator = candidate_operator.strip() if isinstance(candidate_operator, str) else ""
     result["candidate_group_id"] = group_id
-    result["candidate_id"] = f"{group_id}::cand_{candidate_index}"
+    stable_branch_id = str(item.get("branch_id") or item.get("candidate_id") or "").strip()
+    result["candidate_id"] = stable_branch_id or f"{group_id}::cand_{candidate_index}"
+    if stable_branch_id:
+        result["branch_id"] = stable_branch_id
+    if item.get("parent_node_id") is not None:
+        result["parent_node_id"] = item.get("parent_node_id")
     result["candidate_operator"] = candidate_operator
     if candidate_operator:
         meta_info = result.get("meta_info")
@@ -1175,6 +1221,36 @@ def make_evolved_candidate_record(
         "num_candidates_requested": requested_candidates,
         "operator_id": operator_id,
         "operator_source": "primary" if candidate_index == 1 else f"backup_{candidate_index - 1}",
+    }
+    return result
+
+
+def make_not_applicable_candidate_record(
+    item: Dict[str, Any],
+    *,
+    requested_candidates: int,
+    operator_id: str,
+    reason: str,
+) -> Dict[str, Any]:
+    result = make_passthrough_record(
+        item,
+        generation_status="not_applicable",
+        failure_reason=reason,
+    )
+    group_id = get_candidate_group_id(item)
+    branch_id = str(item.get("branch_id") or item.get("candidate_id") or "").strip()
+    result["candidate_group_id"] = group_id
+    result["candidate_id"] = branch_id or f"{group_id}::{operator_id}"
+    result["branch_id"] = result["candidate_id"]
+    result["parent_node_id"] = item.get("parent_node_id") or group_id
+    result["candidate_operator"] = operator_id
+    result["candidate_generation"] = {
+        "candidate_index": 0,
+        "num_candidates_requested": requested_candidates,
+        "operator_id": operator_id,
+        "operator_source": "search_dispatch",
+        "generation_status": "not_applicable",
+        "not_applicable_reason": reason,
     }
     return result
 
@@ -1263,7 +1339,12 @@ class QuestionEvolutionProcessor:
         raise RuntimeError("question 进化重试逻辑异常退出")
 
     async def evolve_with_retry(self, item: Dict[str, Any], operator_id: Optional[str] = None) -> Dict[str, Any]:
-        reject_reason: Optional[str] = None
+        initial_feedback = item.get("search_generation_feedback")
+        reject_reason: Optional[str] = (
+            str(initial_feedback).strip()
+            if isinstance(initial_feedback, str) and initial_feedback.strip()
+            else None
+        )
         first_reject_reason: Optional[str] = None
         for validation_attempt in range(self.max_validation_retries + 1):
             evolved = await self._evolve_once_with_model_retry(
@@ -1347,6 +1428,16 @@ class QuestionEvolutionProcessor:
             for candidate_index, operator_id in enumerate(operator_ids, start=1):
                 try:
                     evolved = await self.evolve_with_retry(item, operator_id=operator_id)
+                    if evolved.get("not_applicable") is True:
+                        candidates.append(
+                            make_not_applicable_candidate_record(
+                                item,
+                                requested_candidates=candidate_count,
+                                operator_id=str(operator_id or ""),
+                                reason=str(evolved.get("not_applicable_reason") or "").strip(),
+                            )
+                        )
+                        continue
                     candidates.append(
                         make_evolved_candidate_record(
                             item,

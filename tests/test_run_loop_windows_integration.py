@@ -68,3 +68,15 @@ def test_windows_loop_exposes_separate_scoring_and_answer_request_limits():
     assert '"--qwen-max-concurrent" $QWEN_SCORING_MAX_CONCURRENT' in WINDOWS_LOOP
     assert '"--gpt-max-concurrent" $GPT_SCORING_MAX_CONCURRENT' in WINDOWS_LOOP
     assert '"--request-concurrency" $ANSWER_REQUEST_CONCURRENCY' in WINDOWS_LOOP
+
+
+def test_windows_loop_configures_the_asymmetric_answer_protocol():
+    assert '$SCORING_ANSWER_TRIALS = Get-EnvOrDefault "SCORING_ANSWER_TRIALS" "3"' in WINDOWS_LOOP
+    assert '$GPT_ANSWER_TRIALS = Get-EnvOrDefault "GPT_ANSWER_TRIALS" "3"' in WINDOWS_LOOP
+    assert '$ROUND0_INITIAL_TRIALS = Get-EnvOrDefault "ROUND0_INITIAL_TRIALS" "3"' in WINDOWS_LOOP
+    assert '$ROUND0_EXTRA_TRIALS = Get-EnvOrDefault "ROUND0_EXTRA_TRIALS" "0"' in WINDOWS_LOOP
+    assert '$ROUND0_MAX_TRIALS = Get-EnvOrDefault "ROUND0_MAX_TRIALS" "3"' in WINDOWS_LOOP
+    assert '"--gpt-answer-trials" $GPT_ANSWER_TRIALS' in WINDOWS_LOOP
+    assert '"--gpt-answer-base-url" $GPT_ANSWER_BASE_URL' in WINDOWS_LOOP
+    assert '"--gpt-answer-api-key" $GPT_ANSWER_API_KEY' in WINDOWS_LOOP
+    assert '"--gpt-answer-model" $GPT_ANSWER_MODEL' in WINDOWS_LOOP

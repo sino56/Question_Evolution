@@ -294,11 +294,21 @@ def test_process_item_rewrites_top_level_to_representative_trial():
 def test_stability_report_contains_cost_and_shift_metrics():
     item = profiled_item(compute_score_summary(trials([0.82, 0.86, 0.84])))
     item["meta_info"] = {"pre_stability_score_rate": 0.70}
+    item["round0_score_trials"] = [
+        {"qwen_judge_repeats": 2, "gpt_judge_repeats": 0, "gpt_answer_judge_repeats": 2}
+        for _ in range(3)
+    ]
+    item["round0_gpt_answer_trials"] = [{"trial_index": index} for index in range(1, 4)]
     report = build_stability_report([item], 0.8)
 
     assert report["total_samples"] == 1
     assert report["average_trial_count"] == 3
-    assert report["estimated_cost_per_100_samples"]["answer_calls"] == 300
+    assert report["estimated_cost_per_100_samples"]["answer_calls"] == 600
+    assert report["estimated_cost_per_100_samples"]["qwen_answer_calls"] == 300
+    assert report["estimated_cost_per_100_samples"]["gpt_answer_calls"] == 300
+    assert report["estimated_cost_per_100_samples"]["judge_calls"] == 1200
+    assert report["estimated_cost_per_100_samples"]["qwen_judge_calls"] == 600
+    assert report["estimated_cost_per_100_samples"]["gpt_judge_calls"] == 600
     assert report["classification_distribution"]["stable_high"] == 1
     assert report["legacy_vs_stable_admission"]["rescued_by_stability"] == 1
 

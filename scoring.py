@@ -56,12 +56,23 @@ GPT_JUDGE_BASE_URL = (
     or os.getenv("OPENAI_BASE_URL")
     or get_config_value("GPT_JUDGE_BASE_URL", "OPENAI_BASE_URL", "BASE_URL", default="")
 )
+GPT_ANSWER_MODEL = (
+    os.getenv("GPT_ANSWER_MODEL")
+    or os.getenv("GPT_MODEL")
+    or get_config_value("GPT_ANSWER_MODEL", "GPT_MODEL", "QA_MODEL", default=GPT_JUDGE_MODEL)
+)
+GPT_ANSWER_BASE_URL = (
+    os.getenv("GPT_ANSWER_BASE_URL")
+    or os.getenv("OPENAI_BASE_URL")
+    or get_config_value("GPT_ANSWER_BASE_URL", "OPENAI_BASE_URL", "BASE_URL", default=GPT_JUDGE_BASE_URL)
+)
 
 
 ANSWER_PLACEHOLDER = "<<<待评答案>>"
 REQUEST_TIMEOUT_SECONDS = 180.0
-EVALUATION_PROTOCOL = "dual_judge_parallel_v1"
+EVALUATION_PROTOCOL = "asymmetric_dual_answer_v2"
 DEFAULT_ANSWER_TRIALS = 3
+DEFAULT_GPT_ANSWER_TRIALS = 3
 DEFAULT_QWEN_JUDGE_REPEATS = 2
 DEFAULT_GPT_JUDGE_REPEATS = 2
 
@@ -153,6 +164,36 @@ def parse_gpt_judge_api_keys(cli_keys: Optional[List[str]] = None) -> List[str]:
         "API_KEYS",
     )
     return keys or ["EMPTY_KEY"]
+
+
+def resolve_gpt_answer_api_key(cli_key: str = "") -> str:
+    """Resolve the GPT answer credential without falling back to the Qwen key."""
+    text = (cli_key or "").strip()
+    if text:
+        return text
+    raw = (
+        os.getenv("GPT_ANSWER_API_KEY")
+        or os.getenv("GPT_JUDGE_API_KEY")
+        or os.getenv("GPT_API_KEYS")
+        or os.getenv("HIAPI_KEYS_BIG")
+        or os.getenv("OPENAI_API_KEY")
+        or ""
+    )
+    keys = [part.strip() for part in raw.split(",") if part.strip()]
+    if keys:
+        return keys[0]
+    config_keys = get_config_list(
+        "GPT_ANSWER_API_KEYS",
+        "GPT_ANSWER_API_KEY",
+        "GPT_JUDGE_API_KEYS",
+        "GPT_JUDGE_API_KEY",
+        "GPT_API_KEYS",
+        "HIAPI_KEYS_BIG",
+        "OPENAI_API_KEYS",
+        "OPENAI_API_KEY",
+        "API_KEYS",
+    )
+    return config_keys[0] if config_keys else ""
 
 
 def extract_answer(resp) -> str:
@@ -519,25 +560,35 @@ class ScoringProcessor:
         max_retries: int = 3,
         answer_client: Optional[AnswerLLMClient] = None,
         answer_model_name: str = "",
+        gpt_answer_client: Optional[AnswerLLMClient] = None,
+        gpt_answer_model_name: str = "",
         force_generate_answer: bool = False,
         judge_temperature: float = 0.0,
         gpt_judge_client: Optional[RotatingAPIClient] = None,
         gpt_judge_model: str = "",
         gpt_judge_temperature: float = 0.0,
         answer_trials: int = 1,
+        gpt_answer_trials: int = 0,
         qwen_judge_repeats: int = 1,
         gpt_judge_repeats: int = 0,
+        gpt_score_qwen_answers: bool = True,
         qwen_max_concurrent: int = 20,
         gpt_max_concurrent: int = 20,
     ):
         if answer_trials < 1:
             raise ValueError("answer_trials must be >= 1")
+        if gpt_answer_trials < 0:
+            raise ValueError("gpt_answer_trials must be >= 0")
         if qwen_judge_repeats < 1:
             raise ValueError("qwen_judge_repeats must be >= 1")
         if gpt_judge_repeats < 0:
             raise ValueError("gpt_judge_repeats must be >= 0")
         if gpt_judge_repeats and not gpt_judge_client:
             raise ValueError("gpt_judge_repeats > 0 but gpt_judge_client is missing")
+        if gpt_answer_trials and not gpt_answer_client:
+            raise ValueError("gpt_answer_trials > 0 but gpt_answer_client is missing")
+        if gpt_answer_trials and not gpt_judge_repeats:
+            raise ValueError("gpt_answer_trials > 0 requires gpt_judge_repeats > 0")
         self.judge_client = judge_client
         self.judge_model = judge_model
         self.gpt_judge_client = gpt_judge_client
@@ -545,12 +596,16 @@ class ScoringProcessor:
         self.answer_mode = answer_mode
         self.answer_client = answer_client
         self.answer_model_name = answer_model_name
+        self.gpt_answer_client = gpt_answer_client
+        self.gpt_answer_model_name = gpt_answer_model_name
         self.force_generate_answer = force_generate_answer
         self.judge_temperature = judge_temperature
         self.gpt_judge_temperature = gpt_judge_temperature
         self.answer_trials = int(answer_trials)
+        self.gpt_answer_trials = int(gpt_answer_trials)
         self.qwen_judge_repeats = int(qwen_judge_repeats)
         self.gpt_judge_repeats = int(gpt_judge_repeats)
+        self.gpt_score_qwen_answers = bool(gpt_score_qwen_answers)
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.qwen_request_pool = FairRequestPool(qwen_max_concurrent, "qwen")
         self.gpt_request_pool = FairRequestPool(gpt_max_concurrent, "gpt")
@@ -624,6 +679,36 @@ class ScoringProcessor:
                     raise
         raise RuntimeError("待评答案重试逻辑异常退出")
 
+    async def generate_gpt_candidate_answer(self, item: Dict[str, Any]) -> str:
+        if not self.gpt_answer_client:
+            raise ValueError("缺少 gpt_answer_client，无法生成 GPT 实验回答")
+        question = item.get("prompt")
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("缺少有效 prompt，无法生成 GPT 实验回答")
+        sample_key = self.get_item_key(item)
+        async with self.gpt_request_pool.request(sample_key):
+            return await self.gpt_answer_client.generate_answer(question.strip())
+
+    async def generate_gpt_candidate_answer_with_retry(self, item: Dict[str, Any]) -> str:
+        for attempt in range(self.max_retries + 1):
+            try:
+                answer = await self.generate_gpt_candidate_answer(item)
+                if isinstance(answer, str) and answer.strip():
+                    return answer.strip()
+                raise ValueError("GPT 实验回答为空")
+            except Exception as exc:
+                logger.warning(
+                    "生成 GPT 实验回答失败 (尝试 %s/%s): %s",
+                    attempt + 1,
+                    self.max_retries + 1,
+                    str(exc)[:200],
+                )
+                if attempt < self.max_retries:
+                    await asyncio.sleep(attempt + 1)
+                else:
+                    raise
+        raise RuntimeError("GPT 实验回答重试逻辑异常退出")
+
     async def score_once(
         self,
         score_prompt: str,
@@ -696,6 +781,7 @@ class ScoringProcessor:
         *,
         sample_key: str,
         trial_index: int,
+        answer_source: str,
         judge_name: str,
         repeat_index: int,
         judge_model: str,
@@ -705,6 +791,7 @@ class ScoringProcessor:
             EVALUATION_PROTOCOL,
             sample_key,
             str(trial_index),
+            answer_source,
             judge_name,
             str(repeat_index),
             raw_response,
@@ -724,6 +811,7 @@ class ScoringProcessor:
             "evaluation_protocol": EVALUATION_PROTOCOL,
             "sample_key": sample_key,
             "trial_index": trial_index,
+            "answer_source": answer_source,
             "judge": judge_name,
             "repeat_index": repeat_index,
             "judge_model": judge_model,
@@ -746,6 +834,7 @@ class ScoringProcessor:
         rubric: List[Dict[str, Any]],
         sample_key: str,
         trial_index: int,
+        answer_source: str,
         repeat_index: int,
         judge_name: str,
         judge_model: str,
@@ -759,6 +848,7 @@ class ScoringProcessor:
         trace_id = await self._register_trace(
             sample_key=sample_key,
             trial_index=trial_index,
+            answer_source=answer_source,
             judge_name=judge_name,
             repeat_index=repeat_index,
             judge_model=judge_model,
@@ -782,6 +872,7 @@ class ScoringProcessor:
         rubric: List[Dict[str, Any]],
         sample_key: str,
         trial_index: int,
+        answer_source: str,
         repeat_index: int,
         judge_name: str,
     ) -> Dict[str, Any]:
@@ -806,6 +897,7 @@ class ScoringProcessor:
             rubric=rubric,
             sample_key=sample_key,
             trial_index=trial_index,
+            answer_source=answer_source,
             repeat_index=repeat_index,
             judge_name=judge_name,
             judge_model=model,
@@ -816,6 +908,10 @@ class ScoringProcessor:
         item: Dict[str, Any],
         candidate_answer: str,
         trial_index: int = 1,
+        *,
+        answer_source: str = "qwen",
+        score_with_qwen: Optional[bool] = None,
+        score_with_gpt: Optional[bool] = None,
     ) -> Dict[str, Any]:
         score_prompt_template = item.get("score_prompt")
         rubric = item.get("rubric")
@@ -824,19 +920,31 @@ class ScoringProcessor:
         if not isinstance(rubric, list) or not rubric:
             raise ValueError("输入数据缺少非空 rubric")
 
+        if answer_source not in {"qwen", "gpt"}:
+            raise ValueError(f"unsupported answer_source: {answer_source}")
+        if score_with_qwen is None:
+            score_with_qwen = answer_source == "qwen"
+        if score_with_gpt is None:
+            score_with_gpt = answer_source == "gpt" or self.gpt_score_qwen_answers
+        if not score_with_qwen and not score_with_gpt:
+            raise ValueError("at least one judge must score an answer trial")
+
         final_prompt = build_scoring_prompt(score_prompt_template, candidate_answer.strip())
         sample_key = self.get_item_key(item)
-        qwen_tasks = [
-            self._score_judge_repeat(
-                final_prompt=final_prompt,
-                rubric=rubric,
-                sample_key=sample_key,
-                trial_index=trial_index,
-                repeat_index=repeat_index,
-                judge_name="qwen",
-            )
-            for repeat_index in range(1, self.qwen_judge_repeats + 1)
-        ]
+        qwen_tasks = []
+        if score_with_qwen:
+            qwen_tasks = [
+                self._score_judge_repeat(
+                    final_prompt=final_prompt,
+                    rubric=rubric,
+                    sample_key=sample_key,
+                    trial_index=trial_index,
+                    answer_source=answer_source,
+                    repeat_index=repeat_index,
+                    judge_name="qwen",
+                )
+                for repeat_index in range(1, self.qwen_judge_repeats + 1)
+            ]
 
         async def experimental_gpt(repeat_index: int) -> Dict[str, Any]:
             try:
@@ -845,6 +953,7 @@ class ScoringProcessor:
                     rubric=rubric,
                     sample_key=sample_key,
                     trial_index=trial_index,
+                    answer_source=answer_source,
                     repeat_index=repeat_index,
                     judge_name="gpt",
                 )
@@ -862,10 +971,12 @@ class ScoringProcessor:
                     "error": str(exc),
                 }
 
-        combined = await asyncio.gather(
-            *qwen_tasks,
-            *(experimental_gpt(index) for index in range(1, self.gpt_judge_repeats + 1)),
+        gpt_tasks = (
+            [experimental_gpt(index) for index in range(1, self.gpt_judge_repeats + 1)]
+            if score_with_gpt
+            else []
         )
+        combined = await asyncio.gather(*qwen_tasks, *gpt_tasks)
         qwen_results = list(combined[:len(qwen_tasks)])
         gpt_results = list(combined[len(qwen_tasks):])
         qwen_rates = [float(result["score_rate"]) for result in qwen_results]
@@ -874,24 +985,36 @@ class ScoringProcessor:
             for result in gpt_results
             if result.get("score_rate") is not None and "error" not in result
         ]
-        representative_qwen = qwen_results[0]
+        representative_result = qwen_results[0] if qwen_results else next(
+            (result for result in gpt_results if "error" not in result and result.get("score_rate") is not None),
+            None,
+        )
         trial_result = {
             "trial_index": trial_index,
+            "answer_source": answer_source,
             "candidate_answer": candidate_answer.strip(),
             "answer_mode": self.answer_mode,
-            "answer_model": self.answer_model_name if self.answer_mode == "llm" else "meta_info.references[0]",
+            "answer_model": (
+                self.gpt_answer_model_name
+                if answer_source == "gpt"
+                else self.answer_model_name if self.answer_mode == "llm" else "meta_info.references[0]"
+            ),
             "qwen_judge_results": qwen_results,
             "gpt_judge_results": gpt_results,
-            "qwen_score_mean": statistics.fmean(qwen_rates),
+            "qwen_score_mean": statistics.fmean(qwen_rates) if qwen_rates else None,
             "gpt_score_mean": statistics.fmean(gpt_rates) if gpt_rates else None,
-            # Legacy-compatible projection for Round 0 and callers that score one answer.
-            "item_scores": deepcopy(representative_qwen["item_scores"]),
-            "overall_comment": representative_qwen["overall_comment"],
-            "total_awarded": statistics.fmean(qwen_rates) * representative_qwen["total_possible"],
-            "total_possible": representative_qwen["total_possible"],
-            "judge_model": self.judge_model,
-            "judge_raw_response_trace_id": representative_qwen["raw_response_trace_id"],
         }
+        if representative_result is not None:
+            primary_rates = qwen_rates if qwen_rates else gpt_rates
+            trial_result.update({
+                # Legacy-compatible projection for Round 0 and callers that score one answer.
+                "item_scores": deepcopy(representative_result["item_scores"]),
+                "overall_comment": representative_result["overall_comment"],
+                "total_awarded": statistics.fmean(primary_rates) * representative_result["total_possible"],
+                "total_possible": representative_result["total_possible"],
+                "judge_model": self.judge_model if qwen_rates else self.gpt_judge_model,
+                "judge_raw_response_trace_id": representative_result["raw_response_trace_id"],
+            })
         return trial_result
 
     @staticmethod
@@ -913,7 +1036,13 @@ class ScoringProcessor:
             "experimental": experimental,
         }
 
-    def aggregate_answer_trials(self, trials: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def aggregate_answer_trials(
+        self,
+        trials: List[Dict[str, Any]],
+        gpt_answer_trials: Optional[List[Dict[str, Any]]] = None,
+        *,
+        experimental_pending: bool = False,
+    ) -> Dict[str, Any]:
         if not trials:
             raise ValueError("至少需要一个 answer trial")
         ordered_trials = sorted(trials, key=lambda trial: int(trial.get("trial_index") or 0))
@@ -936,11 +1065,62 @@ class ScoringProcessor:
             experimental=False,
         )
         qwen_summary["decision_source"] = "qwen"
+        qwen_answer_gpt_request_count = (
+            len(ordered_trials) * self.gpt_judge_repeats
+            if self.gpt_score_qwen_answers
+            else 0
+        )
         gpt_summary = self._score_summary(
             gpt_rates,
-            requested_count=len(ordered_trials) * self.gpt_judge_repeats,
+            requested_count=0 if experimental_pending else qwen_answer_gpt_request_count,
             experimental=True,
         )
+        gpt_summary["answer_source"] = "qwen"
+        gpt_summary["judge_source"] = "gpt"
+        if experimental_pending:
+            gpt_summary["pending_count"] = qwen_answer_gpt_request_count
+            gpt_summary["status"] = "pending" if qwen_answer_gpt_request_count else "completed"
+
+        ordered_gpt_answer_trials = sorted(
+            list(gpt_answer_trials or []),
+            key=lambda trial: int(trial.get("trial_index") or 0),
+        )
+        if any(trial.get("qwen_judge_results") for trial in ordered_gpt_answer_trials):
+            raise ValueError("GPT answers must not be scored by the Qwen judge")
+        gpt_answer_rates = [
+            float(result["score_rate"])
+            for trial in ordered_gpt_answer_trials
+            for result in trial.get("gpt_judge_results", [])
+            if "error" not in result and result.get("score_rate") is not None
+        ]
+        gpt_answer_request_count = (
+            self.gpt_answer_trials * self.gpt_judge_repeats
+            if experimental_pending
+            else len(ordered_gpt_answer_trials) * self.gpt_judge_repeats
+        )
+        gpt_answer_summary = self._score_summary(
+            gpt_answer_rates,
+            requested_count=0 if experimental_pending else gpt_answer_request_count,
+            experimental=True,
+        )
+        gpt_answer_summary["answer_source"] = "gpt"
+        gpt_answer_summary["judge_source"] = "gpt"
+        if experimental_pending:
+            gpt_answer_summary["pending_count"] = gpt_answer_request_count
+            gpt_answer_summary["status"] = "pending" if gpt_answer_request_count else "completed"
+        gpt_answer_generation_summary = {
+            "requested_count": 0 if experimental_pending else len(ordered_gpt_answer_trials),
+            "successful_count": sum(
+                1 for trial in ordered_gpt_answer_trials if isinstance(trial.get("candidate_answer"), str) and trial["candidate_answer"].strip()
+            ),
+            "failed_count": sum(1 for trial in ordered_gpt_answer_trials if trial.get("error")),
+            "experimental": True,
+        }
+        if experimental_pending:
+            gpt_answer_generation_summary["pending_count"] = self.gpt_answer_trials
+            gpt_answer_generation_summary["status"] = (
+                "pending" if self.gpt_answer_trials else "completed"
+            )
         overall_qwen_mean = float(qwen_summary["score_mean"])
         representative = min(
             ordered_trials,
@@ -964,9 +1144,45 @@ class ScoringProcessor:
             "judge_raw_response_trace_id": representative_qwen["raw_response_trace_id"],
             "representative_trial_index": representative["trial_index"],
             "answer_trials": ordered_trials,
+            "gpt_answer_trials": ordered_gpt_answer_trials,
             "qwen_score_summary": qwen_summary,
+            "qwen_answer_gpt_score_summary": deepcopy(gpt_summary),
             "gpt_score_summary": gpt_summary,
+            "gpt_answer_score_summary": gpt_answer_summary,
+            "gpt_answer_generation_summary": gpt_answer_generation_summary,
         }
+
+    async def run_gpt_answer_trial(self, item: Dict[str, Any], trial_index: int) -> Dict[str, Any]:
+        """Generate and self-score one GPT answer without affecting the Qwen online path."""
+        try:
+            candidate_answer = await self.generate_gpt_candidate_answer_with_retry(item)
+            return await self.score_candidate_answer(
+                item,
+                candidate_answer,
+                trial_index=trial_index,
+                answer_source="gpt",
+                score_with_qwen=False,
+                score_with_gpt=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "GPT 实验回答轨道失败 sample=%s trial=%s error=%s",
+                self.get_item_key(item),
+                trial_index,
+                str(exc)[:200],
+            )
+            return {
+                "trial_index": trial_index,
+                "answer_source": "gpt",
+                "answer_mode": "llm",
+                "answer_model": self.gpt_answer_model_name,
+                "candidate_answer": "",
+                "qwen_judge_results": [],
+                "gpt_judge_results": [],
+                "qwen_score_mean": None,
+                "gpt_score_mean": None,
+                "error": str(exc),
+            }
 
     async def process_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         async with self.semaphore:
@@ -991,26 +1207,201 @@ class ScoringProcessor:
                     existing_answer = raw_existing_answer.strip()
                     logger.info(f"首个 trial 读取已有 candidate_answer (index={item.get('index')})")
 
-            async def run_trial(trial_index: int) -> Dict[str, Any]:
+            async def run_qwen_trial(trial_index: int) -> Dict[str, Any]:
                 if self.answer_mode == "reference":
                     candidate_answer = self.get_reference_answer(item)
                 elif trial_index == 1 and existing_answer is not None:
                     candidate_answer = existing_answer
                 else:
                     candidate_answer = await self.generate_candidate_answer_with_retry(item)
-                return await self.score_candidate_answer(item, candidate_answer, trial_index=trial_index)
+                return await self.score_candidate_answer(
+                    item,
+                    candidate_answer,
+                    trial_index=trial_index,
+                    answer_source="qwen",
+                    score_with_qwen=True,
+                    score_with_gpt=self.gpt_score_qwen_answers,
+                )
 
-            trials = await asyncio.gather(*[
-                run_trial(trial_index)
+            qwen_trials_task = asyncio.gather(*[
+                run_qwen_trial(trial_index)
                 for trial_index in range(1, self.answer_trials + 1)
             ])
-            item["scoring_result"] = self.aggregate_answer_trials(list(trials))
+            gpt_trials_task = asyncio.gather(*[
+                self.run_gpt_answer_trial(item, trial_index)
+                for trial_index in range(1, self.gpt_answer_trials + 1)
+            ])
+            trials, gpt_answer_trials = await asyncio.gather(qwen_trials_task, gpt_trials_task)
+            item["scoring_result"] = self.aggregate_answer_trials(
+                list(trials),
+                list(gpt_answer_trials),
+            )
             item["evaluation_protocol"] = EVALUATION_PROTOCOL
             item["qwen_score_summary"] = deepcopy(item["scoring_result"]["qwen_score_summary"])
             item["gpt_score_summary"] = deepcopy(item["scoring_result"]["gpt_score_summary"])
+            item["qwen_answer_gpt_score_summary"] = deepcopy(
+                item["scoring_result"]["qwen_answer_gpt_score_summary"]
+            )
+            item["gpt_answer_score_summary"] = deepcopy(item["scoring_result"]["gpt_answer_score_summary"])
+            item["gpt_answer_generation_summary"] = deepcopy(
+                item["scoring_result"]["gpt_answer_generation_summary"]
+            )
             item["representative_trial_index"] = item["scoring_result"]["representative_trial_index"]
+            item["decision_evaluation_status"] = "completed"
+            item["experimental_evaluation_status"] = "completed"
+            item["scoring_result"]["decision_evaluation_status"] = "completed"
+            item["scoring_result"]["experimental_evaluation_status"] = "completed"
             attach_score_rate(item)
             return item
+
+    def _attach_aggregate_result(
+        self,
+        item: Dict[str, Any],
+        aggregate: Dict[str, Any],
+        *,
+        experimental_status: str,
+    ) -> Dict[str, Any]:
+        item["scoring_result"] = aggregate
+        item["evaluation_protocol"] = EVALUATION_PROTOCOL
+        item["qwen_score_summary"] = deepcopy(aggregate["qwen_score_summary"])
+        item["gpt_score_summary"] = deepcopy(aggregate["gpt_score_summary"])
+        item["qwen_answer_gpt_score_summary"] = deepcopy(
+            aggregate["qwen_answer_gpt_score_summary"]
+        )
+        item["gpt_answer_score_summary"] = deepcopy(
+            aggregate["gpt_answer_score_summary"]
+        )
+        item["gpt_answer_generation_summary"] = deepcopy(
+            aggregate["gpt_answer_generation_summary"]
+        )
+        item["representative_trial_index"] = aggregate["representative_trial_index"]
+        item["decision_evaluation_status"] = "completed"
+        item["experimental_evaluation_status"] = experimental_status
+        aggregate["decision_evaluation_status"] = "completed"
+        aggregate["experimental_evaluation_status"] = experimental_status
+        attach_score_rate(item)
+        return item
+
+    async def process_decision_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Complete the Qwen online decision path without awaiting GPT work."""
+
+        async with self.semaphore:
+            ensure_sample_identity(item)
+            if item.get("question_evolved") is False:
+                ensure_passthrough_reusable(
+                    item,
+                    stage="scoring_decision",
+                    required=("rubric", "score_prompt", "scoring_result"),
+                )
+                item["decision_evaluation_status"] = "completed"
+                item["experimental_evaluation_status"] = "completed"
+                attach_score_rate(item)
+                return item
+
+            existing_answer = None
+            if self.answer_mode == "llm" and not self.force_generate_answer:
+                raw_existing_answer = item.get("scoring_result", {}).get("candidate_answer")
+                if isinstance(raw_existing_answer, str) and raw_existing_answer.strip():
+                    existing_answer = raw_existing_answer.strip()
+
+            async def run_qwen_trial(trial_index: int) -> Dict[str, Any]:
+                if self.answer_mode == "reference":
+                    candidate_answer = self.get_reference_answer(item)
+                elif trial_index == 1 and existing_answer is not None:
+                    candidate_answer = existing_answer
+                else:
+                    candidate_answer = await self.generate_candidate_answer_with_retry(item)
+                return await self.score_candidate_answer(
+                    item,
+                    candidate_answer,
+                    trial_index=trial_index,
+                    answer_source="qwen",
+                    score_with_qwen=True,
+                    score_with_gpt=False,
+                )
+
+            trials = await asyncio.gather(
+                *[
+                    run_qwen_trial(trial_index)
+                    for trial_index in range(1, self.answer_trials + 1)
+                ]
+            )
+            has_experimental_work = bool(
+                (self.gpt_score_qwen_answers and self.gpt_judge_repeats)
+                or self.gpt_answer_trials
+            )
+            aggregate = self.aggregate_answer_trials(
+                list(trials),
+                [],
+                experimental_pending=has_experimental_work,
+            )
+            return self._attach_aggregate_result(
+                item,
+                aggregate,
+                experimental_status="pending" if has_experimental_work else "completed",
+            )
+
+    async def process_experimental_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Fill the recoverable GPT lane while preserving the Qwen decision."""
+
+        async with self.semaphore:
+            ensure_sample_identity(item)
+            if item.get("question_evolved") is False:
+                item["decision_evaluation_status"] = "completed"
+                item["experimental_evaluation_status"] = "completed"
+                attach_score_rate(item)
+                return item
+            if item.get("decision_evaluation_status") != "completed":
+                raise ValueError("experimental evaluation requires a completed decision checkpoint")
+            scoring_result = item.get("scoring_result")
+            if not isinstance(scoring_result, dict):
+                raise ValueError("decision checkpoint is missing scoring_result")
+            decision_trials = scoring_result.get("answer_trials")
+            if not isinstance(decision_trials, list) or not decision_trials:
+                raise ValueError("decision checkpoint is missing Qwen answer trials")
+
+            async def fill_qwen_answer_gpt_scores(
+                trial: Dict[str, Any],
+            ) -> Dict[str, Any]:
+                merged = deepcopy(trial)
+                if not self.gpt_score_qwen_answers or not self.gpt_judge_repeats:
+                    merged["gpt_judge_results"] = []
+                    merged["gpt_score_mean"] = None
+                    return merged
+                experimental = await self.score_candidate_answer(
+                    item,
+                    str(trial.get("candidate_answer") or ""),
+                    trial_index=int(trial.get("trial_index") or 0),
+                    answer_source="qwen",
+                    score_with_qwen=False,
+                    score_with_gpt=True,
+                )
+                merged["gpt_judge_results"] = experimental["gpt_judge_results"]
+                merged["gpt_score_mean"] = experimental["gpt_score_mean"]
+                return merged
+
+            qwen_trial_task = asyncio.gather(
+                *[fill_qwen_answer_gpt_scores(trial) for trial in decision_trials]
+            )
+            gpt_answer_task = asyncio.gather(
+                *[
+                    self.run_gpt_answer_trial(item, trial_index)
+                    for trial_index in range(1, self.gpt_answer_trials + 1)
+                ]
+            )
+            completed_trials, gpt_answer_trials = await asyncio.gather(
+                qwen_trial_task,
+                gpt_answer_task,
+            )
+            aggregate = self.aggregate_answer_trials(
+                list(completed_trials),
+                list(gpt_answer_trials),
+            )
+            return self._attach_aggregate_result(
+                item,
+                aggregate,
+                experimental_status="completed",
+            )
 
     @staticmethod
     def trace_sidecar_path(output_path: str) -> str:
@@ -1049,6 +1440,26 @@ class ScoringProcessor:
                             self._trace_entries[trace_id] = entry
             except Exception as exc:
                 logger.warning("读取已有 judge trace 失败 %s: %s", path, str(exc)[:200])
+
+    def load_input_traces(self, input_path: str) -> None:
+        """Import decision-checkpoint traces into the final complete sidecar."""
+
+        sidecar_path = self.trace_sidecar_path(input_path)
+        if not os.path.exists(sidecar_path):
+            return
+        try:
+            with gzip.open(sidecar_path, "rt", encoding="utf-8") as trace_file:
+                for line in trace_file:
+                    if not line.strip():
+                        continue
+                    entry = json.loads(line)
+                    trace_id = entry.get("trace_id")
+                    if isinstance(trace_id, str) and trace_id:
+                        self._trace_entries.setdefault(trace_id, entry)
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to import decision trace sidecar {sidecar_path}: {exc}"
+            ) from exc
 
     @staticmethod
     def _sha256_file(path: str) -> str:
@@ -1158,19 +1569,28 @@ class ScoringProcessor:
         *,
         performance_path: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
+        evaluation_mode: str = "complete",
     ):
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"输入文件不存在: {input_path}")
 
-        stage = "scoring"
+        if evaluation_mode not in {"complete", "decision", "experimental"}:
+            raise ValueError(f"unsupported evaluation_mode: {evaluation_mode}")
+        stage = "scoring_decision" if evaluation_mode == "decision" else "scoring"
         resolved_config = config or {
             "judge_model": self.judge_model,
             "gpt_judge_model": self.gpt_judge_model,
             "answer_mode": self.answer_mode,
             "answer_trials": self.answer_trials,
+            "gpt_answer_model": self.gpt_answer_model_name,
+            "gpt_answer_trials": self.gpt_answer_trials,
             "qwen_judge_repeats": self.qwen_judge_repeats,
             "gpt_judge_repeats": self.gpt_judge_repeats,
+            "gpt_score_qwen_answers": self.gpt_score_qwen_answers,
+            "evaluation_mode": evaluation_mode,
         }
+        if "evaluation_mode" not in resolved_config:
+            resolved_config = {**resolved_config, "evaluation_mode": evaluation_mode}
         valid, _ = validate_published_artifact(
             output_path,
             stage=stage,
@@ -1192,13 +1612,20 @@ class ScoringProcessor:
             metrics=metrics,
         )
         self.load_existing_traces(output_path)
+        if evaluation_mode == "experimental":
+            self.load_input_traces(input_path)
         failed_path = output_path + ".failed"
         results: List[Dict[str, Any]] = []
         failed_count = 0
 
         async def worker(item: Dict[str, Any]):
             try:
-                processed_item = await self.process_item(item)
+                if evaluation_mode == "decision":
+                    processed_item = await self.process_decision_item(item)
+                elif evaluation_mode == "experimental":
+                    processed_item = await self.process_experimental_item(item)
+                else:
+                    processed_item = await self.process_item(item)
                 return processed_item, None
             except Exception as exc:
                 failed_item = dict(item)
@@ -1265,6 +1692,7 @@ class ScoringProcessor:
             writer.publish(
                 extra_manifest={
                     "evaluation_protocol": EVALUATION_PROTOCOL,
+                    "evaluation_mode": evaluation_mode,
                     "judge_trace_sidecar": sidecar_meta,
                 }
             )
@@ -1289,11 +1717,18 @@ async def main():
     parser.add_argument("--output", type=str, help="输出 jsonl 文件路径，默认在输入文件名后追加 _scored")
     parser.add_argument("--concurrency", type=int, default=20, help="并行处理的题目 worker 数量")
     parser.add_argument("--retries", type=int, default=3, help="评分调用失败时的重试次数")
-    parser.add_argument("--answer-trials", type=int, default=None, help="每题回答 trial 数；llm 模式默认 3，reference 模式默认 1")
+    parser.add_argument("--answer-trials", type=int, default=None, help="每题 Qwen 回答 trial 数；llm 模式默认 3，reference 模式默认 1")
+    parser.add_argument("--gpt-answer-trials", type=int, default=None, help="每题 GPT 实验回答 trial 数；llm 模式默认 3，reference 模式默认 0")
     parser.add_argument("--qwen-judge-repeats", type=int, default=DEFAULT_QWEN_JUDGE_REPEATS, help="每个回答的 Qwen judge 独立评分次数")
     parser.add_argument("--gpt-judge-repeats", type=int, default=DEFAULT_GPT_JUDGE_REPEATS, help="每个回答的 GPT 实验复评次数；设为 0 可关闭")
+    parser.add_argument(
+        "--evaluation-mode",
+        choices=["complete", "decision", "experimental"],
+        default="complete",
+        help="complete=同步完整评分；decision=仅发布 Qwen 决策检查点；experimental=从决策检查点补齐 GPT 并发布完整评分",
+    )
     parser.add_argument("--qwen-max-concurrent", type=int, default=20, help="Qwen answer 与 Qwen judge 共享请求池的在途上限")
-    parser.add_argument("--gpt-max-concurrent", type=int, default=20, help="GPT judge 独立请求池的在途上限")
+    parser.add_argument("--gpt-max-concurrent", type=int, default=20, help="GPT answer 与 GPT judge 共享请求池的在途上限")
     parser.add_argument("--judge-model", type=str, default=JUDGE_MODEL, help="评分模型名称")
     parser.add_argument("--judge-base-url", type=str, default=JUDGE_BASE_URL, help="评分模型 OpenAI-compatible base_url")
     parser.add_argument("--judge-api-key", action="append", default=None, help="评分模型 API key；可多次传入。本地 Qwen 服务不需要 key 时可不传。")
@@ -1302,6 +1737,16 @@ async def main():
     parser.add_argument("--gpt-judge-base-url", type=str, default=GPT_JUDGE_BASE_URL, help="GPT 实验评分服务 base_url")
     parser.add_argument("--gpt-judge-api-key", action="append", default=None, help="GPT 实验评分 API key；可多次传入")
     parser.add_argument("--gpt-judge-temperature", type=float, default=0.0, help="GPT 实验评分 temperature")
+    parser.add_argument("--gpt-answer-model", type=str, default=GPT_ANSWER_MODEL, help="GPT 实验回答模型名称")
+    parser.add_argument("--gpt-answer-base-url", type=str, default=GPT_ANSWER_BASE_URL, help="GPT 实验回答服务 base_url")
+    parser.add_argument("--gpt-answer-api-key", type=str, default="", help="GPT 实验回答 API key")
+    parser.add_argument("--gpt-answer-temperature", type=float, default=None, help="GPT 实验回答 temperature")
+    parser.add_argument("--gpt-answer-top-p", type=float, default=None, help="GPT 实验回答 top_p")
+    parser.add_argument(
+        "--no-gpt-score-qwen-answers",
+        action="store_true",
+        help="关闭 GPT 对 Qwen 回答的实验复评；Round 0 使用该语义",
+    )
     parser.add_argument(
         "--answer-mode",
         type=str,
@@ -1331,6 +1776,11 @@ async def main():
         resolved_answer_trials = DEFAULT_ANSWER_TRIALS if args.answer_mode == "llm" else 1
     if resolved_answer_trials < 1:
         raise ValueError("--answer-trials 必须 >= 1")
+    resolved_gpt_answer_trials = args.gpt_answer_trials
+    if resolved_gpt_answer_trials is None:
+        resolved_gpt_answer_trials = DEFAULT_GPT_ANSWER_TRIALS if args.answer_mode == "llm" else 0
+    if resolved_gpt_answer_trials < 0:
+        raise ValueError("--gpt-answer-trials 必须 >= 0")
     if args.qwen_judge_repeats < 1:
         raise ValueError("--qwen-judge-repeats 必须 >= 1")
     if args.gpt_judge_repeats < 0:
@@ -1339,6 +1789,12 @@ async def main():
         raise ValueError("启用 GPT judge 时必须提供 --gpt-judge-base-url")
     if args.gpt_judge_repeats and not (args.gpt_judge_model or "").strip():
         raise ValueError("启用 GPT judge 时必须提供 --gpt-judge-model")
+    if resolved_gpt_answer_trials and not args.gpt_judge_repeats:
+        raise ValueError("启用 GPT 实验回答时 --gpt-judge-repeats 必须 >= 1")
+    if resolved_gpt_answer_trials and not (args.gpt_answer_base_url or "").strip():
+        raise ValueError("启用 GPT 实验回答时必须提供 --gpt-answer-base-url")
+    if resolved_gpt_answer_trials and not (args.gpt_answer_model or "").strip():
+        raise ValueError("启用 GPT 实验回答时必须提供 --gpt-answer-model")
 
     if not args.output:
         base, ext = os.path.splitext(args.input)
@@ -1346,6 +1802,7 @@ async def main():
 
     answer_client = None
     answer_model_name = ""
+    resolved_answer_model = ""
     if args.answer_mode == "llm":
         resolved_answer_base_url = (args.answer_base_url or ANSWER_BASE_URL).strip()
         resolved_answer_model = (args.answer_model or ANSWER_MODEL).strip()
@@ -1359,6 +1816,18 @@ async def main():
             model=resolved_answer_model
         )
         answer_model_name = resolved_answer_model
+
+    gpt_answer_client = None
+    gpt_answer_model_name = ""
+    if resolved_gpt_answer_trials:
+        gpt_answer_model_name = (args.gpt_answer_model or GPT_ANSWER_MODEL).strip()
+        gpt_answer_client = AnswerLLMClient(
+            base_url=(args.gpt_answer_base_url or GPT_ANSWER_BASE_URL).strip(),
+            api_key=resolve_gpt_answer_api_key(args.gpt_answer_api_key),
+            model=gpt_answer_model_name,
+            temperature=args.gpt_answer_temperature,
+            top_p=args.gpt_answer_top_p,
+        )
 
     judge_client = RotatingAPIClient(
         base_url=args.judge_base_url or JUDGE_BASE_URL,
@@ -1379,14 +1848,18 @@ async def main():
         max_retries=args.retries,
         answer_client=answer_client,
         answer_model_name=answer_model_name,
+        gpt_answer_client=gpt_answer_client,
+        gpt_answer_model_name=gpt_answer_model_name,
         force_generate_answer=args.force_generate_answer,
         judge_temperature=args.judge_temperature,
         gpt_judge_client=gpt_judge_client,
         gpt_judge_model=args.gpt_judge_model,
         gpt_judge_temperature=args.gpt_judge_temperature,
         answer_trials=resolved_answer_trials,
+        gpt_answer_trials=resolved_gpt_answer_trials,
         qwen_judge_repeats=args.qwen_judge_repeats,
         gpt_judge_repeats=args.gpt_judge_repeats,
+        gpt_score_qwen_answers=not args.no_gpt_score_qwen_answers,
         qwen_max_concurrent=args.qwen_max_concurrent,
         gpt_max_concurrent=args.gpt_max_concurrent,
     )
@@ -1396,20 +1869,27 @@ async def main():
             args.input,
             args.output,
             performance_path=args.performance_events,
+            evaluation_mode=args.evaluation_mode,
             config={
                 "answer_mode": args.answer_mode,
                 "answer_model": resolved_answer_model if args.answer_mode == "llm" else "reference",
                 "judge_model": args.judge_model or JUDGE_MODEL,
                 "gpt_judge_model": args.gpt_judge_model,
                 "answer_trials": resolved_answer_trials,
+                "gpt_answer_model": gpt_answer_model_name,
+                "gpt_answer_trials": resolved_gpt_answer_trials,
                 "qwen_judge_repeats": args.qwen_judge_repeats,
                 "gpt_judge_repeats": args.gpt_judge_repeats,
+                "gpt_score_qwen_answers": not args.no_gpt_score_qwen_answers,
                 "qwen_max_concurrent": args.qwen_max_concurrent,
                 "gpt_max_concurrent": args.gpt_max_concurrent,
                 "worker_concurrency": args.concurrency,
                 "retries": args.retries,
                 "judge_temperature": args.judge_temperature,
                 "gpt_judge_temperature": args.gpt_judge_temperature,
+                "gpt_answer_temperature": args.gpt_answer_temperature,
+                "gpt_answer_top_p": args.gpt_answer_top_p,
+                "evaluation_mode": args.evaluation_mode,
                 "force_generate_answer": args.force_generate_answer,
             },
         )
@@ -1419,6 +1899,8 @@ async def main():
             await gpt_judge_client.close()
         if answer_client is not None:
             await answer_client.close()
+        if gpt_answer_client is not None:
+            await gpt_answer_client.close()
 
 
 if __name__ == "__main__":

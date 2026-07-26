@@ -82,6 +82,7 @@ def append_unique_jsonl(records: Iterable[Dict[str, Any]], output_path: str) -> 
         os.makedirs(output_dir, exist_ok=True)
 
     seen = set()
+    seen_idempotency_keys = set()
     if os.path.isfile(output_path):
         with open(output_path, "r", encoding="utf-8") as existing:
             for line_number, line in enumerate(existing, start=1):
@@ -95,15 +96,23 @@ def append_unique_jsonl(records: Iterable[Dict[str, Any]], output_path: str) -> 
                         f"[update_sample_state:memory] {output_path}:{line_number}: {exc.msg}"
                     ) from exc
                 seen.add(json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+                key = _clean_text(item.get("memory_idempotency_key"))
+                if key:
+                    seen_idempotency_keys.add(key)
 
     appended = 0
     with open(output_path, "a", encoding="utf-8") as output:
         for record in records:
             canonical = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            if canonical in seen:
+            idempotency_key = _clean_text(record.get("memory_idempotency_key"))
+            if canonical in seen or (
+                idempotency_key and idempotency_key in seen_idempotency_keys
+            ):
                 continue
             output.write(json.dumps(record, ensure_ascii=False) + "\n")
             seen.add(canonical)
+            if idempotency_key:
+                seen_idempotency_keys.add(idempotency_key)
             appended += 1
         if appended:
             output.flush()
@@ -113,6 +122,11 @@ def append_unique_jsonl(records: Iterable[Dict[str, Any]], output_path: str) -> 
 
 def _clean_text(value: Any) -> str:
     return str(value).strip() if value is not None else ""
+
+
+def _memory_idempotency_key(item: Dict[str, Any], memory_type: str) -> str:
+    branch_id = _clean_text(item.get("branch_id") or item.get("candidate_id"))
+    return f"{branch_id}::{memory_type}" if branch_id else ""
 
 
 def _sample_id(item: Dict[str, Any]) -> Any:
@@ -367,7 +381,7 @@ def build_operator_memory_entry(item: Dict[str, Any]) -> Dict[str, Any]:
     reuse_note = "自动轻量命中，进入下一轮路由前建议人工复核。"
     if confidence == "low":
         reuse_note = "低置信命中，仅供人工复核和后续对照，不应沉淀为强成功经验。"
-    return {
+    entry = {
         "sample_id": _sample_id(item),
         "round": _round_value(item, _previous_state(item)),
         "sample_signature": sample_signature(item),
@@ -384,6 +398,11 @@ def build_operator_memory_entry(item: Dict[str, Any]) -> Dict[str, Any]:
         "effect_label": _clean_text(effect.get("effect_label")),
         "reuse_note": reuse_note,
     }
+    idempotency_key = _memory_idempotency_key(item, "operator")
+    if idempotency_key:
+        entry["memory_idempotency_key"] = idempotency_key
+        entry["branch_id"] = _clean_text(item.get("branch_id") or item.get("candidate_id"))
+    return entry
 
 
 def build_failure_memory_entry(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -394,7 +413,7 @@ def build_failure_memory_entry(item: Dict[str, Any]) -> Dict[str, Any]:
         _clean_text(effect.get("effect_label")),
         int(build_next_state(item).get("consecutive_full_score_count", 0) or 0),
     )
-    return {
+    entry = {
         "sample_id": _sample_id(item),
         "round": _round_value(item, _previous_state(item)),
         "sample_signature": sample_signature(item),
@@ -406,6 +425,11 @@ def build_failure_memory_entry(item: Dict[str, Any]) -> Dict[str, Any]:
         "failure_reason": _clean_text(effect.get("lightweight_hit_reason")) or "未形成清晰降分。",
         "avoid_note": "建议切换到：" + "、".join(recommended) if recommended else "建议避免重复当前问法。",
     }
+    idempotency_key = _memory_idempotency_key(item, "failure")
+    if idempotency_key:
+        entry["memory_idempotency_key"] = idempotency_key
+        entry["branch_id"] = _clean_text(item.get("branch_id") or item.get("candidate_id"))
+    return entry
 
 
 def build_invalid_generation_case(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -416,7 +440,7 @@ def build_invalid_generation_case(item: Dict[str, Any]) -> Dict[str, Any]:
     recommended = state.get("recommended_next_methods")
     if isinstance(recommended, list) and recommended:
         suggested = _clean_text(recommended[0])
-    return {
+    entry = {
         "sample_id": _sample_id(item),
         "round": _round_value(item, _previous_state(item)),
         "operator_used": _clean_text(effect.get("operator_used")),
@@ -425,6 +449,11 @@ def build_invalid_generation_case(item: Dict[str, Any]) -> Dict[str, Any]:
         "reason": _clean_text(validation.get("reject_reason")) or _clean_text(effect.get("lightweight_hit_reason")),
         "suggested_operator": suggested,
     }
+    idempotency_key = _memory_idempotency_key(item, "invalid_generation")
+    if idempotency_key:
+        entry["memory_idempotency_key"] = idempotency_key
+        entry["branch_id"] = _clean_text(item.get("branch_id") or item.get("candidate_id"))
+    return entry
 
 
 def normalize_preselection_invalid_case(item: Dict[str, Any]) -> Dict[str, Any]:

@@ -41,6 +41,9 @@ CONFIG_QWEN_MODEL=$(read_config_value QWEN_MODEL GPT_MODEL "hjl_Qwen3.6-27B")
 CONFIG_GPT_JUDGE_MODEL=$(read_config_value GPT_JUDGE_MODEL GPT_MODEL QA_MODEL "$CONFIG_GPT_MODEL")
 CONFIG_GPT_JUDGE_BASE_URL=$(read_config_value GPT_JUDGE_BASE_URL OPENAI_BASE_URL BASE_URL "$CONFIG_BASE_URL")
 CONFIG_GPT_JUDGE_API_KEY=$(read_config_value GPT_JUDGE_API_KEY OPENAI_API_KEY "")
+CONFIG_GPT_ANSWER_MODEL=$(read_config_value GPT_ANSWER_MODEL GPT_MODEL QA_MODEL "$CONFIG_GPT_MODEL")
+CONFIG_GPT_ANSWER_BASE_URL=$(read_config_value GPT_ANSWER_BASE_URL OPENAI_BASE_URL BASE_URL "$CONFIG_BASE_URL")
+CONFIG_GPT_ANSWER_API_KEY=$(read_config_value GPT_ANSWER_API_KEY GPT_JUDGE_API_KEY OPENAI_API_KEY "$CONFIG_GPT_JUDGE_API_KEY")
 CONFIG_PROFILE_MODEL=$(read_config_value PROFILE_MODEL EVOLVE_MODEL QA_MODEL GPT_MODEL "$CONFIG_GPT_MODEL")
 CONFIG_DIFFICULTY_GAIN_MODEL=$(read_config_value DIFFICULTY_GAIN_MODEL PROFILE_MODEL EVOLVE_MODEL QA_MODEL GPT_MODEL "$CONFIG_PROFILE_MODEL")
 CONFIG_DIFFICULTY_GAIN_BASE_URL=$(read_config_value DIFFICULTY_GAIN_BASE_URL PROFILE_BASE_URL EVOLVE_BASE_URL BASE_URL OPENAI_BASE_URL "$CONFIG_BASE_URL")
@@ -57,6 +60,14 @@ NO_INFO_STOP_ROUNDS=${NO_INFO_STOP_ROUNDS:-2}    # 连续多少轮无新信息�
 NO_INFO_MIN_DELTA=${NO_INFO_MIN_DELTA:-0.0001}   # 平均分变化小于该值视为无新信息
 MIN_SCORE_RATE=${MIN_SCORE_RATE:-0.8}            # legacy question_evolution 触发阈值
 NUM_CANDIDATES=${NUM_CANDIDATES:-2}              # 每条待进化样本最多生成候选数，范围 1-4
+SEARCH_MODE=${SEARCH_MODE:-single_branch}         # single_branch | multi_operator_branch
+SEARCH_BRANCH_WINDOW=${SEARCH_BRANCH_WINDOW:-1}   # 灰度默认 1；验证后可设为 3
+SEARCH_PIPELINE_MODE=${SEARCH_PIPELINE_MODE:-step} # step | stream
+SEARCH_ARTIFACT_RETENTION=${SEARCH_ARTIFACT_RETENTION:-compact} # compact | full
+DEFER_GPT_EXPERIMENTAL_EVALUATION=${DEFER_GPT_EXPERIMENTAL_EVALUATION:-false}
+SEARCH_OPERATOR_SORT_MODE=${SEARCH_OPERATOR_SORT_MODE:-route} # route | yield_per_time
+SEARCH_OPERATOR_EXPLORATION_RATIO=${SEARCH_OPERATOR_EXPLORATION_RATIO:-0.1}
+SEARCH_BOUNDARY_TARGET=${SEARCH_BOUNDARY_TARGET:-5}
 MAX_CANDIDATE_BUDGET=${MAX_CANDIDATE_BUDGET:-0}  # 单轮候选总预算；0 表示待进化样本数 * 2
 VALIDATION_RETRIES=${VALIDATION_RETRIES:-1}      # validate-retry 次数；当前最多 1 次
 MIN_DIFFICULTY_GAIN_SCORE=${MIN_DIFFICULTY_GAIN_SCORE:-0.75}
@@ -69,8 +80,8 @@ ENABLE_UNCERTAIN_LOW_PROBE=${ENABLE_UNCERTAIN_LOW_PROBE:-false}
 UNCERTAIN_LOW_PROBE_MIN_SCORE=${UNCERTAIN_LOW_PROBE_MIN_SCORE:-0.55}
 FAILURE_MEMORY_WINDOW_ROUNDS=${FAILURE_MEMORY_WINDOW_ROUNDS:-3}
 ROUND0_INITIAL_TRIALS=${ROUND0_INITIAL_TRIALS:-3}
-ROUND0_EXTRA_TRIALS=${ROUND0_EXTRA_TRIALS:-2}
-ROUND0_MAX_TRIALS=${ROUND0_MAX_TRIALS:-5}
+ROUND0_EXTRA_TRIALS=${ROUND0_EXTRA_TRIALS:-0}
+ROUND0_MAX_TRIALS=${ROUND0_MAX_TRIALS:-3}
 ROUND0_EDGE_LOW=${ROUND0_EDGE_LOW:-0.72}
 ROUND0_EDGE_HIGH=${ROUND0_EDGE_HIGH:-0.83}
 ROUND0_STRONG_HIGH_RATE=${ROUND0_STRONG_HIGH_RATE:-0.85}
@@ -79,6 +90,7 @@ ROUND0_ANSWER_TOP_P=${ROUND0_ANSWER_TOP_P:-0.95}
 ROUND0_ANSWER_SEED_BASE=${ROUND0_ANSWER_SEED_BASE:-20260704}
 ROUND0_JUDGE_TEMPERATURE=${ROUND0_JUDGE_TEMPERATURE:-0.0}
 SCORING_ANSWER_TRIALS=${SCORING_ANSWER_TRIALS:-3}
+GPT_ANSWER_TRIALS=${GPT_ANSWER_TRIALS:-3}
 QWEN_JUDGE_REPEATS=${QWEN_JUDGE_REPEATS:-2}
 GPT_JUDGE_REPEATS=${GPT_JUDGE_REPEATS:-2}
 
@@ -94,6 +106,9 @@ QWEN_MODEL=${QWEN_MODEL:-$CONFIG_QWEN_MODEL}
 GPT_JUDGE_MODEL=${GPT_JUDGE_MODEL:-$CONFIG_GPT_JUDGE_MODEL}
 GPT_JUDGE_BASE_URL=${GPT_JUDGE_BASE_URL:-$CONFIG_GPT_JUDGE_BASE_URL}
 GPT_JUDGE_API_KEY=${GPT_JUDGE_API_KEY:-$CONFIG_GPT_JUDGE_API_KEY}
+GPT_ANSWER_MODEL=${GPT_ANSWER_MODEL:-$CONFIG_GPT_ANSWER_MODEL}
+GPT_ANSWER_BASE_URL=${GPT_ANSWER_BASE_URL:-$CONFIG_GPT_ANSWER_BASE_URL}
+GPT_ANSWER_API_KEY=${GPT_ANSWER_API_KEY:-$CONFIG_GPT_ANSWER_API_KEY}
 
 # GPT / OpenAI-compatible 配置。API key 优先使用各脚本支持的环境变量：
 # PROFILE_API_KEYS、EVOLVE_API_KEYS、OPENAI_API_KEYS 或 OPENAI_API_KEY。
@@ -350,6 +365,14 @@ if [ ! -f "$SUMMARY_FILE" ]; then
     echo "No-info min delta: $NO_INFO_MIN_DELTA" >> "$SUMMARY_FILE"
     echo "Evolution trigger rate: $MIN_SCORE_RATE" >> "$SUMMARY_FILE"
     echo "Num candidates: $NUM_CANDIDATES" >> "$SUMMARY_FILE"
+    echo "Search mode: $SEARCH_MODE" >> "$SUMMARY_FILE"
+    echo "Search branch window: $SEARCH_BRANCH_WINDOW" >> "$SUMMARY_FILE"
+    echo "Search pipeline mode: $SEARCH_PIPELINE_MODE" >> "$SUMMARY_FILE"
+    echo "Search artifact retention: $SEARCH_ARTIFACT_RETENTION" >> "$SUMMARY_FILE"
+    echo "Deferred GPT experimental evaluation: $DEFER_GPT_EXPERIMENTAL_EVALUATION" >> "$SUMMARY_FILE"
+    echo "Search operator sort mode: $SEARCH_OPERATOR_SORT_MODE" >> "$SUMMARY_FILE"
+    echo "Search operator exploration ratio: $SEARCH_OPERATOR_EXPLORATION_RATIO" >> "$SUMMARY_FILE"
+    echo "Search boundary target: $SEARCH_BOUNDARY_TARGET" >> "$SUMMARY_FILE"
     echo "Max candidate budget: $MAX_CANDIDATE_BUDGET" >> "$SUMMARY_FILE"
     echo "Validation retries: $VALIDATION_RETRIES" >> "$SUMMARY_FILE"
     echo "Min difficulty gain score: $MIN_DIFFICULTY_GAIN_SCORE" >> "$SUMMARY_FILE"
@@ -360,6 +383,7 @@ if [ ! -f "$SUMMARY_FILE" ]; then
     echo "Uncertain low probe: $ENABLE_UNCERTAIN_LOW_PROBE" >> "$SUMMARY_FILE"
     echo "Failure memory window rounds: $FAILURE_MEMORY_WINDOW_ROUNDS" >> "$SUMMARY_FILE"
     echo "Scoring answer trials: $SCORING_ANSWER_TRIALS" >> "$SUMMARY_FILE"
+    echo "GPT answer trials: $GPT_ANSWER_TRIALS" >> "$SUMMARY_FILE"
     echo "Qwen judge repeats: $QWEN_JUDGE_REPEATS" >> "$SUMMARY_FILE"
     echo "GPT judge repeats: $GPT_JUDGE_REPEATS" >> "$SUMMARY_FILE"
     echo "Scoring worker concurrency: $SCORING_CONCURRENCY" >> "$SUMMARY_FILE"
@@ -410,6 +434,10 @@ run_if_missing "$ROUND_DIR/scored.jsonl" "round0_stability_probe" "$ROUND_DIR/in
         --gpt-judge-api-key "$GPT_JUDGE_API_KEY" \
         --gpt-judge-model "$GPT_JUDGE_MODEL" \
         --gpt-judge-repeats "$GPT_JUDGE_REPEATS" \
+        --gpt-answer-trials "$GPT_ANSWER_TRIALS" \
+        --gpt-answer-base-url "$GPT_ANSWER_BASE_URL" \
+        --gpt-answer-api-key "$GPT_ANSWER_API_KEY" \
+        --gpt-answer-model "$GPT_ANSWER_MODEL" \
         --qwen-max-concurrent "$QWEN_SCORING_MAX_CONCURRENT" \
         --gpt-max-concurrent "$GPT_SCORING_MAX_CONCURRENT" \
         --max-concurrent "$SCORING_CONCURRENCY" \
@@ -482,6 +510,43 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --report-output "$ROUND_DIR/operator_router_report.json" \
                 --performance-events "$ROUND_DIR/performance_events.jsonl"
 
+        if [ "$SEARCH_MODE" = "multi_operator_branch" ]; then
+            export EVO_CONCURRENCY DIFFICULTY_GAIN_CONCURRENCY
+            export ANSWER_CONCURRENCY ANSWER_REQUEST_CONCURRENCY RUBRIC_CONCURRENCY
+            export SCORING_CONCURRENCY QWEN_SCORING_MAX_CONCURRENT GPT_SCORING_MAX_CONCURRENT
+            export VALIDATION_RETRIES SCORING_ANSWER_TRIALS GPT_ANSWER_TRIALS
+            export QWEN_JUDGE_REPEATS GPT_JUDGE_REPEATS
+            export MIN_DIFFICULTY_GAIN_SCORE BORDERLINE_DIFFICULTY_GAIN_SCORE
+            export MIN_COMPETITIVE_JUDGMENT_SCORE DIFFICULTY_GAIN_ALLOW_BORDERLINE
+            export DIFFICULTY_GAIN_ENABLE_WEAK_PROBE WEAK_PROBE_MODE
+            SEARCH_EXTRA_ARGS=()
+            if [ -n "${SEARCH_OPERATOR_STATISTICS:-}" ]; then
+                SEARCH_EXTRA_ARGS+=(--operator-statistics "$SEARCH_OPERATOR_STATISTICS")
+            fi
+            if [ "${SEARCH_RULE_ONLY_DIFFICULTY:-false}" = "true" ]; then
+                SEARCH_EXTRA_ARGS+=(--rule-only-difficulty)
+            fi
+            if [ "$DEFER_GPT_EXPERIMENTAL_EVALUATION" = "true" ]; then
+                SEARCH_EXTRA_ARGS+=(--defer-gpt-experimental-evaluation)
+            fi
+            python multi_operator_search.py \
+                --input "$ROUND_DIR/routed.jsonl" \
+                --output "$ROUND_DIR/search_state_updated.jsonl" \
+                --work-dir "$ROUND_DIR/search" \
+                --memory-dir "$MEMORY_DIR" \
+                --branch-window "$SEARCH_BRANCH_WINDOW" \
+                --boundary-target "$SEARCH_BOUNDARY_TARGET" \
+                --pipeline-mode "$SEARCH_PIPELINE_MODE" \
+                --artifact-retention "$SEARCH_ARTIFACT_RETENTION" \
+                --operator-sort-mode "$SEARCH_OPERATOR_SORT_MODE" \
+                --exploration-ratio "$SEARCH_OPERATOR_EXPLORATION_RATIO" \
+                "${SEARCH_EXTRA_ARGS[@]}"
+            PREV_SCORED="$ROUND_DIR/search_state_updated.jsonl"
+            AVG_RATE=$(compute_avg_score_rate "$PREV_SCORED")
+            append_summary_round_if_missing "$ROUND" "$AVG_RATE" "multi_operator_search_complete"
+            break
+        fi
+
         run_if_missing "$ROUND_DIR/candidates.jsonl" "question_evolution" "$ROUND_DIR/routed.jsonl" "[Round $ROUND] Step 4/13: question_evolution.py" \
             python question_evolution.py \
                 --input "$ROUND_DIR/routed.jsonl" \
@@ -552,10 +617,46 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --base-url "$RUBRIC_BASE_URL" \
                 --performance-events "$ROUND_DIR/performance_events.jsonl"
 
-        run_if_missing "$ROUND_DIR/scored.jsonl" "scoring" "$ROUND_DIR/rubric.jsonl" "[Round $ROUND] Step 11/13: scoring.py" \
+        SCORING_INPUT="$ROUND_DIR/rubric.jsonl"
+        SCORING_OUTPUT="$ROUND_DIR/scored.jsonl"
+        SCORING_STAGE="scoring"
+        SCORING_EVALUATION_MODE="complete"
+        if [ "$DEFER_GPT_EXPERIMENTAL_EVALUATION" = "true" ]; then
+            run_if_missing "$ROUND_DIR/decision_scored.jsonl" "scoring_decision" "$ROUND_DIR/rubric.jsonl" "[Round $ROUND] Step 11a/13: Qwen decision checkpoint" \
+                python scoring.py \
+                    --input "$ROUND_DIR/rubric.jsonl" \
+                    --output "$ROUND_DIR/decision_scored.jsonl" \
+                    --evaluation-mode decision \
+                    --answer-mode llm \
+                    --answer-base-url "$QWEN_BASE_URL" \
+                    --answer-api-key "$QWEN_API_KEY" \
+                    --answer-model "$QWEN_MODEL" \
+                    --judge-base-url "$QWEN_BASE_URL" \
+                    --judge-api-key "$QWEN_API_KEY" \
+                    --judge-model "$QWEN_MODEL" \
+                    --answer-trials "$SCORING_ANSWER_TRIALS" \
+                    --gpt-answer-trials "$GPT_ANSWER_TRIALS" \
+                    --qwen-judge-repeats "$QWEN_JUDGE_REPEATS" \
+                    --gpt-judge-base-url "$GPT_JUDGE_BASE_URL" \
+                    --gpt-judge-api-key "$GPT_JUDGE_API_KEY" \
+                    --gpt-judge-model "$GPT_JUDGE_MODEL" \
+                    --gpt-judge-repeats "$GPT_JUDGE_REPEATS" \
+                    --gpt-answer-base-url "$GPT_ANSWER_BASE_URL" \
+                    --gpt-answer-api-key "$GPT_ANSWER_API_KEY" \
+                    --gpt-answer-model "$GPT_ANSWER_MODEL" \
+                    --qwen-max-concurrent "$QWEN_SCORING_MAX_CONCURRENT" \
+                    --gpt-max-concurrent "$GPT_SCORING_MAX_CONCURRENT" \
+                    --concurrency "$SCORING_CONCURRENCY" \
+                    --performance-events "$ROUND_DIR/performance_events.jsonl"
+            SCORING_INPUT="$ROUND_DIR/decision_scored.jsonl"
+            SCORING_EVALUATION_MODE="experimental"
+        fi
+
+        run_if_missing "$SCORING_OUTPUT" "$SCORING_STAGE" "$SCORING_INPUT" "[Round $ROUND] Step 11/13: scoring.py complete scored artifact" \
             python scoring.py \
-                --input "$ROUND_DIR/rubric.jsonl" \
-                --output "$ROUND_DIR/scored.jsonl" \
+                --input "$SCORING_INPUT" \
+                --output "$SCORING_OUTPUT" \
+                --evaluation-mode "$SCORING_EVALUATION_MODE" \
                 --answer-mode llm \
                 --answer-base-url "$QWEN_BASE_URL" \
                 --answer-api-key "$QWEN_API_KEY" \
@@ -564,11 +665,15 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --judge-api-key "$QWEN_API_KEY" \
                 --judge-model "$QWEN_MODEL" \
                 --answer-trials "$SCORING_ANSWER_TRIALS" \
+                --gpt-answer-trials "$GPT_ANSWER_TRIALS" \
                 --qwen-judge-repeats "$QWEN_JUDGE_REPEATS" \
                 --gpt-judge-base-url "$GPT_JUDGE_BASE_URL" \
                 --gpt-judge-api-key "$GPT_JUDGE_API_KEY" \
                 --gpt-judge-model "$GPT_JUDGE_MODEL" \
                 --gpt-judge-repeats "$GPT_JUDGE_REPEATS" \
+                --gpt-answer-base-url "$GPT_ANSWER_BASE_URL" \
+                --gpt-answer-api-key "$GPT_ANSWER_API_KEY" \
+                --gpt-answer-model "$GPT_ANSWER_MODEL" \
                 --qwen-max-concurrent "$QWEN_SCORING_MAX_CONCURRENT" \
                 --gpt-max-concurrent "$GPT_SCORING_MAX_CONCURRENT" \
                 --concurrency "$SCORING_CONCURRENCY" \

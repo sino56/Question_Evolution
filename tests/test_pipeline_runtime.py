@@ -221,6 +221,7 @@ def test_fair_request_pool_enforces_limit_and_rotates_samples():
             call("a", 1), call("a", 2), call("b", 1), call("b", 2)
         )
         assert pool.peak_active == 1
+        assert 0 < pool.average_utilization <= 1
         assert [sample for sample, _ in order[:3]] == ["a", "b", "a"]
 
     asyncio.run(scenario())

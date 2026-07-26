@@ -63,3 +63,10 @@ writes low-risk Stage 5 entries after effect analysis: effective operator
 experience, failed operator experience, and invalid generation cases. Low
 confidence hits must keep `needs_manual_review=true` and must not be treated as
 strong success examples without review.
+
+## Multi-Operator Search
+
+- `search_state.schema.json` defines the lightweight scheduler state and
+  explicitly forbids embedded full branch collections.
+- `branch_result.schema.json` defines complete append-only branch results,
+  including independent decision and experimental evaluation status.

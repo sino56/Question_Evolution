@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Full multi-operator branch result",
+  "type": "object",
+  "required": [
+    "branch_id",
+    "parent_node_id",
+    "operator_id",
+    "branch_status",
+    "decision_evaluation_status",
+    "experimental_evaluation_status"
+  ],
+  "properties": {
+    "branch_id": {"type": "string", "minLength": 1},
+    "parent_node_id": {"type": "string", "minLength": 1},
+    "operator_id": {"type": "string", "minLength": 1},
+    "branch_status": {
+      "enum": [
+        "boundary_candidate",
+        "no_score_change",
+        "score_increased",
+        "duplicate_exhausted",
+        "validation_failed",
+        "branch_error",
+        "not_applicable"
+      ]
+    },
+    "decision_evaluation_status": {"enum": ["pending", "completed", "failed"]},
+    "experimental_evaluation_status": {"enum": ["pending", "completed", "failed"]},
+    "parent_score_rate": {"type": ["number", "null"]},
+    "child_score_rate": {"type": ["number", "null"]},
+    "delta_score_rate": {"type": ["number", "null"]},
+    "review_status": {"enum": ["pending", "approved", "rejected", null]}
+  },
+  "additionalProperties": true
+}

@@ -1015,10 +1015,14 @@ def select_candidates(
     *,
     allow_missing_difficulty_gain: bool = False,
     max_exploration_candidates_per_round: int = MAX_EXPLORATION_CANDIDATES_PER_ROUND,
+    branch_mode: bool = False,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     groups: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
     for record in records:
-        groups[candidate_group_id(record)].append(record)
+        branch_key = str(
+            record.get("branch_id") or record.get("candidate_id") or ""
+        ).strip()
+        groups[branch_key if branch_mode and branch_key else candidate_group_id(record)].append(record)
 
     selected_records: List[Dict[str, Any]] = []
     invalid_cases: List[Dict[str, Any]] = []
@@ -1116,6 +1120,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--report-output", default=None, help="Optional candidate-selection report JSON path.")
     parser.add_argument("--performance-events", default=None)
+    parser.add_argument(
+        "--branch-mode",
+        action="store_true",
+        help="Treat each stable branch_id/candidate_id as an independent candidate group.",
+    )
     return parser.parse_args()
 
 
@@ -1125,6 +1134,7 @@ def main() -> None:
     config = {
         "allow_missing_difficulty_gain": args.allow_missing_difficulty_gain,
         "max_exploration_candidates_per_round": args.max_exploration_candidates_per_round,
+        "branch_mode": args.branch_mode,
         "invalid_output": (
             os.path.abspath(args.invalid_output)
             if args.invalid_output and not args.no_invalid_output
@@ -1142,6 +1152,7 @@ def main() -> None:
         records,
         allow_missing_difficulty_gain=args.allow_missing_difficulty_gain,
         max_exploration_candidates_per_round=args.max_exploration_candidates_per_round,
+        branch_mode=args.branch_mode,
     )
     metrics.compute_seconds += time.monotonic() - compute_started
     valid, reason = validate_published_artifact(

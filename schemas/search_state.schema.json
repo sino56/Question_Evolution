@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Lightweight multi-operator search state",
+  "type": "object",
+  "required": [
+    "search_state_version",
+    "parent_node_id",
+    "status",
+    "boundary_target",
+    "boundary_candidate_count",
+    "selected_operator_ids",
+    "operator_plan",
+    "branch_window",
+    "in_flight_branch_ids"
+  ],
+  "properties": {
+    "search_state_version": {"const": 1},
+    "parent_node_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["running", "completed", "partial", "aborted"]},
+    "termination_reason": {
+      "type": ["string", "null"],
+      "enum": [
+        null,
+        "boundary_target_reached",
+        "candidate_list_exhausted",
+        "operator_space_exhausted",
+        "partial_coverage",
+        "evaluation_budget_exhausted",
+        "request_budget_exhausted",
+        "timeout",
+        "fatal_error",
+        "aborted"
+      ]
+    },
+    "boundary_target": {"type": "integer", "minimum": 1},
+    "boundary_candidate_count": {"type": "integer", "minimum": 0},
+    "selected_operator_ids": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "operator_plan": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["operator_id", "branch_id", "status", "branch_stage"],
+        "properties": {
+          "operator_id": {"type": "string", "minLength": 1},
+          "branch_id": {"type": "string", "minLength": 1},
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "completed",
+              "duplicate_exhausted",
+              "not_applicable",
+              "validation_failed",
+              "branch_error"
+            ]
+          },
+          "branch_stage": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "branch_window": {"type": "integer", "minimum": 1},
+    "in_flight_branch_ids": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "branch_summaries": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "not": {
+        "anyOf": [
+          {"required": ["branches"]},
+          {"required": ["branch_results"]},
+          {"required": ["full_branch_results"]}
+        ]
+      }
+    }
+  ],
+  "additionalProperties": true
+}

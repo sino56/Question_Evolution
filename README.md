@@ -570,7 +570,7 @@ VALIDATION_RETRIES=1
 ### 4.3 分步运行
 
 ```bash
-# Round 0：稳定多 trial + 双 Judge baseline 评分
+# Round 0：Qwen/GPT 各自 3 次回答、各自 2 次自评
 python round0_stability_probe.py \
   --input data/data.jsonl \
   --output round_0_scored.jsonl \
@@ -585,7 +585,11 @@ python round0_stability_probe.py \
   --gpt-judge-base-url "$GPT_JUDGE_BASE_URL" \
   --gpt-judge-api-key "$GPT_JUDGE_API_KEY" \
   --gpt-judge-model "$GPT_JUDGE_MODEL" \
-  --gpt-judge-repeats 2
+  --gpt-judge-repeats 2 \
+  --gpt-answer-trials 3 \
+  --gpt-answer-base-url "$GPT_ANSWER_BASE_URL" \
+  --gpt-answer-api-key "$GPT_ANSWER_API_KEY" \
+  --gpt-answer-model "$GPT_ANSWER_MODEL"
 
 # Step 1：画像
 python profile_samples.py \
@@ -685,7 +689,11 @@ python scoring.py \
   --gpt-judge-base-url "$GPT_JUDGE_BASE_URL" \
   --gpt-judge-api-key "$GPT_JUDGE_API_KEY" \
   --gpt-judge-model "$GPT_JUDGE_MODEL" \
-  --gpt-judge-repeats 2
+  --gpt-judge-repeats 2 \
+  --gpt-answer-trials 3 \
+  --gpt-answer-base-url "$GPT_ANSWER_BASE_URL" \
+  --gpt-answer-api-key "$GPT_ANSWER_API_KEY" \
+  --gpt-answer-model "$GPT_ANSWER_MODEL"
 
 # Step 11：效果统计
 python analyze_evolution_effect.py \
@@ -764,9 +772,13 @@ python collect_answers.py --input data/questions_evolved_only.jsonl --output dat
 
 ### scoring.py
 
-自由回答模式默认生成 3 个独立 Qwen 回答，每个回答执行 2 次必需的
-Qwen 评分和 2 次实验性 GPT 复评。顶层 `score_rate` 只由全部 Qwen
-repeat 聚合得到；GPT 结果只写入 `gpt_score_summary` 和 trial 明细。
+自由回答模式采用分阶段非对称协议。Round 0 中，Qwen 与 GPT 各生成 3 个
+独立回答，并分别只对自己的回答评分 2 次；GPT 结果仅记录。进化后的题目中，
+Qwen 与 GPT 仍各回答 3 次：Qwen 对自身每份回答评分 2 次，GPT 对自身每份
+回答评分 2 次，同时对每份 Qwen 回答复评 2 次。Qwen 不评分 GPT 回答。
+顶层 `score_rate` 始终只由“Qwen 回答 + Qwen 自评”的全部 repeat 聚合得到；
+GPT 对 Qwen 的复评写入 `gpt_score_summary`，GPT 自身回答与自评分开写入
+`gpt_answer_generation_summary`、`gpt_answer_score_summary` 和 trial 明细。
 原始 judge 响应写入 `*.judge_traces.jsonl.gz`，校验信息登记在
 `*.manifest.json`。未进化透传样本仍完全复用已有评分，不发起任何新请求。
 
@@ -779,7 +791,7 @@ repeat 聚合得到；GPT 结果只写入 `gpt_score_summary` 和 trial 明细�
 
 `--concurrency` 表示样本 worker 数。答案采集另用
 `--request-concurrency` 控制真实在途请求；评分的 Qwen answer/Qwen judge
-共享 `--qwen-max-concurrent` 请求池，GPT judge 使用独立的
+共享 `--qwen-max-concurrent` 请求池，GPT answer/GPT judge 共享独立的
 `--gpt-max-concurrent` 请求池。提高 worker 数不会绕过请求池上限。
 
 ```bash
@@ -799,6 +811,10 @@ python scoring.py \
   --gpt-judge-api-key KEY \
   --gpt-judge-model MODEL \
   --gpt-judge-repeats 2 \
+  --gpt-answer-trials 3 \
+  --gpt-answer-base-url URL \
+  --gpt-answer-api-key KEY \
+  --gpt-answer-model MODEL \
   --qwen-max-concurrent 20 \
   --gpt-max-concurrent 20 \
   --concurrency N \
@@ -879,3 +895,97 @@ python update_sample_state.py --input effect_analysis.jsonl --output state_updat
 2. **检查进化质量**：重点看 `meta_info.prompt_old` → `prompt` 的变化是否合理，是否引入了外部未提供的知识。
 3. **对比前后得分**：通过 `meta_info.stale_scoring_result.total_awarded/total_possible` 与新 `scoring_result` 对比，判断进化是否有效。
 4. **查看失败文件**：每个脚本失败的数据会写入 `*.failed` 文件，里面包含错误信息。
+
+---
+
+## 8. 多算子分支搜索与效率优化
+
+项目现已提供基于同一已评分父题的多算子横向分支搜索。自然搜索只使用当前
+`operator_route` 中冻结的候选算子，不会自动把注册表其余算子追加到计划中。
+同一父节点和算子使用稳定 `branch_id`，窗口按剩余边界名额、当前在途数和剩余候选数
+动态领取。
+
+启用方式：
+
+```bash
+SEARCH_MODE=multi_operator_branch
+SEARCH_BRANCH_WINDOW=3
+SEARCH_BOUNDARY_TARGET=5
+SEARCH_PIPELINE_MODE=stream
+SEARCH_ARTIFACT_RETENTION=compact
+DEFER_GPT_EXPERIMENTAL_EVALUATION=true
+SEARCH_OPERATOR_SORT_MODE=route
+bash run_loop.sh
+```
+
+Windows 设置相同环境变量后运行 `.\run_loop.ps1`。
+
+关键兼容开关：
+
+```text
+SEARCH_BRANCH_WINDOW=1                  恢复单分支窗口
+SEARCH_PIPELINE_MODE=step               使用分步编排
+SEARCH_ARTIFACT_RETENTION=full          调试时保留全部阶段文件
+DEFER_GPT_EXPERIMENTAL_EVALUATION=false 恢复同步完整双 Judge
+SEARCH_OPERATOR_SORT_MODE=route         恢复路由既有顺序
+```
+
+`SEARCH_PIPELINE_MODE=step` 复用按波次的阶段 CLI，`stream` 使用长期存活 worker、
+有界队列和逐分支 checkpoint，并在一个分支完成决策后立即按动态窗口补位。两种模式
+共享稳定分支 ID、状态归并和完整分支产物。
+
+评分支持 `complete`、`decision` 和 `experimental` 三种模式。`decision` 只发布
+Qwen 在线决策检查点；`experimental` 从检查点补齐 GPT 对 Qwen 回答的复评和 GPT
+自回答/自评。仅当 `DEFER_GPT_EXPERIMENTAL_EVALUATION=true` 时搜索调度不等待 GPT；
+正式实验结束仍要求完整 GPT 产物或明确记录原有容错失败。设为 `false` 会恢复同步
+完整双 Judge。
+
+`SEARCH_ARTIFACT_RETENTION` 默认值为 `compact`。在该模式下，stream 分支到达终态后
+立即删除已经被正式分支结果和终态 checkpoint 覆盖的 `stream_branches/<branch>` 阶段
+文件；逐阶段 checkpoint 始终只保留最新可恢复记录，完成后只保留 `final.json`，失败后
+只保留 `branch_error.json`。step 模式的 `wave_*` 文件会保留到最终搜索状态及 sidecar
+成功发布，随后统一删除。需要逐文件调试时可设为 `full`，其行为与旧版全部保留一致。
+
+compact 模式保留的主要产物：
+
+```text
+search_state_updated.jsonl             轻量搜索状态
+search/branch_results.jsonl            追加式完整分支产物
+search/stream_checkpoints/*/final.json stream 模式成功分支终态检查点
+search/stream_checkpoints/*/branch_error.json stream 模式失败分支终态检查点
+search/search_summary.json             搜索与完整实验耗时、吞吐和延迟摘要
+search/performance_events.jsonl        阶段和调度性能事件
+```
+
+运行期间不要手工删除 checkpoint。compact 只会在新的原子 checkpoint 已落盘后清理旧
+快照；已确认候选仍从最新阶段继续，终态分支可从 `final.json` 或 `branch_error.json`
+恢复。只有“已领取但没有确认产物”的分支才恢复为 pending。状态或分支产物版本不一致
+时会拒绝在原实验目录混写。
+
+性能验收至少重复三次：
+
+```bash
+python search_performance.py \
+  --baseline baseline_run1/search_summary.json \
+  --baseline baseline_run2/search_summary.json \
+  --baseline baseline_run3/search_summary.json \
+  --optimized optimized_run1/search_summary.json \
+  --optimized optimized_run2/search_summary.json \
+  --optimized optimized_run3/search_summary.json \
+  --output performance_report.json
+```
+
+如需启用单位时间收益排序，先从追加式分支产物生成统计：
+
+```bash
+python operator_ranking.py \
+  --input experiments/.../search/branch_results.jsonl \
+  --output operator_statistics.json
+
+SEARCH_OPERATOR_SORT_MODE=yield_per_time \
+SEARCH_OPERATOR_STATISTICS=operator_statistics.json \
+bash run_loop.sh
+```
+
+代码和离线等价性/恢复性测试已经接入。正式标记验收前仍需使用相同模型、Prompt、
+trial/repeat、请求上限和重试策略完成 3 至 5 条真实样本灰度，并至少重复三次性能对照。

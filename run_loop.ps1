@@ -218,6 +218,9 @@ $CONFIG_QWEN_MODEL = Get-ConfigValue @("QWEN_MODEL", "GPT_MODEL") "hjl_Qwen3.6-2
 $CONFIG_GPT_JUDGE_MODEL = Get-ConfigValue @("GPT_JUDGE_MODEL", "GPT_MODEL", "QA_MODEL") $CONFIG_GPT_MODEL
 $CONFIG_GPT_JUDGE_BASE_URL = Get-ConfigValue @("GPT_JUDGE_BASE_URL", "OPENAI_BASE_URL", "BASE_URL") $CONFIG_BASE_URL
 $CONFIG_GPT_JUDGE_API_KEY = Get-ConfigValue @("GPT_JUDGE_API_KEY", "OPENAI_API_KEY") ""
+$CONFIG_GPT_ANSWER_MODEL = Get-ConfigValue @("GPT_ANSWER_MODEL", "GPT_MODEL", "QA_MODEL") $CONFIG_GPT_MODEL
+$CONFIG_GPT_ANSWER_BASE_URL = Get-ConfigValue @("GPT_ANSWER_BASE_URL", "OPENAI_BASE_URL", "BASE_URL") $CONFIG_BASE_URL
+$CONFIG_GPT_ANSWER_API_KEY = Get-ConfigValue @("GPT_ANSWER_API_KEY", "GPT_JUDGE_API_KEY", "OPENAI_API_KEY") $CONFIG_GPT_JUDGE_API_KEY
 $CONFIG_PROFILE_MODEL = Get-ConfigValue @("PROFILE_MODEL", "EVOLVE_MODEL", "QA_MODEL", "GPT_MODEL") $CONFIG_GPT_MODEL
 $CONFIG_DIFFICULTY_GAIN_MODEL = Get-ConfigValue @("DIFFICULTY_GAIN_MODEL", "PROFILE_MODEL", "EVOLVE_MODEL", "QA_MODEL", "GPT_MODEL") $CONFIG_PROFILE_MODEL
 $CONFIG_DIFFICULTY_GAIN_BASE_URL = Get-ConfigValue @("DIFFICULTY_GAIN_BASE_URL", "PROFILE_BASE_URL", "EVOLVE_BASE_URL", "BASE_URL", "OPENAI_BASE_URL") $CONFIG_BASE_URL
@@ -243,6 +246,14 @@ $NO_INFO_STOP_ROUNDS = [int](Get-EnvOrDefault "NO_INFO_STOP_ROUNDS" "2")
 $NO_INFO_MIN_DELTA = [double](Get-EnvOrDefault "NO_INFO_MIN_DELTA" "0.0001")
 $MIN_SCORE_RATE = Get-EnvOrDefault "MIN_SCORE_RATE" "0.8"
 $NUM_CANDIDATES = Get-EnvOrDefault "NUM_CANDIDATES" "2"
+$SEARCH_MODE = Get-EnvOrDefault "SEARCH_MODE" "single_branch"
+$SEARCH_BRANCH_WINDOW = Get-EnvOrDefault "SEARCH_BRANCH_WINDOW" "1"
+$SEARCH_PIPELINE_MODE = Get-EnvOrDefault "SEARCH_PIPELINE_MODE" "step"
+$SEARCH_ARTIFACT_RETENTION = Get-EnvOrDefault "SEARCH_ARTIFACT_RETENTION" "compact"
+$DEFER_GPT_EXPERIMENTAL_EVALUATION = Get-EnvOrDefault "DEFER_GPT_EXPERIMENTAL_EVALUATION" "false"
+$SEARCH_OPERATOR_SORT_MODE = Get-EnvOrDefault "SEARCH_OPERATOR_SORT_MODE" "route"
+$SEARCH_OPERATOR_EXPLORATION_RATIO = Get-EnvOrDefault "SEARCH_OPERATOR_EXPLORATION_RATIO" "0.1"
+$SEARCH_BOUNDARY_TARGET = Get-EnvOrDefault "SEARCH_BOUNDARY_TARGET" "5"
 $MAX_CANDIDATE_BUDGET = Get-EnvOrDefault "MAX_CANDIDATE_BUDGET" "0"
 $VALIDATION_RETRIES = Get-EnvOrDefault "VALIDATION_RETRIES" "1"
 $MIN_DIFFICULTY_GAIN_SCORE = Get-EnvOrDefault "MIN_DIFFICULTY_GAIN_SCORE" "0.75"
@@ -255,8 +266,8 @@ $ENABLE_UNCERTAIN_LOW_PROBE = Get-EnvOrDefault "ENABLE_UNCERTAIN_LOW_PROBE" "fal
 $UNCERTAIN_LOW_PROBE_MIN_SCORE = Get-EnvOrDefault "UNCERTAIN_LOW_PROBE_MIN_SCORE" "0.55"
 $FAILURE_MEMORY_WINDOW_ROUNDS = Get-EnvOrDefault "FAILURE_MEMORY_WINDOW_ROUNDS" "3"
 $ROUND0_INITIAL_TRIALS = Get-EnvOrDefault "ROUND0_INITIAL_TRIALS" "3"
-$ROUND0_EXTRA_TRIALS = Get-EnvOrDefault "ROUND0_EXTRA_TRIALS" "2"
-$ROUND0_MAX_TRIALS = Get-EnvOrDefault "ROUND0_MAX_TRIALS" "5"
+$ROUND0_EXTRA_TRIALS = Get-EnvOrDefault "ROUND0_EXTRA_TRIALS" "0"
+$ROUND0_MAX_TRIALS = Get-EnvOrDefault "ROUND0_MAX_TRIALS" "3"
 $ROUND0_EDGE_LOW = Get-EnvOrDefault "ROUND0_EDGE_LOW" "0.72"
 $ROUND0_EDGE_HIGH = Get-EnvOrDefault "ROUND0_EDGE_HIGH" "0.83"
 $ROUND0_STRONG_HIGH_RATE = Get-EnvOrDefault "ROUND0_STRONG_HIGH_RATE" "0.85"
@@ -271,6 +282,9 @@ $QWEN_MODEL = Get-EnvOrDefault "QWEN_MODEL" $CONFIG_QWEN_MODEL
 $GPT_JUDGE_MODEL = Get-EnvOrDefault "GPT_JUDGE_MODEL" $CONFIG_GPT_JUDGE_MODEL
 $GPT_JUDGE_BASE_URL = Get-EnvOrDefault "GPT_JUDGE_BASE_URL" $CONFIG_GPT_JUDGE_BASE_URL
 $GPT_JUDGE_API_KEY = Get-EnvOrDefault "GPT_JUDGE_API_KEY" $CONFIG_GPT_JUDGE_API_KEY
+$GPT_ANSWER_MODEL = Get-EnvOrDefault "GPT_ANSWER_MODEL" $CONFIG_GPT_ANSWER_MODEL
+$GPT_ANSWER_BASE_URL = Get-EnvOrDefault "GPT_ANSWER_BASE_URL" $CONFIG_GPT_ANSWER_BASE_URL
+$GPT_ANSWER_API_KEY = Get-EnvOrDefault "GPT_ANSWER_API_KEY" $CONFIG_GPT_ANSWER_API_KEY
 $GPT_MODEL = Get-EnvOrDefault "GPT_MODEL" $CONFIG_GPT_MODEL
 $OPENAI_BASE_URL = Get-EnvOrDefault "OPENAI_BASE_URL" $CONFIG_BASE_URL
 $PROFILE_MODEL = Get-EnvOrDefault "PROFILE_MODEL" $CONFIG_PROFILE_MODEL
@@ -285,6 +299,7 @@ $EVOLVE_BASE_URL = Get-EnvOrDefault "EVOLVE_BASE_URL" $OPENAI_BASE_URL
 $ANSWER_BASE_URL = Get-EnvOrDefault "ANSWER_BASE_URL" $OPENAI_BASE_URL
 $RUBRIC_BASE_URL = Get-EnvOrDefault "RUBRIC_BASE_URL" $OPENAI_BASE_URL
 $SCORING_ANSWER_TRIALS = Get-EnvOrDefault "SCORING_ANSWER_TRIALS" "3"
+$GPT_ANSWER_TRIALS = Get-EnvOrDefault "GPT_ANSWER_TRIALS" "3"
 $QWEN_JUDGE_REPEATS = Get-EnvOrDefault "QWEN_JUDGE_REPEATS" "2"
 $GPT_JUDGE_REPEATS = Get-EnvOrDefault "GPT_JUDGE_REPEATS" "2"
 $SCORING_CONCURRENCY = Get-EnvOrDefault "SCORING_CONCURRENCY" "20"
@@ -352,8 +367,8 @@ if (-not (Test-Path -LiteralPath $SUMMARY_FILE -PathType Leaf)) {
     foreach ($line in @(
         "Input file: $InputFile", "Memory dir: $MEMORY_DIR", "Max rounds: $MaxRounds", "Early stop rate: $EARLY_STOP_RATE",
         "No-info stop rounds: $NO_INFO_STOP_ROUNDS", "No-info min delta: $NO_INFO_MIN_DELTA", "Evolution trigger rate: $MIN_SCORE_RATE",
-        "Num candidates: $NUM_CANDIDATES", "Max candidate budget: $MAX_CANDIDATE_BUDGET", "Validation retries: $VALIDATION_RETRIES",
-        "Scoring answer trials: $SCORING_ANSWER_TRIALS", "Qwen judge repeats: $QWEN_JUDGE_REPEATS", "GPT judge repeats: $GPT_JUDGE_REPEATS",
+        "Num candidates: $NUM_CANDIDATES", "Search mode: $SEARCH_MODE", "Search branch window: $SEARCH_BRANCH_WINDOW", "Search pipeline mode: $SEARCH_PIPELINE_MODE", "Search artifact retention: $SEARCH_ARTIFACT_RETENTION", "Deferred GPT experimental evaluation: $DEFER_GPT_EXPERIMENTAL_EVALUATION", "Search operator sort mode: $SEARCH_OPERATOR_SORT_MODE", "Search operator exploration ratio: $SEARCH_OPERATOR_EXPLORATION_RATIO", "Search boundary target: $SEARCH_BOUNDARY_TARGET", "Max candidate budget: $MAX_CANDIDATE_BUDGET", "Validation retries: $VALIDATION_RETRIES",
+        "Scoring answer trials: $SCORING_ANSWER_TRIALS", "GPT answer trials: $GPT_ANSWER_TRIALS", "Qwen judge repeats: $QWEN_JUDGE_REPEATS", "GPT judge repeats: $GPT_JUDGE_REPEATS",
         "Scoring worker concurrency: $SCORING_CONCURRENCY", "Qwen scoring max concurrent: $QWEN_SCORING_MAX_CONCURRENT", "GPT scoring max concurrent: $GPT_SCORING_MAX_CONCURRENT",
         "Answer worker concurrency: $ANSWER_CONCURRENCY", "Answer request concurrency: $ANSWER_REQUEST_CONCURRENCY",
         "", "Round | Avg Score Rate | Status", "------|----------------|--------"
@@ -367,7 +382,7 @@ $roundInput = Join-Path $roundDir "input.jsonl"
 $roundScored = Join-Path $roundDir "scored.jsonl"
 Invoke-Step $roundInput "prepare_round_input" $InputFile "[Round 0] Step 0/2: 准备 baseline input" { Prepare-RoundInput $InputFile $roundInput 0 (Join-Path $roundDir "performance_events.jsonl") }
 Invoke-Step $roundScored "round0_stability_probe" $roundInput "[Round 0] Step 1/2: round0_stability_probe.py baseline" {
-    Invoke-Python "round0_stability_probe.py" "--input" $roundInput "--output" $roundScored "--answer-mode" "llm" "--answer-base-url" $QWEN_BASE_URL "--answer-api-key" $QWEN_API_KEY "--answer-model" $QWEN_MODEL "--judge-base-url" $QWEN_BASE_URL "--judge-api-key" $QWEN_API_KEY "--judge-model" $QWEN_MODEL "--qwen-judge-repeats" $QWEN_JUDGE_REPEATS "--gpt-judge-base-url" $GPT_JUDGE_BASE_URL "--gpt-judge-api-key" $GPT_JUDGE_API_KEY "--gpt-judge-model" $GPT_JUDGE_MODEL "--gpt-judge-repeats" $GPT_JUDGE_REPEATS "--qwen-max-concurrent" $QWEN_SCORING_MAX_CONCURRENT "--gpt-max-concurrent" $GPT_SCORING_MAX_CONCURRENT "--max-concurrent" $SCORING_CONCURRENCY "--initial-trials" $ROUND0_INITIAL_TRIALS "--extra-trials" $ROUND0_EXTRA_TRIALS "--max-trials" $ROUND0_MAX_TRIALS "--answer-temperature" $ROUND0_ANSWER_TEMPERATURE "--answer-top-p" $ROUND0_ANSWER_TOP_P "--answer-seed-base" $ROUND0_ANSWER_SEED_BASE "--judge-temperature" $ROUND0_JUDGE_TEMPERATURE "--score-threshold" $MIN_SCORE_RATE "--strong-high-threshold" $ROUND0_STRONG_HIGH_RATE "--edge-low" $ROUND0_EDGE_LOW "--edge-high" $ROUND0_EDGE_HIGH "--cache-dir" (Join-Path $roundDir "round0_cache") "--report-output" (Join-Path $roundDir "round0_stability_report.json") "--performance-events" (Join-Path $roundDir "performance_events.jsonl")
+    Invoke-Python "round0_stability_probe.py" "--input" $roundInput "--output" $roundScored "--answer-mode" "llm" "--answer-base-url" $QWEN_BASE_URL "--answer-api-key" $QWEN_API_KEY "--answer-model" $QWEN_MODEL "--judge-base-url" $QWEN_BASE_URL "--judge-api-key" $QWEN_API_KEY "--judge-model" $QWEN_MODEL "--qwen-judge-repeats" $QWEN_JUDGE_REPEATS "--gpt-judge-base-url" $GPT_JUDGE_BASE_URL "--gpt-judge-api-key" $GPT_JUDGE_API_KEY "--gpt-judge-model" $GPT_JUDGE_MODEL "--gpt-judge-repeats" $GPT_JUDGE_REPEATS "--gpt-answer-trials" $GPT_ANSWER_TRIALS "--gpt-answer-base-url" $GPT_ANSWER_BASE_URL "--gpt-answer-api-key" $GPT_ANSWER_API_KEY "--gpt-answer-model" $GPT_ANSWER_MODEL "--qwen-max-concurrent" $QWEN_SCORING_MAX_CONCURRENT "--gpt-max-concurrent" $GPT_SCORING_MAX_CONCURRENT "--max-concurrent" $SCORING_CONCURRENCY "--initial-trials" $ROUND0_INITIAL_TRIALS "--extra-trials" $ROUND0_EXTRA_TRIALS "--max-trials" $ROUND0_MAX_TRIALS "--answer-temperature" $ROUND0_ANSWER_TEMPERATURE "--answer-top-p" $ROUND0_ANSWER_TOP_P "--answer-seed-base" $ROUND0_ANSWER_SEED_BASE "--judge-temperature" $ROUND0_JUDGE_TEMPERATURE "--score-threshold" $MIN_SCORE_RATE "--strong-high-threshold" $ROUND0_STRONG_HIGH_RATE "--edge-low" $ROUND0_EDGE_LOW "--edge-high" $ROUND0_EDGE_HIGH "--cache-dir" (Join-Path $roundDir "round0_cache") "--report-output" (Join-Path $roundDir "round0_stability_report.json") "--performance-events" (Join-Path $roundDir "performance_events.jsonl")
 }
 
 $previousScored = $roundScored
@@ -405,6 +420,37 @@ for ($round = 1; $round -le $MaxRounds; $round += 1) {
         Invoke-Step $profiled "profile_samples" $roundInput "[Round $round] Step 1/13: profile_samples.py" { Invoke-Python "profile_samples.py" "--input" $roundInput "--output" $profiled "--model" $PROFILE_MODEL "--base-url" $PROFILE_BASE_URL "--concurrency" $PROFILE_CONCURRENCY "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
         Invoke-Step $profiledCandidates "select_evolution_candidates" $profiled "[Round $round] Step 2/13: select_evolution_candidates.py" { Invoke-Python "select_evolution_candidates.py" "--input" $profiled "--output" $profiledCandidates "--high-score-threshold" $MIN_SCORE_RATE "--report-output" (Join-Path $roundDir "evolution_candidate_report.json") "--performance-events" (Join-Path $roundDir "performance_events.jsonl") @uncertainLowProbeArgs }
         Invoke-Step $routed "operator_router" $profiledCandidates "[Round $round] Step 3/13: operator_router.py" { Invoke-Python "operator_router.py" "--input" $profiledCandidates "--output" $routed "--memory-dir" $MEMORY_DIR "--failure-memory-window-rounds" $FAILURE_MEMORY_WINDOW_ROUNDS "--report-output" (Join-Path $roundDir "operator_router_report.json") "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
+        if ($SEARCH_MODE -eq "multi_operator_branch") {
+            $env:EVO_CONCURRENCY = [string]$EVO_CONCURRENCY
+            $env:DIFFICULTY_GAIN_CONCURRENCY = [string]$DIFFICULTY_GAIN_CONCURRENCY
+            $env:ANSWER_CONCURRENCY = [string]$ANSWER_CONCURRENCY
+            $env:ANSWER_REQUEST_CONCURRENCY = [string]$ANSWER_REQUEST_CONCURRENCY
+            $env:RUBRIC_CONCURRENCY = [string]$RUBRIC_CONCURRENCY
+            $env:SCORING_CONCURRENCY = [string]$SCORING_CONCURRENCY
+            $env:QWEN_SCORING_MAX_CONCURRENT = [string]$QWEN_SCORING_MAX_CONCURRENT
+            $env:GPT_SCORING_MAX_CONCURRENT = [string]$GPT_SCORING_MAX_CONCURRENT
+            $env:VALIDATION_RETRIES = [string]$VALIDATION_RETRIES
+            $env:SCORING_ANSWER_TRIALS = [string]$SCORING_ANSWER_TRIALS
+            $env:GPT_ANSWER_TRIALS = [string]$GPT_ANSWER_TRIALS
+            $env:QWEN_JUDGE_REPEATS = [string]$QWEN_JUDGE_REPEATS
+            $env:GPT_JUDGE_REPEATS = [string]$GPT_JUDGE_REPEATS
+            $env:MIN_DIFFICULTY_GAIN_SCORE = [string]$MIN_DIFFICULTY_GAIN_SCORE
+            $env:BORDERLINE_DIFFICULTY_GAIN_SCORE = [string]$BORDERLINE_DIFFICULTY_GAIN_SCORE
+            $env:MIN_COMPETITIVE_JUDGMENT_SCORE = [string]$MIN_COMPETITIVE_JUDGMENT_SCORE
+            $env:DIFFICULTY_GAIN_ALLOW_BORDERLINE = [string]$DIFFICULTY_GAIN_ALLOW_BORDERLINE
+            $env:DIFFICULTY_GAIN_ENABLE_WEAK_PROBE = [string]$DIFFICULTY_GAIN_ENABLE_WEAK_PROBE
+            $env:WEAK_PROBE_MODE = [string]$WEAK_PROBE_MODE
+            $searchStateOutput = Join-Path $roundDir "search_state_updated.jsonl"
+            $searchArgs = @("multi_operator_search.py", "--input", $routed, "--output", $searchStateOutput, "--work-dir", (Join-Path $roundDir "search"), "--memory-dir", $MEMORY_DIR, "--branch-window", $SEARCH_BRANCH_WINDOW, "--boundary-target", $SEARCH_BOUNDARY_TARGET, "--pipeline-mode", $SEARCH_PIPELINE_MODE, "--artifact-retention", $SEARCH_ARTIFACT_RETENTION, "--operator-sort-mode", $SEARCH_OPERATOR_SORT_MODE, "--exploration-ratio", $SEARCH_OPERATOR_EXPLORATION_RATIO)
+            if ($env:SEARCH_OPERATOR_STATISTICS) { $searchArgs += @("--operator-statistics", $env:SEARCH_OPERATOR_STATISTICS) }
+            if ($env:SEARCH_RULE_ONLY_DIFFICULTY -eq "true") { $searchArgs += "--rule-only-difficulty" }
+            if ($DEFER_GPT_EXPERIMENTAL_EVALUATION -eq "true") { $searchArgs += "--defer-gpt-experimental-evaluation" }
+            Invoke-Python @searchArgs
+            $previousScored = $searchStateOutput
+            $previousAverage = Get-AverageScoreRate $previousScored
+            Add-SummaryRoundIfMissing $SUMMARY_FILE $round $previousAverage "multi_operator_search_complete"
+            break
+        }
         Invoke-Step $candidates "question_evolution" $routed "[Round $round] Step 4/13: question_evolution.py" { Invoke-Python "question_evolution.py" "--input" $routed "--output" $candidates "--min-score-rate" $MIN_SCORE_RATE "--model" $EVOLVE_MODEL "--base-url" $EVOLVE_BASE_URL "--concurrency" $EVO_CONCURRENCY "--num-candidates" $NUM_CANDIDATES "--max-candidate-budget" $MAX_CANDIDATE_BUDGET "--validation-retries" $VALIDATION_RETRIES "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
         Assert-CandidateCoverage $routed $candidates
         Invoke-Step $validatedCandidates "validate_evolved_question" $candidates "[Round $round] Step 5/13: validate_evolved_question.py" { Invoke-Python "validate_evolved_question.py" "--input" $candidates "--output" $validatedCandidates "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
@@ -413,7 +459,15 @@ for ($round = 1; $round -le $MaxRounds; $round += 1) {
         Invoke-Step $evolved "candidate_selection" $difficultyValidatedCandidates "[Round $round] Step 8/13: candidate_selection.py" { Invoke-Python "candidate_selection.py" "--input" $difficultyValidatedCandidates "--output" $evolved "--invalid-output" (Join-Path $roundDir "invalid_generation_cases.jsonl") "--report-output" (Join-Path $roundDir "candidate_selection_report.json") "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
         Invoke-Step $withAnswers "collect_answers" $evolved "[Round $round] Step 9/13: collect_answers.py" { Invoke-Python "collect_answers.py" "--input" $evolved "--output" $withAnswers "--concurrency" $ANSWER_CONCURRENCY "--request-concurrency" $ANSWER_REQUEST_CONCURRENCY "--samples" "1" "--model" $GPT_MODEL "--base-url" $ANSWER_BASE_URL "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
         Invoke-Step $rubric "gen_rubric" $withAnswers "[Round $round] Step 10/13: gen_rubric.py" { Invoke-Python "gen_rubric.py" "--input" $withAnswers "--output" $rubric "--concurrency" $RUBRIC_CONCURRENCY "--model" $GPT_MODEL "--base-url" $RUBRIC_BASE_URL "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
-        Invoke-Step $roundScored "scoring" $rubric "[Round $round] Step 11/13: scoring.py" { Invoke-Python "scoring.py" "--input" $rubric "--output" $roundScored "--answer-mode" "llm" "--answer-base-url" $QWEN_BASE_URL "--answer-api-key" $QWEN_API_KEY "--answer-model" $QWEN_MODEL "--judge-base-url" $QWEN_BASE_URL "--judge-api-key" $QWEN_API_KEY "--judge-model" $QWEN_MODEL "--answer-trials" $SCORING_ANSWER_TRIALS "--qwen-judge-repeats" $QWEN_JUDGE_REPEATS "--gpt-judge-base-url" $GPT_JUDGE_BASE_URL "--gpt-judge-api-key" $GPT_JUDGE_API_KEY "--gpt-judge-model" $GPT_JUDGE_MODEL "--gpt-judge-repeats" $GPT_JUDGE_REPEATS "--qwen-max-concurrent" $QWEN_SCORING_MAX_CONCURRENT "--gpt-max-concurrent" $GPT_SCORING_MAX_CONCURRENT "--concurrency" $SCORING_CONCURRENCY "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
+        $scoringInput = $rubric
+        $scoringMode = "complete"
+        if ($DEFER_GPT_EXPERIMENTAL_EVALUATION -eq "true") {
+            $decisionScored = Join-Path $roundDir "decision_scored.jsonl"
+            Invoke-Step $decisionScored "scoring_decision" $rubric "[Round $round] Step 11a/13: Qwen decision checkpoint" { Invoke-Python "scoring.py" "--input" $rubric "--output" $decisionScored "--evaluation-mode" "decision" "--answer-mode" "llm" "--answer-base-url" $QWEN_BASE_URL "--answer-api-key" $QWEN_API_KEY "--answer-model" $QWEN_MODEL "--judge-base-url" $QWEN_BASE_URL "--judge-api-key" $QWEN_API_KEY "--judge-model" $QWEN_MODEL "--answer-trials" $SCORING_ANSWER_TRIALS "--gpt-answer-trials" $GPT_ANSWER_TRIALS "--qwen-judge-repeats" $QWEN_JUDGE_REPEATS "--gpt-judge-base-url" $GPT_JUDGE_BASE_URL "--gpt-judge-api-key" $GPT_JUDGE_API_KEY "--gpt-judge-model" $GPT_JUDGE_MODEL "--gpt-judge-repeats" $GPT_JUDGE_REPEATS "--gpt-answer-base-url" $GPT_ANSWER_BASE_URL "--gpt-answer-api-key" $GPT_ANSWER_API_KEY "--gpt-answer-model" $GPT_ANSWER_MODEL "--qwen-max-concurrent" $QWEN_SCORING_MAX_CONCURRENT "--gpt-max-concurrent" $GPT_SCORING_MAX_CONCURRENT "--concurrency" $SCORING_CONCURRENCY "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
+            $scoringInput = $decisionScored
+            $scoringMode = "experimental"
+        }
+        Invoke-Step $roundScored "scoring" $scoringInput "[Round $round] Step 11/13: scoring.py complete scored artifact" { Invoke-Python "scoring.py" "--input" $scoringInput "--output" $roundScored "--evaluation-mode" $scoringMode "--answer-mode" "llm" "--answer-base-url" $QWEN_BASE_URL "--answer-api-key" $QWEN_API_KEY "--answer-model" $QWEN_MODEL "--judge-base-url" $QWEN_BASE_URL "--judge-api-key" $QWEN_API_KEY "--judge-model" $QWEN_MODEL "--answer-trials" $SCORING_ANSWER_TRIALS "--gpt-answer-trials" $GPT_ANSWER_TRIALS "--qwen-judge-repeats" $QWEN_JUDGE_REPEATS "--gpt-judge-base-url" $GPT_JUDGE_BASE_URL "--gpt-judge-api-key" $GPT_JUDGE_API_KEY "--gpt-judge-model" $GPT_JUDGE_MODEL "--gpt-judge-repeats" $GPT_JUDGE_REPEATS "--gpt-answer-base-url" $GPT_ANSWER_BASE_URL "--gpt-answer-api-key" $GPT_ANSWER_API_KEY "--gpt-answer-model" $GPT_ANSWER_MODEL "--qwen-max-concurrent" $QWEN_SCORING_MAX_CONCURRENT "--gpt-max-concurrent" $GPT_SCORING_MAX_CONCURRENT "--concurrency" $SCORING_CONCURRENCY "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
     }
     else {
         Write-Host "检测到已存在 $roundScored，跳过本轮生成闭环"
