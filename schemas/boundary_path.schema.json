@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Vertical boundary path",
+  "type": "object",
+  "required": ["path_id", "sample_id", "root_node_id", "leaf_node_id", "node_ids", "operator_stack", "operator_set", "depth", "edge_deltas", "root_delta_score_rate", "review_status"],
+  "properties": {
+    "path_id": {"type": "string", "minLength": 1},
+    "sample_id": {"type": "string", "minLength": 1},
+    "root_node_id": {"type": "string", "minLength": 1},
+    "leaf_node_id": {"type": "string", "minLength": 1},
+    "node_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "operator_stack": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "operator_set": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "depth": {"type": "integer", "minimum": 2},
+    "edge_deltas": {"type": "array", "items": {"type": "number"}},
+    "root_delta_score_rate": {"type": "number"},
+    "review_status": {"enum": ["pending", "approved", "rejected"]}
+  },
+  "additionalProperties": true
+}

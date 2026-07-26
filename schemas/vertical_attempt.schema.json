@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Vertical search operator attempt",
+  "type": "object",
+  "required": [
+    "vertical_attempt_version",
+    "attempt_id",
+    "parent_node_id",
+    "sample_id",
+    "operator_id",
+    "depth",
+    "operator_rank",
+    "status",
+    "generation_attempt_count",
+    "validation_retry_count",
+    "duplicate_retry_count",
+    "failure_reasons"
+  ],
+  "properties": {
+    "vertical_attempt_version": {"const": 1},
+    "attempt_id": {"type": "string", "minLength": 1},
+    "parent_node_id": {"type": "string", "minLength": 1},
+    "sample_id": {"type": "string", "minLength": 1},
+    "operator_id": {"type": "string", "minLength": 1},
+    "depth": {"type": "integer", "minimum": 2},
+    "operator_rank": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["pending", "running", "completed", "duplicate_exhausted", "validation_failed", "not_applicable", "branch_error", "skipped_depth_limit", "skipped_global_termination"]},
+    "branch_status": {"type": ["string", "null"]},
+    "generation_attempt_count": {"type": "integer", "minimum": 0},
+    "validation_retry_count": {"type": "integer", "minimum": 0},
+    "duplicate_retry_count": {"type": "integer", "minimum": 0},
+    "failure_reasons": {"type": "array"}
+  },
+  "additionalProperties": true
+}

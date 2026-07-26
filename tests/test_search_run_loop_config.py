@@ -37,3 +37,14 @@ def test_multi_operator_mode_is_wired_to_the_production_search_runner():
     assert '"--artifact-retention", $SEARCH_ARTIFACT_RETENTION' in PS_LOOP
     assert '$searchArgs += "--defer-gpt-experimental-evaluation"' in PS_LOOP
     assert "$env:EVO_CONCURRENCY = [string]$EVO_CONCURRENCY" in PS_LOOP
+
+
+def test_vertical_operator_mode_is_wired_with_depth_and_protection_controls():
+    assert "multi_operator_vertical_stack" in SH_LOOP
+    assert "python vertical_operator_search.py" in SH_LOOP
+    assert 'SEARCH_MAX_DEPTH=${SEARCH_MAX_DEPTH:-3}' in SH_LOOP
+    assert '--max-depth "$SEARCH_MAX_DEPTH"' in SH_LOOP
+    assert '--max-request-attempts-per-sample "$SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE"' in SH_LOOP
+    assert '"vertical_operator_search.py", "--input", $routed' in PS_LOOP
+    assert '"--max-depth", $SEARCH_MAX_DEPTH' in PS_LOOP
+    assert '$SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH -eq "true"' in PS_LOOP

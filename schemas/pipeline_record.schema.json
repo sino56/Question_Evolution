@@ -201,6 +201,27 @@
     },
     "effect_analysis": {
       "$ref": "effect_analysis.schema.json"
+    },
+    "node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "root_node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "parent_node_id": {
+      "type": ["string", "null"]
+    },
+    "vertical_search_state": {
+      "$ref": "vertical_search_state.schema.json"
+    },
+    "vertical_node": {
+      "$ref": "vertical_node.schema.json"
+    },
+    "vertical_search_context": {
+      "type": "object",
+      "additionalProperties": true
     }
   }
 }

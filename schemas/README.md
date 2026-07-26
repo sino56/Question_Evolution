@@ -70,3 +70,8 @@ strong success examples without review.
   explicitly forbids embedded full branch collections.
 - `branch_result.schema.json` defines complete append-only branch results,
   including independent decision and experimental evaluation status.
+- `vertical_search_state.schema.json` keeps only recoverable vertical scheduler
+  references; full nodes and paths stay in sidecar artifacts.
+- `vertical_node.schema.json`, `vertical_attempt.schema.json`,
+  `boundary_edge.schema.json`, and `boundary_path.schema.json` define the
+  ordered, directly comparable vertical-search evidence records.

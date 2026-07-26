@@ -1030,7 +1030,16 @@ class MultiOperatorSearchRunner:
         experimental_jobs: List[Future[List[Tuple[str, str]]]] = []
         search_completed_at: Optional[float] = None
         try:
-            for iteration in range(1, self.max_iterations + 1):
+            existing_wave_numbers = [
+                int(path.name.removeprefix("wave_"))
+                for path in self.work_dir.glob("wave_[0-9][0-9][0-9][0-9]")
+                if path.is_dir() and path.name.removeprefix("wave_").isdigit()
+            ]
+            first_iteration = max(existing_wave_numbers, default=0) + 1
+            for iteration in range(
+                first_iteration,
+                first_iteration + self.max_iterations,
+            ):
                 wave_dir = self.work_dir / f"wave_{iteration:04d}"
                 wave_dir.mkdir(parents=True, exist_ok=True)
                 next_states: List[Dict[str, Any]] = []
@@ -1079,7 +1088,9 @@ class MultiOperatorSearchRunner:
                         generation = candidate.get("candidate_generation")
                         generation = generation if isinstance(generation, Mapping) else {}
                         if generation.get("generation_status") == "not_applicable":
-                            reason = _clean(generation.get("not_applicable_reason"))
+                            reason = _clean(generation.get("not_applicable_reason")) or (
+                                "operator reported not_applicable without a reason"
+                            )
                             state = mark_branch_terminal(
                                 state,
                                 branch_id=branch_id,
@@ -1125,6 +1136,22 @@ class MultiOperatorSearchRunner:
                                     [retry_input],
                                 )
                                 retry_candidate = retry_rows[0]
+                                retry_candidate["duplicate_generation_trajectories"] = [
+                                    {
+                                        "generation_attempt": 1,
+                                        "prompt": candidate.get("prompt"),
+                                        "candidate_generation": deepcopy(
+                                            candidate.get("candidate_generation")
+                                        ),
+                                    },
+                                    {
+                                        "generation_attempt": 2,
+                                        "prompt": retry_candidate.get("prompt"),
+                                        "candidate_generation": deepcopy(
+                                            retry_candidate.get("candidate_generation")
+                                        ),
+                                    },
+                                ]
                                 state, retry_action = register_generated_prompt(
                                     state,
                                     branch_id=branch_id,
@@ -1390,7 +1417,8 @@ class MultiOperatorSearchRunner:
                 raise StreamBranchTerminalError(
                     "not_applicable",
                     candidate,
-                    _clean(generation.get("not_applicable_reason")),
+                    _clean(generation.get("not_applicable_reason"))
+                    or "operator reported not_applicable without a reason",
                 )
             if candidate.get("question_evolved") is not True:
                 raise StreamBranchTerminalError(
@@ -1430,6 +1458,22 @@ class MultiOperatorSearchRunner:
                 [retry_input],
             )
             retry_candidate = retry_rows[0]
+            retry_candidate["duplicate_generation_trajectories"] = [
+                {
+                    "generation_attempt": 1,
+                    "prompt": candidate.get("prompt"),
+                    "candidate_generation": deepcopy(
+                        candidate.get("candidate_generation")
+                    ),
+                },
+                {
+                    "generation_attempt": 2,
+                    "prompt": retry_candidate.get("prompt"),
+                    "candidate_generation": deepcopy(
+                        retry_candidate.get("candidate_generation")
+                    ),
+                },
+            ]
             async with state_lock:
                 state_record = states_by_parent[parent_id]
                 state, retry_action = register_generated_prompt(

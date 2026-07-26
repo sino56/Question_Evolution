@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Lightweight vertical multi-operator search state",
+  "type": "object",
+  "required": [
+    "vertical_search_state_version",
+    "search_mode",
+    "root_node_id",
+    "status",
+    "current_depth",
+    "max_depth",
+    "boundary_target",
+    "boundary_candidate_count",
+    "frontier_node_ids",
+    "completed_parent_node_ids",
+    "registered_node_ids",
+    "registered_prompt_hashes"
+  ],
+  "properties": {
+    "vertical_search_state_version": {"const": 1},
+    "search_mode": {"const": "multi_operator_vertical_stack"},
+    "root_node_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["running", "completed", "partial", "aborted"]},
+    "current_depth": {"type": "integer", "minimum": 1},
+    "max_depth": {"type": "integer", "minimum": 1},
+    "boundary_target": {"type": "integer", "minimum": 1},
+    "boundary_candidate_count": {"type": "integer", "minimum": 0},
+    "completed_operator_attempt_count": {"type": "integer", "minimum": 0},
+    "pending_expandable_node_count": {"type": "integer", "minimum": 0},
+    "termination_reason": {
+      "type": ["string", "null"],
+      "enum": [
+        null,
+        "operator_space_exhausted",
+        "boundary_target_reached",
+        "request_budget_exhausted",
+        "evaluation_budget_exhausted",
+        "timeout",
+        "fatal_error",
+        "state_recovery_failed",
+        "aborted"
+      ]
+    },
+    "allow_operator_repeat_in_path": {"type": "boolean"},
+    "frontier_node_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "completed_parent_node_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "registered_node_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "registered_prompt_hashes": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "execution_sequence": {"type": "array", "items": {"type": "object"}}
+  },
+  "allOf": [
+    {
+      "not": {
+        "anyOf": [
+          {"required": ["nodes"]},
+          {"required": ["operator_attempts"]},
+          {"required": ["boundary_paths"]}
+        ]
+      }
+    }
+  ],
+  "additionalProperties": true
+}

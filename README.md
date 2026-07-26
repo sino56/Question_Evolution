@@ -989,3 +989,51 @@ bash run_loop.sh
 
 代码和离线等价性/恢复性测试已经接入。正式标记验收前仍需使用相同模型、Prompt、
 trial/repeat、请求上限和重试策略完成 3 至 5 条真实样本灰度，并至少重复三次性能对照。
+
+## 9. 纵向算子叠加搜索
+
+项目支持在横向分支搜索之上启用 `multi_operator_vertical_stack`。根节点仍覆盖全部已注册、
+具备题目生成功能的算子；只有相对直接父节点真实降分且通过原有完整闭环的子节点，才会
+进入下一层 frontier。在线扩展不读取人工 `review_status`，也不改变答案、Rubric、
+Score Prompt、双 Judge 或 Memory 的业务准入规则。
+
+推荐的首轮实验配置：
+
+```bash
+SEARCH_MODE=multi_operator_vertical_stack
+SEARCH_MAX_DEPTH=3
+SEARCH_BOUNDARY_TARGET=5
+SEARCH_BRANCH_WINDOW=1
+SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH=false
+bash run_loop.sh
+```
+
+Windows 使用相同环境变量运行 `.\run_loop.ps1`。`max_depth` 使用节点层级：root 为 1，
+第一层算子子节点为 2，第二次叠加后的节点为 3。因此默认值 3 只允许一次真正的纵向叠加。
+若只验证横向兼容性，可临时设置 `SEARCH_MAX_DEPTH=2`。
+
+可选系统保护参数：
+
+```text
+SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE=0  0 表示不额外设置尝试上限
+SEARCH_MAX_EVALUATIONS_PER_SAMPLE=0       0 表示不额外设置评分节点上限
+SEARCH_SAMPLE_TIMEOUT_SECONDS=0           0 表示不额外设置样本超时
+```
+
+纵向模式在 `search/` 下保存：
+
+```text
+vertical_search_checkpoint.jsonl  可恢复的轻量样本状态
+vertical_nodes.jsonl              root 与所有完成完整评分闭环的节点及完整证据
+operator_attempts.jsonl           每个 frontier 的逐算子尝试状态
+boundary_edges.jsonl              直接父子降分边
+boundary_paths.jsonl              有序算子路径及累计分数变化
+vertical_search_summary.json      样本、算子、组合、终止和预算指标
+parents/                          各 frontier 复用横向完整闭环的恢复产物
+```
+
+稳定 `node_id` 同时作为横向 `branch_id`，因此现有 Memory 写入继续使用
+`node_id + memory_type` 幂等，不会因断点恢复重复追加。达到 `max_depth` 的降分节点仍保留为
+`boundary_candidate`，但不会进入下一层；它不会把样本终止原因伪装成
+`max_depth_reached`。正常业务终止只使用 `operator_space_exhausted` 或
+`boundary_target_reached`，请求、评分、超时、恢复和致命错误使用独立系统终止原因。

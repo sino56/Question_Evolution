@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Vertical search node metadata",
+  "type": "object",
+  "required": [
+    "vertical_node_version",
+    "node_id",
+    "sample_id",
+    "depth",
+    "root_node_id",
+    "operator_stack",
+    "operator_set",
+    "score_rate",
+    "root_score_rate",
+    "root_delta_score_rate",
+    "node_status",
+    "frontier_status"
+  ],
+  "properties": {
+    "vertical_node_version": {"const": 1},
+    "node_id": {"type": "string", "minLength": 1},
+    "sample_id": {"type": "string", "minLength": 1},
+    "depth": {"type": "integer", "minimum": 1},
+    "root_node_id": {"type": "string", "minLength": 1},
+    "parent_node_id": {"type": ["string", "null"]},
+    "operator_from_parent": {"type": ["string", "null"]},
+    "operator_stack": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "operator_set": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "score_rate": {"type": "number"},
+    "parent_score_rate": {"type": ["number", "null"]},
+    "root_score_rate": {"type": "number"},
+    "edge_delta_score_rate": {"type": ["number", "null"]},
+    "root_delta_score_rate": {"type": "number"},
+    "node_status": {"enum": ["root", "boundary_candidate", "no_score_change", "score_increased"]},
+    "frontier_status": {"enum": ["eligible", "ineligible", "depth_limit", "expanded"]},
+    "review_status": {"enum": ["pending", "approved", "rejected", null]}
+  },
+  "additionalProperties": true
+}

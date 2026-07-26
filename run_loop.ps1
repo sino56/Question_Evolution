@@ -254,6 +254,11 @@ $DEFER_GPT_EXPERIMENTAL_EVALUATION = Get-EnvOrDefault "DEFER_GPT_EXPERIMENTAL_EV
 $SEARCH_OPERATOR_SORT_MODE = Get-EnvOrDefault "SEARCH_OPERATOR_SORT_MODE" "route"
 $SEARCH_OPERATOR_EXPLORATION_RATIO = Get-EnvOrDefault "SEARCH_OPERATOR_EXPLORATION_RATIO" "0.1"
 $SEARCH_BOUNDARY_TARGET = Get-EnvOrDefault "SEARCH_BOUNDARY_TARGET" "5"
+$SEARCH_MAX_DEPTH = Get-EnvOrDefault "SEARCH_MAX_DEPTH" "3"
+$SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH = Get-EnvOrDefault "SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH" "false"
+$SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE = Get-EnvOrDefault "SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE" "0"
+$SEARCH_MAX_EVALUATIONS_PER_SAMPLE = Get-EnvOrDefault "SEARCH_MAX_EVALUATIONS_PER_SAMPLE" "0"
+$SEARCH_SAMPLE_TIMEOUT_SECONDS = Get-EnvOrDefault "SEARCH_SAMPLE_TIMEOUT_SECONDS" "0"
 $MAX_CANDIDATE_BUDGET = Get-EnvOrDefault "MAX_CANDIDATE_BUDGET" "0"
 $VALIDATION_RETRIES = Get-EnvOrDefault "VALIDATION_RETRIES" "1"
 $MIN_DIFFICULTY_GAIN_SCORE = Get-EnvOrDefault "MIN_DIFFICULTY_GAIN_SCORE" "0.75"
@@ -367,7 +372,7 @@ if (-not (Test-Path -LiteralPath $SUMMARY_FILE -PathType Leaf)) {
     foreach ($line in @(
         "Input file: $InputFile", "Memory dir: $MEMORY_DIR", "Max rounds: $MaxRounds", "Early stop rate: $EARLY_STOP_RATE",
         "No-info stop rounds: $NO_INFO_STOP_ROUNDS", "No-info min delta: $NO_INFO_MIN_DELTA", "Evolution trigger rate: $MIN_SCORE_RATE",
-        "Num candidates: $NUM_CANDIDATES", "Search mode: $SEARCH_MODE", "Search branch window: $SEARCH_BRANCH_WINDOW", "Search pipeline mode: $SEARCH_PIPELINE_MODE", "Search artifact retention: $SEARCH_ARTIFACT_RETENTION", "Deferred GPT experimental evaluation: $DEFER_GPT_EXPERIMENTAL_EVALUATION", "Search operator sort mode: $SEARCH_OPERATOR_SORT_MODE", "Search operator exploration ratio: $SEARCH_OPERATOR_EXPLORATION_RATIO", "Search boundary target: $SEARCH_BOUNDARY_TARGET", "Max candidate budget: $MAX_CANDIDATE_BUDGET", "Validation retries: $VALIDATION_RETRIES",
+        "Num candidates: $NUM_CANDIDATES", "Search mode: $SEARCH_MODE", "Search branch window: $SEARCH_BRANCH_WINDOW", "Search pipeline mode: $SEARCH_PIPELINE_MODE", "Search artifact retention: $SEARCH_ARTIFACT_RETENTION", "Deferred GPT experimental evaluation: $DEFER_GPT_EXPERIMENTAL_EVALUATION", "Search operator sort mode: $SEARCH_OPERATOR_SORT_MODE", "Search operator exploration ratio: $SEARCH_OPERATOR_EXPLORATION_RATIO", "Search boundary target: $SEARCH_BOUNDARY_TARGET", "Search max depth: $SEARCH_MAX_DEPTH", "Allow operator repeat in path: $SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH", "Search max request attempts per sample: $SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE", "Search max evaluations per sample: $SEARCH_MAX_EVALUATIONS_PER_SAMPLE", "Search sample timeout seconds: $SEARCH_SAMPLE_TIMEOUT_SECONDS", "Max candidate budget: $MAX_CANDIDATE_BUDGET", "Validation retries: $VALIDATION_RETRIES",
         "Scoring answer trials: $SCORING_ANSWER_TRIALS", "GPT answer trials: $GPT_ANSWER_TRIALS", "Qwen judge repeats: $QWEN_JUDGE_REPEATS", "GPT judge repeats: $GPT_JUDGE_REPEATS",
         "Scoring worker concurrency: $SCORING_CONCURRENCY", "Qwen scoring max concurrent: $QWEN_SCORING_MAX_CONCURRENT", "GPT scoring max concurrent: $GPT_SCORING_MAX_CONCURRENT",
         "Answer worker concurrency: $ANSWER_CONCURRENCY", "Answer request concurrency: $ANSWER_REQUEST_CONCURRENCY",
@@ -420,7 +425,7 @@ for ($round = 1; $round -le $MaxRounds; $round += 1) {
         Invoke-Step $profiled "profile_samples" $roundInput "[Round $round] Step 1/13: profile_samples.py" { Invoke-Python "profile_samples.py" "--input" $roundInput "--output" $profiled "--model" $PROFILE_MODEL "--base-url" $PROFILE_BASE_URL "--concurrency" $PROFILE_CONCURRENCY "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
         Invoke-Step $profiledCandidates "select_evolution_candidates" $profiled "[Round $round] Step 2/13: select_evolution_candidates.py" { Invoke-Python "select_evolution_candidates.py" "--input" $profiled "--output" $profiledCandidates "--high-score-threshold" $MIN_SCORE_RATE "--report-output" (Join-Path $roundDir "evolution_candidate_report.json") "--performance-events" (Join-Path $roundDir "performance_events.jsonl") @uncertainLowProbeArgs }
         Invoke-Step $routed "operator_router" $profiledCandidates "[Round $round] Step 3/13: operator_router.py" { Invoke-Python "operator_router.py" "--input" $profiledCandidates "--output" $routed "--memory-dir" $MEMORY_DIR "--failure-memory-window-rounds" $FAILURE_MEMORY_WINDOW_ROUNDS "--report-output" (Join-Path $roundDir "operator_router_report.json") "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
-        if ($SEARCH_MODE -eq "multi_operator_branch") {
+        if ($SEARCH_MODE -in @("multi_operator_branch", "multi_operator_vertical_stack")) {
             $env:EVO_CONCURRENCY = [string]$EVO_CONCURRENCY
             $env:DIFFICULTY_GAIN_CONCURRENCY = [string]$DIFFICULTY_GAIN_CONCURRENCY
             $env:ANSWER_CONCURRENCY = [string]$ANSWER_CONCURRENCY
@@ -441,14 +446,19 @@ for ($round = 1; $round -le $MaxRounds; $round += 1) {
             $env:DIFFICULTY_GAIN_ENABLE_WEAK_PROBE = [string]$DIFFICULTY_GAIN_ENABLE_WEAK_PROBE
             $env:WEAK_PROBE_MODE = [string]$WEAK_PROBE_MODE
             $searchStateOutput = Join-Path $roundDir "search_state_updated.jsonl"
-            $searchArgs = @("multi_operator_search.py", "--input", $routed, "--output", $searchStateOutput, "--work-dir", (Join-Path $roundDir "search"), "--memory-dir", $MEMORY_DIR, "--branch-window", $SEARCH_BRANCH_WINDOW, "--boundary-target", $SEARCH_BOUNDARY_TARGET, "--pipeline-mode", $SEARCH_PIPELINE_MODE, "--artifact-retention", $SEARCH_ARTIFACT_RETENTION, "--operator-sort-mode", $SEARCH_OPERATOR_SORT_MODE, "--exploration-ratio", $SEARCH_OPERATOR_EXPLORATION_RATIO)
-            if ($env:SEARCH_OPERATOR_STATISTICS) { $searchArgs += @("--operator-statistics", $env:SEARCH_OPERATOR_STATISTICS) }
+            if ($SEARCH_MODE -eq "multi_operator_vertical_stack") {
+                $searchArgs = @("vertical_operator_search.py", "--input", $routed, "--output", $searchStateOutput, "--work-dir", (Join-Path $roundDir "search"), "--memory-dir", $MEMORY_DIR, "--branch-window", $SEARCH_BRANCH_WINDOW, "--boundary-target", $SEARCH_BOUNDARY_TARGET, "--max-depth", $SEARCH_MAX_DEPTH, "--pipeline-mode", $SEARCH_PIPELINE_MODE, "--artifact-retention", $SEARCH_ARTIFACT_RETENTION, "--max-request-attempts-per-sample", $SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE, "--max-evaluations-per-sample", $SEARCH_MAX_EVALUATIONS_PER_SAMPLE, "--sample-timeout-seconds", $SEARCH_SAMPLE_TIMEOUT_SECONDS)
+                if ($SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH -eq "true") { $searchArgs += "--allow-operator-repeat-in-path" }
+            } else {
+                $searchArgs = @("multi_operator_search.py", "--input", $routed, "--output", $searchStateOutput, "--work-dir", (Join-Path $roundDir "search"), "--memory-dir", $MEMORY_DIR, "--branch-window", $SEARCH_BRANCH_WINDOW, "--boundary-target", $SEARCH_BOUNDARY_TARGET, "--pipeline-mode", $SEARCH_PIPELINE_MODE, "--artifact-retention", $SEARCH_ARTIFACT_RETENTION, "--operator-sort-mode", $SEARCH_OPERATOR_SORT_MODE, "--exploration-ratio", $SEARCH_OPERATOR_EXPLORATION_RATIO)
+                if ($env:SEARCH_OPERATOR_STATISTICS) { $searchArgs += @("--operator-statistics", $env:SEARCH_OPERATOR_STATISTICS) }
+            }
             if ($env:SEARCH_RULE_ONLY_DIFFICULTY -eq "true") { $searchArgs += "--rule-only-difficulty" }
             if ($DEFER_GPT_EXPERIMENTAL_EVALUATION -eq "true") { $searchArgs += "--defer-gpt-experimental-evaluation" }
             Invoke-Python @searchArgs
             $previousScored = $searchStateOutput
             $previousAverage = Get-AverageScoreRate $previousScored
-            Add-SummaryRoundIfMissing $SUMMARY_FILE $round $previousAverage "multi_operator_search_complete"
+            Add-SummaryRoundIfMissing $SUMMARY_FILE $round $previousAverage "${SEARCH_MODE}_complete"
             break
         }
         Invoke-Step $candidates "question_evolution" $routed "[Round $round] Step 4/13: question_evolution.py" { Invoke-Python "question_evolution.py" "--input" $routed "--output" $candidates "--min-score-rate" $MIN_SCORE_RATE "--model" $EVOLVE_MODEL "--base-url" $EVOLVE_BASE_URL "--concurrency" $EVO_CONCURRENCY "--num-candidates" $NUM_CANDIDATES "--max-candidate-budget" $MAX_CANDIDATE_BUDGET "--validation-retries" $VALIDATION_RETRIES "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }

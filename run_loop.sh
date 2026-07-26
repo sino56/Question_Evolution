@@ -60,7 +60,7 @@ NO_INFO_STOP_ROUNDS=${NO_INFO_STOP_ROUNDS:-2}    # 连续多少轮无新信息�
 NO_INFO_MIN_DELTA=${NO_INFO_MIN_DELTA:-0.0001}   # 平均分变化小于该值视为无新信息
 MIN_SCORE_RATE=${MIN_SCORE_RATE:-0.8}            # legacy question_evolution 触发阈值
 NUM_CANDIDATES=${NUM_CANDIDATES:-2}              # 每条待进化样本最多生成候选数，范围 1-4
-SEARCH_MODE=${SEARCH_MODE:-single_branch}         # single_branch | multi_operator_branch
+SEARCH_MODE=${SEARCH_MODE:-single_branch}         # single_branch | multi_operator_branch | multi_operator_vertical_stack
 SEARCH_BRANCH_WINDOW=${SEARCH_BRANCH_WINDOW:-1}   # 灰度默认 1；验证后可设为 3
 SEARCH_PIPELINE_MODE=${SEARCH_PIPELINE_MODE:-step} # step | stream
 SEARCH_ARTIFACT_RETENTION=${SEARCH_ARTIFACT_RETENTION:-compact} # compact | full
@@ -68,6 +68,11 @@ DEFER_GPT_EXPERIMENTAL_EVALUATION=${DEFER_GPT_EXPERIMENTAL_EVALUATION:-false}
 SEARCH_OPERATOR_SORT_MODE=${SEARCH_OPERATOR_SORT_MODE:-route} # route | yield_per_time
 SEARCH_OPERATOR_EXPLORATION_RATIO=${SEARCH_OPERATOR_EXPLORATION_RATIO:-0.1}
 SEARCH_BOUNDARY_TARGET=${SEARCH_BOUNDARY_TARGET:-5}
+SEARCH_MAX_DEPTH=${SEARCH_MAX_DEPTH:-3}
+SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH=${SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH:-false}
+SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE=${SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE:-0}
+SEARCH_MAX_EVALUATIONS_PER_SAMPLE=${SEARCH_MAX_EVALUATIONS_PER_SAMPLE:-0}
+SEARCH_SAMPLE_TIMEOUT_SECONDS=${SEARCH_SAMPLE_TIMEOUT_SECONDS:-0}
 MAX_CANDIDATE_BUDGET=${MAX_CANDIDATE_BUDGET:-0}  # 单轮候选总预算；0 表示待进化样本数 * 2
 VALIDATION_RETRIES=${VALIDATION_RETRIES:-1}      # validate-retry 次数；当前最多 1 次
 MIN_DIFFICULTY_GAIN_SCORE=${MIN_DIFFICULTY_GAIN_SCORE:-0.75}
@@ -373,6 +378,11 @@ if [ ! -f "$SUMMARY_FILE" ]; then
     echo "Search operator sort mode: $SEARCH_OPERATOR_SORT_MODE" >> "$SUMMARY_FILE"
     echo "Search operator exploration ratio: $SEARCH_OPERATOR_EXPLORATION_RATIO" >> "$SUMMARY_FILE"
     echo "Search boundary target: $SEARCH_BOUNDARY_TARGET" >> "$SUMMARY_FILE"
+    echo "Search max depth: $SEARCH_MAX_DEPTH" >> "$SUMMARY_FILE"
+    echo "Allow operator repeat in path: $SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH" >> "$SUMMARY_FILE"
+    echo "Search max request attempts per sample: $SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE" >> "$SUMMARY_FILE"
+    echo "Search max evaluations per sample: $SEARCH_MAX_EVALUATIONS_PER_SAMPLE" >> "$SUMMARY_FILE"
+    echo "Search sample timeout seconds: $SEARCH_SAMPLE_TIMEOUT_SECONDS" >> "$SUMMARY_FILE"
     echo "Max candidate budget: $MAX_CANDIDATE_BUDGET" >> "$SUMMARY_FILE"
     echo "Validation retries: $VALIDATION_RETRIES" >> "$SUMMARY_FILE"
     echo "Min difficulty gain score: $MIN_DIFFICULTY_GAIN_SCORE" >> "$SUMMARY_FILE"
@@ -510,7 +520,7 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --report-output "$ROUND_DIR/operator_router_report.json" \
                 --performance-events "$ROUND_DIR/performance_events.jsonl"
 
-        if [ "$SEARCH_MODE" = "multi_operator_branch" ]; then
+        if [ "$SEARCH_MODE" = "multi_operator_branch" ] || [ "$SEARCH_MODE" = "multi_operator_vertical_stack" ]; then
             export EVO_CONCURRENCY DIFFICULTY_GAIN_CONCURRENCY
             export ANSWER_CONCURRENCY ANSWER_REQUEST_CONCURRENCY RUBRIC_CONCURRENCY
             export SCORING_CONCURRENCY QWEN_SCORING_MAX_CONCURRENT GPT_SCORING_MAX_CONCURRENT
@@ -529,21 +539,48 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
             if [ "$DEFER_GPT_EXPERIMENTAL_EVALUATION" = "true" ]; then
                 SEARCH_EXTRA_ARGS+=(--defer-gpt-experimental-evaluation)
             fi
-            python multi_operator_search.py \
-                --input "$ROUND_DIR/routed.jsonl" \
-                --output "$ROUND_DIR/search_state_updated.jsonl" \
-                --work-dir "$ROUND_DIR/search" \
-                --memory-dir "$MEMORY_DIR" \
-                --branch-window "$SEARCH_BRANCH_WINDOW" \
-                --boundary-target "$SEARCH_BOUNDARY_TARGET" \
-                --pipeline-mode "$SEARCH_PIPELINE_MODE" \
-                --artifact-retention "$SEARCH_ARTIFACT_RETENTION" \
-                --operator-sort-mode "$SEARCH_OPERATOR_SORT_MODE" \
-                --exploration-ratio "$SEARCH_OPERATOR_EXPLORATION_RATIO" \
-                "${SEARCH_EXTRA_ARGS[@]}"
+            if [ "$SEARCH_MODE" = "multi_operator_vertical_stack" ]; then
+                VERTICAL_EXTRA_ARGS=()
+                if [ "${SEARCH_RULE_ONLY_DIFFICULTY:-false}" = "true" ]; then
+                    VERTICAL_EXTRA_ARGS+=(--rule-only-difficulty)
+                fi
+                if [ "$DEFER_GPT_EXPERIMENTAL_EVALUATION" = "true" ]; then
+                    VERTICAL_EXTRA_ARGS+=(--defer-gpt-experimental-evaluation)
+                fi
+                if [ "$SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH" = "true" ]; then
+                    VERTICAL_EXTRA_ARGS+=(--allow-operator-repeat-in-path)
+                fi
+                python vertical_operator_search.py \
+                    --input "$ROUND_DIR/routed.jsonl" \
+                    --output "$ROUND_DIR/search_state_updated.jsonl" \
+                    --work-dir "$ROUND_DIR/search" \
+                    --memory-dir "$MEMORY_DIR" \
+                    --branch-window "$SEARCH_BRANCH_WINDOW" \
+                    --boundary-target "$SEARCH_BOUNDARY_TARGET" \
+                    --max-depth "$SEARCH_MAX_DEPTH" \
+                    --pipeline-mode "$SEARCH_PIPELINE_MODE" \
+                    --artifact-retention "$SEARCH_ARTIFACT_RETENTION" \
+                    --max-request-attempts-per-sample "$SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE" \
+                    --max-evaluations-per-sample "$SEARCH_MAX_EVALUATIONS_PER_SAMPLE" \
+                    --sample-timeout-seconds "$SEARCH_SAMPLE_TIMEOUT_SECONDS" \
+                    "${VERTICAL_EXTRA_ARGS[@]}"
+            else
+                python multi_operator_search.py \
+                    --input "$ROUND_DIR/routed.jsonl" \
+                    --output "$ROUND_DIR/search_state_updated.jsonl" \
+                    --work-dir "$ROUND_DIR/search" \
+                    --memory-dir "$MEMORY_DIR" \
+                    --branch-window "$SEARCH_BRANCH_WINDOW" \
+                    --boundary-target "$SEARCH_BOUNDARY_TARGET" \
+                    --pipeline-mode "$SEARCH_PIPELINE_MODE" \
+                    --artifact-retention "$SEARCH_ARTIFACT_RETENTION" \
+                    --operator-sort-mode "$SEARCH_OPERATOR_SORT_MODE" \
+                    --exploration-ratio "$SEARCH_OPERATOR_EXPLORATION_RATIO" \
+                    "${SEARCH_EXTRA_ARGS[@]}"
+            fi
             PREV_SCORED="$ROUND_DIR/search_state_updated.jsonl"
             AVG_RATE=$(compute_avg_score_rate "$PREV_SCORED")
-            append_summary_round_if_missing "$ROUND" "$AVG_RATE" "multi_operator_search_complete"
+            append_summary_round_if_missing "$ROUND" "$AVG_RATE" "${SEARCH_MODE}_complete"
             break
         fi
 
