@@ -233,13 +233,13 @@ admission_score 取值 1–5，只表示“是否值得进入 round0 探测”�
 5 分：
 强烈推荐进入 round0 探测。必须满足：
 
-* concrete_case 或非常强的 strong_partial_case；
-* 事实底座清楚；
-* 可在原事实内部做单主轴扰动；
-* rubric 不是长清单或格式型；
-* 有明确 operator family；
-* 不主要依赖 conclusion_strength_control_only；
-* 不容易退化成模板化易答题。
+- concrete_case 或非常强的 strong_partial_case；
+- 事实底座清楚；
+- 可在原事实内部做单主轴扰动；
+- rubric 不是长清单或格式型；
+- 有明确 operator family；
+- 不主要依赖 conclusion_strength_control_only；
+- 不容易退化成模板化易答题。
 
 # 分数上限规则
 
@@ -300,11 +300,13 @@ admission_score 取值 1–5，只表示“是否值得进入 round0 探测”�
     说明为什么适合或不适合该 operator family。
 
 15. rubric_fit：
+    ```json
     {
     "rubric_type": "boundary_reasoning / long_checklist / keyword_coverage / format_compliance / procedure_listing / generic_cautious_template / unknown",
     "rubric_fit_score": 1,
     "rubric_risk_tags": []
     }
+    ```
 
 16. evolution_risk_tags：
     可多选：
@@ -347,11 +349,11 @@ admission_score 取值 1–5，只表示“是否值得进入 round0 探测”�
 
 你将收到若干条原始样本。每条样本可能包含：
 
-* index
-* prompt
-* reference_answer 或 meta_info.references
-* rubric
-* 其他元数据
+- index
+- prompt
+- reference_answer 或 meta_info.references
+- rubric
+- 其他元数据
 
 请逐条判断。
 
@@ -361,6 +363,7 @@ admission_score 取值 1–5，只表示“是否值得进入 round0 探测”�
 
 输出格式如下：
 
+```json
 {
 "selected_summary": {
 "total_input": 0,
@@ -401,6 +404,7 @@ admission_score 取值 1–5，只表示“是否值得进入 round0 探测”�
 }
 ]
 }
+```
 
 # 最终筛选原则
 
