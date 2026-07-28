@@ -132,6 +132,34 @@ def test_live_hybrid_route_keeps_all_valid_llm_candidates_in_router_rank_order()
     assert "operator_cards" in client.calls[0]
 
 
+def test_frontier_route_bypasses_only_original_admission_and_is_explicit_in_prompt():
+    record = sample()
+    record["evolution_action"] = "stop_evolution"
+    record["frontier_route"] = {
+        "enabled": True,
+        "parent_node_id": "hybrid-route-1::root::O10",
+        "root_node_id": "hybrid-route-1::root",
+        "parent_depth": 2,
+        "operator_stack": ["O10_evidence_sufficiency_ladder"],
+        "direct_parent_score_rate": 0.8,
+        "root_score_rate": 1.0,
+        "profile_version": "frontier-profile-v1",
+    }
+    client = FakeRouterClient(
+        [response([candidate("O19_multi_entity_role_binding", 1, "O29_entity_identity_conflict_resolution")])]
+    )
+    routed = asyncio.run(
+        route_records_hybrid_async([record], settings=settings(), client=client)
+    )
+
+    route = routed[0]["operator_route"]
+    assert route["route_source"] == "llm"
+    assert route["is_frontier_route"] is True
+    assert route["selected_operator_ids"] == ["O19_multi_entity_role_binding"]
+    assert '"frontier_route"' in client.calls[0]
+    assert "不要重新执行仅适用于原始样本" in client.calls[0]
+
+
 def test_invalid_candidate_does_not_discard_valid_sibling():
     invalid = candidate("O19_multi_entity_role_binding", 1, "O29_entity_identity_conflict_resolution")
     invalid["evidence_spans"] = ["算子卡片中的虚构证据"]

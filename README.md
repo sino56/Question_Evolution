@@ -992,17 +992,20 @@ trial/repeat、请求上限和重试策略完成 3 至 5 条真实样本灰度�
 
 ## 9. 纵向算子叠加搜索
 
-项目支持在横向分支搜索之上启用 `multi_operator_vertical_stack`。根节点仍覆盖全部已注册、
-具备题目生成功能的算子；只有相对直接父节点真实降分且通过原有完整闭环的子节点，才会
-进入下一层 frontier。在线扩展不读取人工 `review_status`，也不改变答案、Rubric、
-Score Prompt、双 Judge 或 Memory 的业务准入规则。
+项目支持在横向分支搜索之上启用 `multi_operator_vertical_stack`。根节点使用已完成准入后的
+最终路由候选列表；只有相对直接父节点真实降分且通过原有完整闭环的子节点，才会成为
+depth 2 frontier。每个 frontier 会基于当前题面、当前参考答案、Rubric、Score Prompt、
+候选回答和评分结果重新画像并重新路由，绝不继承根节点 `operator_plan`。在线扩展不读取
+人工 `review_status`，也不改变答案、Rubric、Score Prompt、双 Judge 或 Memory 的业务准入规则。
 
 推荐的首轮实验配置：
 
 ```bash
 SEARCH_MODE=multi_operator_vertical_stack
 SEARCH_MAX_DEPTH=3
-SEARCH_BOUNDARY_TARGET=5
+SEARCH_SINGLE_OPERATOR_BOUNDARY_TARGET=5
+SEARCH_STACKED_OPERATOR_BOUNDARY_TARGET=5
+SEARCH_TOTAL_BOUNDARY_HARD_CAP=10
 SEARCH_BRANCH_WINDOW=1
 SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH=false
 bash run_loop.sh
@@ -1010,7 +1013,14 @@ bash run_loop.sh
 
 Windows 使用相同环境变量运行 `.\run_loop.ps1`。`max_depth` 使用节点层级：root 为 1，
 第一层算子子节点为 2，第二次叠加后的节点为 3。因此默认值 3 只允许一次真正的纵向叠加。
-若只验证横向兼容性，可临时设置 `SEARCH_MAX_DEPTH=2`。
+若只验证横向兼容性，可设置 `SEARCH_MAX_DEPTH=2` 与
+`SEARCH_STACKED_OPERATOR_BOUNDARY_TARGET=0`。旧的 `SEARCH_BOUNDARY_TARGET` 仍是兼容 alias：
+未设置三个分层参数时，它会同时提供单算子和叠加层目标，并将总上限设为两者之和。
+
+单算子达到目标后，根节点不再领取新算子，但已登记 frontier 会按稳定顺序串行完成 depth 3
+扩展。路径默认不重复使用算子；路由候选以当前节点的 LLM/规则最终结果为唯一来源，不会额外
+枚举注册表中的启用算子。上游 `ASSIGNMENT_MODE=live` 可以用于根节点和 frontier 的 LLM 路由；
+纵向调度器会保存该新路由的候选计划，并以自己的确定性账本执行它。
 
 可选系统保护参数：
 
@@ -1030,10 +1040,12 @@ boundary_edges.jsonl              直接父子降分边
 boundary_paths.jsonl              有序算子路径及累计分数变化
 vertical_search_summary.json      样本、算子、组合、终止和预算指标
 parents/                          各 frontier 复用横向完整闭环的恢复产物
+parents/*/frontier_profiled_parent.jsonl  frontier 的可恢复新画像
 ```
 
 稳定 `node_id` 同时作为横向 `branch_id`，因此现有 Memory 写入继续使用
 `node_id + memory_type` 幂等，不会因断点恢复重复追加。达到 `max_depth` 的降分节点仍保留为
 `boundary_candidate`，但不会进入下一层；它不会把样本终止原因伪装成
-`max_depth_reached`。正常业务终止只使用 `operator_space_exhausted` 或
-`boundary_target_reached`，请求、评分、超时、恢复和致命错误使用独立系统终止原因。
+`max_depth_reached`。正常业务终止会明确区分 `operator_space_exhausted`、
+`single_operator_boundary_target_reached`、`stacked_operator_boundary_target_reached` 和
+`total_boundary_hard_cap_reached`；请求、评分、超时、恢复和致命错误使用独立系统终止原因。

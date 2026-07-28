@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from branch_artifacts import BranchArtifactStore
-from multi_operator_search import MultiOperatorSearchRunner
+from multi_operator_search import MultiOperatorSearchRunner, _python_stage, _run
 from operator_router import load_jsonl_if_exists, route_records
 from pipeline_runtime import load_json_records, publish_records, sha256_file
 from search_coordinator import (
@@ -43,6 +43,8 @@ from vertical_search import (
     complete_frontier,
     initialize_vertical_search_state,
     mark_system_termination,
+    normalized_prompt_hash,
+    reconcile_vertical_boundary_counts,
     sample_identity,
     upgrade_vertical_search_state,
 )
@@ -72,7 +74,7 @@ class VerticalOperatorSearchRunner:
         work_dir: Path,
         memory_dir: Path,
         branch_window: int,
-        boundary_target: int,
+        boundary_target: Optional[int],
         max_depth: int,
         allow_operator_repeat_in_path: bool,
         pipeline_mode: str,
@@ -83,18 +85,66 @@ class VerticalOperatorSearchRunner:
         max_request_attempts_per_sample: int = 0,
         max_evaluations_per_sample: int = 0,
         sample_timeout_seconds: float = 0.0,
+        single_operator_boundary_target: Optional[int] = None,
+        stacked_operator_boundary_target: Optional[int] = None,
+        total_boundary_hard_cap: Optional[int] = None,
+        routing_mode: str = "",
+        router_model: str = "",
+        router_base_url: str = "",
+        router_timeout_seconds: float = 60.0,
+        router_retries: int = 0,
+        router_concurrency: int = 20,
+        router_cache: str = "",
+        profile_model: str = "",
+        profile_base_url: str = "",
+        profile_concurrency: int = 5,
     ):
-        if max_depth < 2:
-            raise ValueError("max_depth must be >= 2")
-        if branch_window < 1 or boundary_target < 1:
-            raise ValueError("branch_window and boundary_target must be >= 1")
+        if max_depth not in {2, 3}:
+            raise ValueError("max_depth must be 2 or 3")
+        if branch_window < 1:
+            raise ValueError("branch_window must be >= 1")
         if pipeline_mode not in {"step", "stream"}:
             raise ValueError("pipeline_mode must be step or stream")
         self.project_dir = project_dir
         self.work_dir = work_dir
         self.memory_dir = memory_dir
         self.branch_window = branch_window
-        self.boundary_target = boundary_target
+        legacy_target = int(boundary_target or 5)
+        self.single_operator_boundary_target = int(
+            single_operator_boundary_target
+            if single_operator_boundary_target is not None
+            else legacy_target
+        )
+        self.stacked_operator_boundary_target = (
+            0
+            if max_depth == 2
+            else int(
+                stacked_operator_boundary_target
+                if stacked_operator_boundary_target is not None
+                else legacy_target
+            )
+        )
+        if self.single_operator_boundary_target < 1:
+            raise ValueError("single_operator_boundary_target must be >= 1")
+        if self.stacked_operator_boundary_target < 0:
+            raise ValueError("stacked_operator_boundary_target must be >= 0")
+        if max_depth == 2 and stacked_operator_boundary_target not in {None, 0}:
+            raise ValueError("max_depth=2 requires stacked_operator_boundary_target=0")
+        self.total_boundary_hard_cap = int(
+            total_boundary_hard_cap
+            if total_boundary_hard_cap is not None
+            else self.single_operator_boundary_target
+            + self.stacked_operator_boundary_target
+        )
+        if self.total_boundary_hard_cap < max(
+            self.single_operator_boundary_target,
+            self.stacked_operator_boundary_target,
+        ):
+            raise ValueError(
+                "total_boundary_hard_cap must be at least each enabled layer target"
+            )
+        # Compatibility projection for callers which still inspect this field.
+        self.boundary_target = self.total_boundary_hard_cap
         self.max_depth = max_depth
         self.allow_operator_repeat_in_path = allow_operator_repeat_in_path
         self.pipeline_mode = pipeline_mode
@@ -105,6 +155,16 @@ class VerticalOperatorSearchRunner:
         self.max_request_attempts_per_sample = max(0, max_request_attempts_per_sample)
         self.max_evaluations_per_sample = max(0, max_evaluations_per_sample)
         self.sample_timeout_seconds = max(0.0, sample_timeout_seconds)
+        self.routing_mode = (routing_mode or os.getenv("ROUTING_MODE", "rule")).strip().lower()
+        self.router_model = router_model or os.getenv("ROUTER_MODEL", "")
+        self.router_base_url = router_base_url or os.getenv("ROUTER_BASE_URL", "")
+        self.router_timeout_seconds = max(0.0, float(router_timeout_seconds))
+        self.router_retries = max(0, int(router_retries))
+        self.router_concurrency = max(1, int(router_concurrency))
+        self.router_cache = Path(router_cache) if router_cache else self.work_dir / "frontier_router_cache.jsonl"
+        self.profile_model = profile_model or os.getenv("PROFILE_MODEL", "")
+        self.profile_base_url = profile_base_url or os.getenv("PROFILE_BASE_URL", "")
+        self.profile_concurrency = max(1, int(profile_concurrency))
         self.checkpoint_path = self.work_dir / "vertical_search_checkpoint.jsonl"
         self.artifacts = VerticalArtifactStore(self.work_dir)
         self.started_at_by_sample: Dict[str, float] = {}
@@ -127,35 +187,179 @@ class VerticalOperatorSearchRunner:
             ),
         }
 
+    def _frontier_profile_paths(self, node_id: str) -> Tuple[Path, Path]:
+        parent_dir = self._parent_work_dir(node_id)
+        return (
+            parent_dir / "frontier_profile_input.jsonl",
+            parent_dir / "frontier_profiled_parent.jsonl",
+        )
+
+    @staticmethod
+    def _frontier_context(
+        parent_node: Mapping[str, Any],
+        parent_record: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        return {
+            "enabled": True,
+            "root_node_id": parent_node["root_node_id"],
+            "parent_node_id": parent_node["node_id"],
+            "parent_depth": int(parent_node["depth"]),
+            "operator_stack": list(parent_node.get("operator_stack") or []),
+            "direct_parent_score_rate": float(parent_node["score_rate"]),
+            "root_score_rate": float(parent_node["root_score_rate"]),
+            "prompt_sha256": normalized_prompt_hash(parent_record.get("prompt")),
+        }
+
+    def _frontier_profile_input(
+        self,
+        parent_record: Mapping[str, Any],
+        parent_node: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Prepare one current-node profile input without root-score leakage."""
+
+        prepared = deepcopy(dict(parent_record))
+        for field in (
+            "round0_score_trials",
+            "round0_score_summary",
+            "representative_round0_answer",
+            "search_state",
+            "multi_operator_search_state",
+            "vertical_search_state",
+        ):
+            prepared.pop(field, None)
+        meta_info = prepared.get("meta_info")
+        meta_copy = deepcopy(dict(meta_info)) if isinstance(meta_info, Mapping) else {}
+        # The previous-parent snapshot is useful to downstream evolution, but
+        # it must not influence a fresh diagnosis of this frontier.
+        meta_copy.pop("parent_snapshot", None)
+        # The generic profile stage receives metadata rather than top-level
+        # rubric fields.  Put the current evaluation contract in a scoped
+        # metadata object so the frontier diagnosis sees the new rubric and
+        # score prompt without changing the shared profile-stage API.
+        meta_copy["frontier_evaluation_evidence"] = {
+            "rubric": deepcopy(parent_record.get("rubric")),
+            "score_prompt": parent_record.get("score_prompt"),
+        }
+        prepared["meta_info"] = meta_copy
+        prepared["frontier_route"] = self._frontier_context(parent_node, parent_record)
+        return prepared
+
+    def _profile_frontier(
+        self,
+        parent_record: Mapping[str, Any],
+        parent_node: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Persist and reuse a fresh profile for one depth-2 frontier node."""
+
+        profile_input_path, profile_output_path = self._frontier_profile_paths(
+            _clean(parent_node["node_id"])
+        )
+        if not profile_output_path.is_file():
+            profile_input_path.parent.mkdir(parents=True, exist_ok=True)
+            profile_input = self._frontier_profile_input(parent_record, parent_node)
+            _write_jsonl_atomic([profile_input], str(profile_input_path))
+            command = _python_stage(
+                self.project_dir,
+                "profile_samples.py",
+                "--input",
+                str(profile_input_path),
+                "--output",
+                str(profile_output_path),
+                "--model",
+                self.profile_model,
+                "--base-url",
+                self.profile_base_url,
+                "--concurrency",
+                str(self.profile_concurrency),
+            )
+            _run(command, cwd=self.project_dir)
+        rows = load_json_records(
+            str(profile_output_path), stage="vertical_frontier_profile_recovery"
+        )
+        if len(rows) != 1:
+            raise RuntimeError("frontier profile must contain exactly one record")
+        profiled = deepcopy(dict(rows[0]))
+        context = self._frontier_context(parent_node, parent_record)
+        metadata = profiled.get("profile_metadata")
+        if isinstance(metadata, Mapping):
+            context["profile_version"] = _clean(metadata.get("profile_model")) or None
+        profiled["frontier_route"] = context
+        return profiled
+
+    @staticmethod
+    def _is_usable_route(record: Mapping[str, Any]) -> bool:
+        route = record.get("operator_route")
+        if not isinstance(route, Mapping):
+            return False
+        selected = route.get("selected_operator_ids")
+        return isinstance(selected, list) or bool(
+            _clean(route.get("primary_operator"))
+            or list(route.get("backup_operators") or [])
+        )
+
+    def _normalize_vertical_route(
+        self,
+        routed: Mapping[str, Any],
+        *,
+        parent_node: Mapping[str, Any],
+        state: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        normalized = deepcopy(dict(routed))
+        plan = build_vertical_operator_plan(
+            normalized,
+            operator_stack=parent_node.get("operator_stack") or [],
+            allow_operator_repeat_in_path=bool(
+                state.get("allow_operator_repeat_in_path")
+            ),
+        )
+        route = deepcopy(dict(normalized.get("operator_route") or {}))
+        route["vertical_original_avoid_operators"] = list(
+            route.get("avoid_operators") or []
+        )
+        route["vertical_router_assignment_mode"] = route.get("assignment_mode")
+        # The vertical coordinator freezes one newly routed plan itself.  The
+        # horizontal executor must therefore treat it as a natural plan even
+        # when the upstream Router produced a live-assignment route.
+        route["assignment_mode"] = "natural"
+        route["selected_operator_ids"] = list(plan)
+        route["primary_operator"] = plan[0] if plan else None
+        route["backup_operators"] = plan[1:]
+        route["avoid_operators"] = []
+        normalized["operator_route"] = route
+        return normalized, plan
+
     def _route_frontier(
         self,
         parent_record: Mapping[str, Any],
         parent_node: Mapping[str, Any],
         state: Mapping[str, Any],
     ) -> Tuple[Dict[str, Any], List[str], Dict[str, Any]]:
-        operator_path, failure_path = self._memory_paths()
-        routed = route_records(
-            [deepcopy(dict(parent_record))],
-            operator_memory=load_jsonl_if_exists(str(operator_path)),
-            failure_memory=load_jsonl_if_exists(str(failure_path)),
-        )[0]
-        plan = build_vertical_operator_plan(
-            routed,
-            operator_stack=parent_node.get("operator_stack") or [],
-            allow_operator_repeat_in_path=bool(
-                state.get("allow_operator_repeat_in_path")
-            ),
+        # The root uses the already admitted and routed input.  A frontier is
+        # different: profile and route evidence must be rebuilt from its own
+        # question, answers, rubric, score prompt, and score.
+        if int(parent_node.get("depth") or 0) == 1 and self._is_usable_route(
+            parent_record
+        ):
+            routed = deepcopy(dict(parent_record))
+        else:
+            operator_path, failure_path = self._memory_paths()
+            profile_input = self._profile_frontier(parent_record, parent_node)
+            routed = route_records(
+                [profile_input],
+                operator_memory=load_jsonl_if_exists(str(operator_path)),
+                failure_memory=load_jsonl_if_exists(str(failure_path)),
+                routing_mode=self.routing_mode,
+                assignment_mode=("live" if self.routing_mode == "hybrid" else "natural"),
+                router_model=self.router_model,
+                router_base_url=self.router_base_url,
+                router_timeout_seconds=self.router_timeout_seconds,
+                router_retries=self.router_retries,
+                router_concurrency=self.router_concurrency,
+                router_cache=str(self.router_cache),
+            )[0]
+        routed, plan = self._normalize_vertical_route(
+            routed, parent_node=parent_node, state=state
         )
-        route = deepcopy(dict(routed.get("operator_route") or {}))
-        route["vertical_original_avoid_operators"] = list(
-            route.get("avoid_operators") or []
-        )
-        route["selected_operator_ids"] = list(plan)
-        route["primary_operator"] = plan[0] if plan else None
-        route["backup_operators"] = plan[1:]
-        # Avoid is a down-rank signal in vertical mode, not a hard exclusion.
-        route["avoid_operators"] = []
-        routed["operator_route"] = route
         return routed, plan, self._memory_snapshot()
 
     def _parent_work_dir(self, node_id: str) -> Path:
@@ -225,6 +429,9 @@ class VerticalOperatorSearchRunner:
             "child_depth": int(parent_node["depth"]) + 1,
             "operator_stack": list(parent_node.get("operator_stack") or []),
             "max_depth": state["max_depth"],
+            "route_type": (
+                "frontier_route" if int(parent_node["depth"]) > 1 else "root_route"
+            ),
         }
         horizontal = initialize_search_state(
             prepared,
@@ -328,6 +535,7 @@ class VerticalOperatorSearchRunner:
         plan: Sequence[str],
         operator_route: Mapping[str, Any],
         memory_version: Mapping[str, Any],
+        frontier_route: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         updated = upgrade_vertical_search_state(state)
         for execution in reversed(updated["execution_sequence"]):
@@ -338,6 +546,8 @@ class VerticalOperatorSearchRunner:
                 execution["operator_plan"] = list(plan)
                 execution["operator_route"] = deepcopy(dict(operator_route))
                 execution["memory_version"] = deepcopy(dict(memory_version))
+                if frontier_route is not None:
+                    execution["frontier_route"] = deepcopy(dict(frontier_route))
                 break
         return updated
 
@@ -484,6 +694,32 @@ class VerticalOperatorSearchRunner:
         )
         return updated, child_records
 
+    @staticmethod
+    def _remaining_boundary_slots(
+        state: Mapping[str, Any], parent_node: Mapping[str, Any]
+    ) -> int:
+        total_remaining = max(
+            0,
+            int(state["total_boundary_hard_cap"])
+            - int(state["total_boundary_count"]),
+        )
+        depth = int(parent_node.get("depth") or 0)
+        if depth == 1:
+            layer_remaining = max(
+                0,
+                int(state["single_operator_boundary_target"])
+                - int(state["single_operator_boundary_count"]),
+            )
+        elif depth == 2:
+            layer_remaining = max(
+                0,
+                int(state["stacked_operator_boundary_target"])
+                - int(state["stacked_operator_boundary_count"]),
+            )
+        else:
+            return 0
+        return min(total_remaining, layer_remaining)
+
     def _checkpoint(self, records: Sequence[Mapping[str, Any]]) -> None:
         _write_jsonl_atomic(records, str(self.checkpoint_path))
 
@@ -520,6 +756,9 @@ class VerticalOperatorSearchRunner:
                 record,
                 max_depth=self.max_depth,
                 boundary_target=self.boundary_target,
+                single_operator_boundary_target=self.single_operator_boundary_target,
+                stacked_operator_boundary_target=self.stacked_operator_boundary_target,
+                total_boundary_hard_cap=self.total_boundary_hard_cap,
                 allow_operator_repeat_in_path=self.allow_operator_repeat_in_path,
             )
             if state is not None:
@@ -578,6 +817,7 @@ class VerticalOperatorSearchRunner:
                     node_id: _node_metadata(record)
                     for node_id, record in node_records.items()
                 }
+                state = reconcile_vertical_boundary_counts(state, nodes)
                 budget_reason = self._budget_reason(state, sample_key)
                 if budget_reason:
                     state = mark_system_termination(state, budget_reason)
@@ -600,29 +840,44 @@ class VerticalOperatorSearchRunner:
                     if isinstance(active_execution, Mapping)
                     else None
                 )
-                if saved_plan and isinstance(saved_route, Mapping):
-                    routed = deepcopy(dict(parent_record))
-                    routed["operator_route"] = deepcopy(dict(saved_route))
-                    plan = saved_plan
-                    saved_memory = active_execution.get("memory_version")
-                    memory_version = (
-                        deepcopy(dict(saved_memory))
-                        if isinstance(saved_memory, Mapping)
-                        else {}
-                    )
-                else:
-                    routed, plan, memory_version = self._route_frontier(
-                        parent_record, parent_node, state
-                    )
-                    state = self._record_active_plan(
-                        state,
-                        parent_id,
-                        plan=plan,
-                        operator_route=routed.get("operator_route") or {},
-                        memory_version=memory_version,
-                    )
+                try:
+                    if saved_plan and isinstance(saved_route, Mapping):
+                        routed = (
+                            self._profile_frontier(parent_record, parent_node)
+                            if int(parent_node.get("depth") or 0) > 1
+                            else deepcopy(dict(parent_record))
+                        )
+                        routed["operator_route"] = deepcopy(dict(saved_route))
+                        plan = saved_plan
+                        saved_memory = active_execution.get("memory_version")
+                        memory_version = (
+                            deepcopy(dict(saved_memory))
+                            if isinstance(saved_memory, Mapping)
+                            else {}
+                        )
+                    else:
+                        routed, plan, memory_version = self._route_frontier(
+                            parent_record, parent_node, state
+                        )
+                        state = self._record_active_plan(
+                            state,
+                            parent_id,
+                            plan=plan,
+                            operator_route=routed.get("operator_route") or {},
+                            memory_version=memory_version,
+                            frontier_route=(
+                                routed.get("frontier_route")
+                                if isinstance(routed.get("frontier_route"), Mapping)
+                                else None
+                            ),
+                        )
+                        output_record["vertical_search_state"] = state
+                        self._checkpoint(output_records)
+                except Exception:
+                    state = mark_system_termination(state, "fatal_error")
                     output_record["vertical_search_state"] = state
                     self._checkpoint(output_records)
+                    raise
                 if not plan:
                     state = complete_frontier(
                         state,
@@ -636,11 +891,19 @@ class VerticalOperatorSearchRunner:
                     self._checkpoint(output_records)
                     continue
 
-                remaining_target = max(
-                    1,
-                    int(state["boundary_target"])
-                    - int(state["boundary_candidate_count"]),
-                )
+                remaining_target = self._remaining_boundary_slots(state, parent_node)
+                if remaining_target <= 0:
+                    state = complete_frontier(
+                        state,
+                        parent_node,
+                        [],
+                        completed_attempt_count=0,
+                        operator_plan=[],
+                        memory_version=memory_version,
+                    )
+                    output_record["vertical_search_state"] = state
+                    self._checkpoint(output_records)
+                    continue
                 if self.max_request_attempts_per_sample:
                     remaining_attempts = max(
                         0,
@@ -718,6 +981,18 @@ class VerticalOperatorSearchRunner:
         sample_ids = {_clean(state.get("root_node_id")) for state in states}
         edges_by_sample = Counter(_clean(edge.get("sample_id")) for edge in edges)
         paths_by_sample = Counter(_clean(path.get("sample_id")) for path in paths)
+        single_boundaries_by_sample = Counter(
+            _clean(node.get("sample_id"))
+            for node in nodes
+            if int(node.get("depth") or 0) == 2
+            and _clean(node.get("node_status")) == "boundary_candidate"
+        )
+        stacked_boundaries_by_sample = Counter(
+            _clean(node.get("sample_id"))
+            for node in nodes
+            if int(node.get("depth") or 0) == 3
+            and _clean(node.get("node_status")) == "boundary_candidate"
+        )
         scored_by_sample = Counter(
             _clean(node.get("sample_id"))
             for node in nodes
@@ -798,11 +1073,6 @@ class VerticalOperatorSearchRunner:
             for node in scored_nodes
             if len(node.get("operator_stack") or []) == 2
         )
-        ordered_three = Counter(
-            ">".join(node.get("operator_stack") or [])
-            for node in scored_nodes
-            if len(node.get("operator_stack") or []) == 3
-        )
         unordered = Counter(
             "+".join(sorted(node.get("operator_stack") or []))
             for node in scored_nodes
@@ -812,12 +1082,6 @@ class VerticalOperatorSearchRunner:
             ">".join(node.get("operator_stack") or [])
             for node in scored_nodes
             if len(node.get("operator_stack") or []) == 2
-            and node.get("node_status") == "boundary_candidate"
-        )
-        ordered_three_hits = Counter(
-            ">".join(node.get("operator_stack") or [])
-            for node in scored_nodes
-            if len(node.get("operator_stack") or []) == 3
             and node.get("node_status") == "boundary_candidate"
         )
         unordered_hits = Counter(
@@ -878,8 +1142,22 @@ class VerticalOperatorSearchRunner:
                 paths_by_sample.get(sample_identity(record), 0)
                 for record in vertical_records
             ) if vertical_records else 0.0,
+            "average_single_operator_boundary_count": statistics.fmean(
+                single_boundaries_by_sample.get(sample_identity(record), 0)
+                for record in vertical_records
+            ) if vertical_records else 0.0,
+            "average_stacked_operator_boundary_count": statistics.fmean(
+                stacked_boundaries_by_sample.get(sample_identity(record), 0)
+                for record in vertical_records
+            ) if vertical_records else 0.0,
             "normal_termination_sample_count": sum(
-                reason in {"operator_space_exhausted", "boundary_target_reached"}
+                reason
+                in {
+                    "operator_space_exhausted",
+                    "single_operator_boundary_target_reached",
+                    "stacked_operator_boundary_target_reached",
+                    "total_boundary_hard_cap_reached",
+                }
                 for reason in termination_distribution.elements()
             ),
             "system_protection_termination_sample_count": sum(
@@ -893,11 +1171,6 @@ class VerticalOperatorSearchRunner:
                 "ordered_pair_boundary_hit_rates": {
                     key: ordered_two_hits[key] / count
                     for key, count in ordered_two.items()
-                },
-                "ordered_triple_occurrences": dict(ordered_three),
-                "ordered_triple_boundary_hit_rates": {
-                    key: ordered_three_hits[key] / count
-                    for key, count in ordered_three.items()
                 },
                 "unordered_combination_occurrences": dict(unordered),
                 "unordered_combination_boundary_hit_rates": {
@@ -920,6 +1193,8 @@ class VerticalOperatorSearchRunner:
                     if attempt.get("status") not in {"pending", "running", "skipped_global_termination", "skipped_depth_limit"}
                 ]),
                 "evaluation_count": len(scored_nodes),
+                "single_operator_boundary_count": sum(single_boundaries_by_sample.values()),
+                "stacked_operator_boundary_count": sum(stacked_boundaries_by_sample.values()),
                 "average_sample_runtime_seconds": (
                     elapsed_seconds / len(states) if states else 0.0
                 ),
@@ -957,7 +1232,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--work-dir", required=True)
     parser.add_argument("--memory-dir", default="memory")
     parser.add_argument("--branch-window", type=int, default=1)
-    parser.add_argument("--boundary-target", type=int, default=5)
+    parser.add_argument(
+        "--boundary-target",
+        type=int,
+        default=5,
+        help="Deprecated compatibility alias; supplies both layer targets when new targets are omitted.",
+    )
+    parser.add_argument("--single-operator-boundary-target", type=int, default=None)
+    parser.add_argument("--stacked-operator-boundary-target", type=int, default=None)
+    parser.add_argument("--total-boundary-hard-cap", type=int, default=None)
     parser.add_argument("--max-depth", type=int, default=3)
     parser.add_argument("--allow-operator-repeat-in-path", action="store_true")
     parser.add_argument("--pipeline-mode", choices=["step", "stream"], default="step")
@@ -972,6 +1255,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-request-attempts-per-sample", type=int, default=0)
     parser.add_argument("--max-evaluations-per-sample", type=int, default=0)
     parser.add_argument("--sample-timeout-seconds", type=float, default=0.0)
+    parser.add_argument(
+        "--routing-mode",
+        choices=["rule", "hybrid"],
+        default=os.getenv("ROUTING_MODE", "rule"),
+    )
+    parser.add_argument("--router-model", default=os.getenv("ROUTER_MODEL", ""))
+    parser.add_argument("--router-base-url", default=os.getenv("ROUTER_BASE_URL", ""))
+    parser.add_argument("--router-timeout", type=float, default=float(os.getenv("ROUTER_TIMEOUT", "60")))
+    parser.add_argument("--router-retries", type=int, default=int(os.getenv("ROUTER_RETRIES", "0")))
+    parser.add_argument("--router-concurrency", type=int, default=int(os.getenv("ROUTER_CONCURRENCY", "20")))
+    parser.add_argument("--router-cache", default=None)
+    parser.add_argument("--profile-model", default=os.getenv("PROFILE_MODEL", ""))
+    parser.add_argument("--profile-base-url", default=os.getenv("PROFILE_BASE_URL", ""))
+    parser.add_argument("--profile-concurrency", type=int, default=int(os.getenv("PROFILE_CONCURRENCY", "5")))
     return parser.parse_args()
 
 
@@ -985,6 +1282,9 @@ def main() -> None:
         memory_dir=Path(args.memory_dir),
         branch_window=args.branch_window,
         boundary_target=args.boundary_target,
+        single_operator_boundary_target=args.single_operator_boundary_target,
+        stacked_operator_boundary_target=args.stacked_operator_boundary_target,
+        total_boundary_hard_cap=args.total_boundary_hard_cap,
         max_depth=args.max_depth,
         allow_operator_repeat_in_path=args.allow_operator_repeat_in_path,
         pipeline_mode=args.pipeline_mode,
@@ -995,6 +1295,16 @@ def main() -> None:
         max_request_attempts_per_sample=args.max_request_attempts_per_sample,
         max_evaluations_per_sample=args.max_evaluations_per_sample,
         sample_timeout_seconds=args.sample_timeout_seconds,
+        routing_mode=args.routing_mode,
+        router_model=args.router_model,
+        router_base_url=args.router_base_url,
+        router_timeout_seconds=args.router_timeout,
+        router_retries=args.router_retries,
+        router_concurrency=args.router_concurrency,
+        router_cache=args.router_cache or "",
+        profile_model=args.profile_model,
+        profile_base_url=args.profile_base_url,
+        profile_concurrency=args.profile_concurrency,
     )
     final_records = runner.run(records)
     sidecars = []
@@ -1019,6 +1329,9 @@ def main() -> None:
             "search_mode": "multi_operator_vertical_stack",
             "branch_window": args.branch_window,
             "boundary_target": args.boundary_target,
+            "single_operator_boundary_target": args.single_operator_boundary_target,
+            "stacked_operator_boundary_target": args.stacked_operator_boundary_target,
+            "total_boundary_hard_cap": args.total_boundary_hard_cap,
             "max_depth": args.max_depth,
             "allow_operator_repeat_in_path": args.allow_operator_repeat_in_path,
             "pipeline_mode": args.pipeline_mode,
@@ -1026,6 +1339,12 @@ def main() -> None:
             "max_request_attempts_per_sample": args.max_request_attempts_per_sample,
             "max_evaluations_per_sample": args.max_evaluations_per_sample,
             "sample_timeout_seconds": args.sample_timeout_seconds,
+            "routing_mode": args.routing_mode,
+            "router_model": args.router_model,
+            "router_timeout": args.router_timeout,
+            "router_concurrency": args.router_concurrency,
+            "profile_model": args.profile_model,
+            "profile_concurrency": args.profile_concurrency,
         },
         code_paths=[
             __file__,

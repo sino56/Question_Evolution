@@ -68,6 +68,9 @@ DEFER_GPT_EXPERIMENTAL_EVALUATION=${DEFER_GPT_EXPERIMENTAL_EVALUATION:-false}
 SEARCH_OPERATOR_SORT_MODE=${SEARCH_OPERATOR_SORT_MODE:-route} # route | yield_per_time
 SEARCH_OPERATOR_EXPLORATION_RATIO=${SEARCH_OPERATOR_EXPLORATION_RATIO:-0.1}
 SEARCH_BOUNDARY_TARGET=${SEARCH_BOUNDARY_TARGET:-5}
+SEARCH_SINGLE_OPERATOR_BOUNDARY_TARGET=${SEARCH_SINGLE_OPERATOR_BOUNDARY_TARGET:-$SEARCH_BOUNDARY_TARGET}
+SEARCH_STACKED_OPERATOR_BOUNDARY_TARGET=${SEARCH_STACKED_OPERATOR_BOUNDARY_TARGET:-$SEARCH_BOUNDARY_TARGET}
+SEARCH_TOTAL_BOUNDARY_HARD_CAP=${SEARCH_TOTAL_BOUNDARY_HARD_CAP:-$((SEARCH_SINGLE_OPERATOR_BOUNDARY_TARGET + SEARCH_STACKED_OPERATOR_BOUNDARY_TARGET))}
 ROUTING_MODE=${ROUTING_MODE:-hybrid}             # hybrid is the normal Router path
 ASSIGNMENT_MODE=${ASSIGNMENT_MODE:-live}         # live freezes and exhausts Router candidates
 ROUTER_CONCURRENCY=${ROUTER_CONCURRENCY:-20}
@@ -556,10 +559,6 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 SEARCH_EXTRA_ARGS+=(--defer-gpt-experimental-evaluation)
             fi
             if [ "$SEARCH_MODE" = "multi_operator_vertical_stack" ]; then
-                if [ "$ASSIGNMENT_MODE" = "live" ]; then
-                    echo "ASSIGNMENT_MODE=live requires SEARCH_MODE=multi_operator_branch; vertical stack cannot consume a frozen live operator plan." >&2
-                    exit 2
-                fi
                 VERTICAL_EXTRA_ARGS=()
                 if [ "${SEARCH_RULE_ONLY_DIFFICULTY:-false}" = "true" ]; then
                     VERTICAL_EXTRA_ARGS+=(--rule-only-difficulty)
@@ -577,12 +576,25 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                     --memory-dir "$MEMORY_DIR" \
                     --branch-window "$SEARCH_BRANCH_WINDOW" \
                     --boundary-target "$SEARCH_BOUNDARY_TARGET" \
+                    --single-operator-boundary-target "$SEARCH_SINGLE_OPERATOR_BOUNDARY_TARGET" \
+                    --stacked-operator-boundary-target "$SEARCH_STACKED_OPERATOR_BOUNDARY_TARGET" \
+                    --total-boundary-hard-cap "$SEARCH_TOTAL_BOUNDARY_HARD_CAP" \
                     --max-depth "$SEARCH_MAX_DEPTH" \
                     --pipeline-mode "$SEARCH_PIPELINE_MODE" \
                     --artifact-retention "$SEARCH_ARTIFACT_RETENTION" \
                     --max-request-attempts-per-sample "$SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE" \
                     --max-evaluations-per-sample "$SEARCH_MAX_EVALUATIONS_PER_SAMPLE" \
                     --sample-timeout-seconds "$SEARCH_SAMPLE_TIMEOUT_SECONDS" \
+                    --routing-mode "$ROUTING_MODE" \
+                    --router-model "$ROUTER_MODEL" \
+                    --router-base-url "$ROUTER_BASE_URL" \
+                    --router-concurrency "$ROUTER_CONCURRENCY" \
+                    --router-timeout "$ROUTER_TIMEOUT" \
+                    --router-retries "$ROUTER_RETRIES" \
+                    --router-cache "$EXP_DIR/router_cache.jsonl" \
+                    --profile-model "$PROFILE_MODEL" \
+                    --profile-base-url "$PROFILE_BASE_URL" \
+                    --profile-concurrency "$PROFILE_CONCURRENCY" \
                     "${VERTICAL_EXTRA_ARGS[@]}"
             else
                 python multi_operator_search.py \

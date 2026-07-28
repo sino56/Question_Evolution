@@ -16,12 +16,17 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from prompts.operators import OPERATOR_SPECS
 
 
-VERTICAL_SEARCH_STATE_VERSION = 1
+VERTICAL_SEARCH_STATE_VERSION = 2
 VERTICAL_NODE_VERSION = 1
 VERTICAL_ATTEMPT_VERSION = 1
 VERTICAL_SEARCH_MODE = "multi_operator_vertical_stack"
 DEFAULT_MAX_DEPTH = 3
-DEFAULT_BOUNDARY_TARGET = 5
+DEFAULT_SINGLE_OPERATOR_BOUNDARY_TARGET = 5
+DEFAULT_STACKED_OPERATOR_BOUNDARY_TARGET = 5
+DEFAULT_TOTAL_BOUNDARY_HARD_CAP = 10
+# Backward-compatible public name for callers that still use the original
+# single target flag.  New vertical state always stores layer-specific limits.
+DEFAULT_BOUNDARY_TARGET = DEFAULT_SINGLE_OPERATOR_BOUNDARY_TARGET
 
 EVOLUTION_REQUIRED_ACTIONS = {
     "evolve_high_score_overscore",
@@ -31,7 +36,9 @@ EVOLUTION_REQUIRED_ACTIONS = {
 
 NORMAL_TERMINATION_REASONS = {
     "operator_space_exhausted",
-    "boundary_target_reached",
+    "single_operator_boundary_target_reached",
+    "stacked_operator_boundary_target_reached",
+    "total_boundary_hard_cap_reached",
 }
 SYSTEM_TERMINATION_REASONS = {
     "request_budget_exhausted",
@@ -40,25 +47,6 @@ SYSTEM_TERMINATION_REASONS = {
     "fatal_error",
     "state_recovery_failed",
 }
-
-# First-stage fixed preferences from the design.  They affect order only.
-COMPLEMENTARY_OPERATORS = {
-    "O10_evidence_sufficiency_ladder": (
-        "O15_counterfactual_threshold_shift",
-        "O17_action_vs_fact_threshold",
-        "O18_baseline_scope_mismatch",
-    ),
-    "O11_unobserved_state_attribution": (
-        "O16_close_alternative_normalization",
-        "O15_counterfactual_threshold_shift",
-        "O17_action_vs_fact_threshold",
-    ),
-    "O14_information_closure": (
-        "O10_evidence_sufficiency_ladder",
-        "O12_conjunctive_necessity",
-    ),
-}
-
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
@@ -79,6 +67,67 @@ def _positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         parsed = default
     return parsed if parsed > 0 else default
+
+
+def _nonnegative_config_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return max(0, default)
+
+
+def _max_depth(value: Any) -> int:
+    """The first vertical-search phase permits root plus at most two operators."""
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_MAX_DEPTH
+    if parsed not in {2, 3}:
+        raise ValueError("vertical max_depth must be 2 or 3")
+    return parsed
+
+
+def _quota_config(
+    *,
+    max_depth: int,
+    boundary_target: Optional[int],
+    single_operator_boundary_target: Optional[int],
+    stacked_operator_boundary_target: Optional[int],
+    total_boundary_hard_cap: Optional[int],
+) -> tuple[int, int, int]:
+    """Resolve new layered quotas while retaining the original CLI/API alias."""
+
+    legacy_target = (
+        _positive_int(boundary_target, DEFAULT_BOUNDARY_TARGET)
+        if boundary_target is not None
+        else None
+    )
+    single_target = _positive_int(
+        single_operator_boundary_target,
+        legacy_target or DEFAULT_SINGLE_OPERATOR_BOUNDARY_TARGET,
+    )
+    if max_depth == 2:
+        if (
+            stacked_operator_boundary_target is not None
+            and _nonnegative_config_int(stacked_operator_boundary_target) != 0
+        ):
+            raise ValueError("max_depth=2 requires stacked_operator_boundary_target=0")
+        stacked_target = 0
+    else:
+        stacked_target = _nonnegative_config_int(
+            stacked_operator_boundary_target,
+            legacy_target or DEFAULT_STACKED_OPERATOR_BOUNDARY_TARGET,
+        )
+    hard_cap = _positive_int(
+        total_boundary_hard_cap,
+        single_target + stacked_target,
+    )
+    if hard_cap < max(single_target, stacked_target):
+        raise ValueError(
+            "total_boundary_hard_cap must be at least each enabled layer target"
+        )
+    return single_target, stacked_target, hard_cap
 
 
 def _nonnegative_int(value: Any, default: int = 0) -> int:
@@ -156,7 +205,7 @@ def should_enter_vertical_search(record: Mapping[str, Any]) -> bool:
 
 
 def build_root_node(record: Mapping[str, Any], *, max_depth: int) -> Dict[str, Any]:
-    max_depth = _positive_int(max_depth, DEFAULT_MAX_DEPTH)
+    max_depth = _max_depth(max_depth)
     root_id = make_root_node_id(record)
     rate = coerce_score_rate(record)
     if rate is None:
@@ -187,7 +236,10 @@ def initialize_vertical_search_state(
     record: Mapping[str, Any],
     *,
     max_depth: int = DEFAULT_MAX_DEPTH,
-    boundary_target: int = DEFAULT_BOUNDARY_TARGET,
+    boundary_target: Optional[int] = None,
+    single_operator_boundary_target: Optional[int] = None,
+    stacked_operator_boundary_target: Optional[int] = None,
+    total_boundary_hard_cap: Optional[int] = None,
     allow_operator_repeat_in_path: bool = False,
     now: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
@@ -195,7 +247,15 @@ def initialize_vertical_search_state(
 
     if not should_enter_vertical_search(record):
         return None
-    root = build_root_node(record, max_depth=max_depth)
+    resolved_max_depth = _max_depth(max_depth)
+    single_target, stacked_target, hard_cap = _quota_config(
+        max_depth=resolved_max_depth,
+        boundary_target=boundary_target,
+        single_operator_boundary_target=single_operator_boundary_target,
+        stacked_operator_boundary_target=stacked_operator_boundary_target,
+        total_boundary_hard_cap=total_boundary_hard_cap,
+    )
+    root = build_root_node(record, max_depth=resolved_max_depth)
     prompt_hash = normalized_prompt_hash(record.get("prompt"))
     return {
         "vertical_search_state_version": VERTICAL_SEARCH_STATE_VERSION,
@@ -203,11 +263,21 @@ def initialize_vertical_search_state(
         "root_node_id": root["node_id"],
         "status": "running",
         "current_depth": 1,
-        "max_depth": _positive_int(max_depth, DEFAULT_MAX_DEPTH),
-        "boundary_target": _positive_int(boundary_target, DEFAULT_BOUNDARY_TARGET),
+        "max_depth": resolved_max_depth,
+        "single_operator_boundary_target": single_target,
+        "stacked_operator_boundary_target": stacked_target,
+        "total_boundary_hard_cap": hard_cap,
+        "single_operator_boundary_count": 0,
+        "stacked_operator_boundary_count": 0,
+        "total_boundary_count": 0,
+        # Kept as an aggregate compatibility projection for existing analysis
+        # tools.  New scheduling logic must use the typed counts above.
+        "boundary_target": hard_cap,
         "boundary_candidate_count": 0,
         "completed_operator_attempt_count": 0,
         "pending_expandable_node_count": 1,
+        "pending_frontier_count": 1,
+        "single_operator_root_expansion_stopped": False,
         "termination_reason": None,
         "allow_operator_repeat_in_path": bool(allow_operator_repeat_in_path),
         "frontier_node_ids": [root["node_id"]],
@@ -226,21 +296,60 @@ def upgrade_vertical_search_state(raw_state: Mapping[str, Any]) -> Dict[str, Any
         version = int(raw_version)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid vertical_search_state_version: {raw_version!r}") from exc
-    if version != VERTICAL_SEARCH_STATE_VERSION:
+    if version not in {1, VERTICAL_SEARCH_STATE_VERSION}:
         raise ValueError(
             "vertical search state version mismatch; refuse to mix "
             f"version {version} and {VERTICAL_SEARCH_STATE_VERSION}"
         )
     if _clean(state.get("search_mode")) != VERTICAL_SEARCH_MODE:
         raise ValueError("invalid vertical search mode")
-    state["max_depth"] = _positive_int(state.get("max_depth"), DEFAULT_MAX_DEPTH)
-    state["boundary_target"] = _positive_int(
-        state.get("boundary_target"), DEFAULT_BOUNDARY_TARGET
+    state["max_depth"] = _max_depth(state.get("max_depth"))
+    if version == 1:
+        # A version-1 checkpoint only had an aggregate boundary count.  It is
+        # retained as a provisional single-layer count until the runner
+        # reconciles it with durable node artifacts on resume.
+        legacy_target = _positive_int(
+            state.get("boundary_target"), DEFAULT_BOUNDARY_TARGET
+        )
+        state.update(
+            {
+                "vertical_search_state_version": VERTICAL_SEARCH_STATE_VERSION,
+                "single_operator_boundary_target": legacy_target,
+                "stacked_operator_boundary_target": (
+                    legacy_target if state["max_depth"] == 3 else 0
+                ),
+                "total_boundary_hard_cap": (
+                    legacy_target * 2 if state["max_depth"] == 3 else legacy_target
+                ),
+                "single_operator_boundary_count": _nonnegative_int(
+                    state.get("boundary_candidate_count")
+                ),
+                "stacked_operator_boundary_count": 0,
+                "single_operator_root_expansion_stopped": False,
+            }
+        )
+    single_target, stacked_target, hard_cap = _quota_config(
+        max_depth=state["max_depth"],
+        boundary_target=None,
+        single_operator_boundary_target=state.get("single_operator_boundary_target"),
+        stacked_operator_boundary_target=state.get("stacked_operator_boundary_target"),
+        total_boundary_hard_cap=state.get("total_boundary_hard_cap"),
     )
-    state["boundary_candidate_count"] = min(
-        _nonnegative_int(state.get("boundary_candidate_count")),
-        state["boundary_target"],
+    state["single_operator_boundary_target"] = single_target
+    state["stacked_operator_boundary_target"] = stacked_target
+    state["total_boundary_hard_cap"] = hard_cap
+    state["single_operator_boundary_count"] = _nonnegative_int(
+        state.get("single_operator_boundary_count")
     )
+    state["stacked_operator_boundary_count"] = _nonnegative_int(
+        state.get("stacked_operator_boundary_count")
+    )
+    state["total_boundary_count"] = (
+        state["single_operator_boundary_count"]
+        + state["stacked_operator_boundary_count"]
+    )
+    state["boundary_target"] = state["total_boundary_hard_cap"]
+    state["boundary_candidate_count"] = state["total_boundary_count"]
     state["completed_operator_attempt_count"] = _nonnegative_int(
         state.get("completed_operator_attempt_count")
     )
@@ -254,9 +363,13 @@ def upgrade_vertical_search_state(raw_state: Mapping[str, Any]) -> Dict[str, Any
     sequence = state.get("execution_sequence")
     state["execution_sequence"] = list(sequence) if isinstance(sequence, list) else []
     state["pending_expandable_node_count"] = len(state["frontier_node_ids"])
+    state["pending_frontier_count"] = len(state["frontier_node_ids"])
     state["current_depth"] = _positive_int(state.get("current_depth"), 1)
     state["allow_operator_repeat_in_path"] = bool(
         state.get("allow_operator_repeat_in_path")
+    )
+    state["single_operator_root_expansion_stopped"] = bool(
+        state.get("single_operator_root_expansion_stopped")
     )
     state.setdefault("status", "running")
     state.setdefault("termination_reason", None)
@@ -279,7 +392,11 @@ def build_vertical_operator_plan(
     allow_operator_repeat_in_path: bool = False,
     registered_operator_ids: Optional[Sequence[str]] = None,
 ) -> List[str]:
-    """Build a deterministic per-frontier plan without hard-banning avoid ids."""
+    """Filter the router's final candidate list for one ordered path.
+
+    Vertical search must not expand the route into a registry-wide enumeration:
+    the fresh route plus its runtime constraints are the source of truth.
+    """
 
     route = routed_record.get("operator_route")
     route = route if isinstance(route, Mapping) else {}
@@ -287,13 +404,12 @@ def build_vertical_operator_plan(
     registered_set = set(registered)
     avoid = set(_unique(route.get("avoid_operators") or []))
     used = set(_unique(operator_stack))
-    last_operator = _clean(operator_stack[-1]) if operator_stack else ""
 
+    explicit_candidates = route.get("selected_operator_ids")
     preferred = _unique(
-        [route.get("primary_operator")]
-        + list(route.get("backup_operators") or [])
-        + list(COMPLEMENTARY_OPERATORS.get(last_operator, ()))
-        + registered
+        explicit_candidates
+        if isinstance(explicit_candidates, list)
+        else [route.get("primary_operator")] + list(route.get("backup_operators") or [])
     )
     preferred = [operator for operator in preferred if operator in registered_set]
     if not allow_operator_repeat_in_path:
@@ -302,9 +418,7 @@ def build_vertical_operator_plan(
         preferred = [operator for operator in preferred if operator not in used] + [
             operator for operator in preferred if operator in used
         ]
-    return [operator for operator in preferred if operator not in avoid] + [
-        operator for operator in preferred if operator in avoid
-    ]
+    return [operator for operator in preferred if operator not in avoid]
 
 
 def build_child_node(
@@ -365,6 +479,10 @@ def build_child_node(
         "edge_delta_score_rate": edge_delta,
         "root_delta_score_rate": child_rate - root_rate_value,
         "node_status": node_status,
+        "boundary_kind": (
+            "single_operator" if node_status == "boundary_candidate" and int(parent_node.get("depth") or 0) == 1
+            else "stacked_operator" if node_status == "boundary_candidate" else None
+        ),
         "frontier_status": frontier_status,
         "review_status": review_status,
         "generation_sequence": _nonnegative_int(generation_sequence),
@@ -397,6 +515,7 @@ def build_boundary_edge(node: Mapping[str, Any]) -> Dict[str, Any]:
         "edge_delta_score_rate": node["edge_delta_score_rate"],
         "root_delta_score_rate": node["root_delta_score_rate"],
         "review_status": "pending",
+        "boundary_kind": node.get("boundary_kind"),
     }
 
 
@@ -427,6 +546,7 @@ def build_boundary_path(
         "edge_deltas": [float(item["edge_delta_score_rate"]) for item in chain],
         "root_delta_score_rate": node["root_delta_score_rate"],
         "review_status": "pending",
+        "boundary_kind": node.get("boundary_kind"),
     }
 
 
@@ -477,6 +597,96 @@ def mark_system_termination(
     return updated
 
 
+def reconcile_vertical_boundary_counts(
+    state: Mapping[str, Any],
+    nodes_by_id: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Rebuild layered counters from durable completed-node evidence.
+
+    This is intentionally narrow: normalized node artifacts are the recovery
+    authority for boundary counts, while the checkpoint remains the authority
+    for queue ownership and active execution.
+    """
+
+    updated = upgrade_vertical_search_state(state)
+    single_count = 0
+    stacked_count = 0
+    for node in nodes_by_id.values():
+        if _clean(node.get("node_status")) != "boundary_candidate":
+            continue
+        depth = int(node.get("depth") or 0)
+        if depth == 2:
+            single_count += 1
+        elif depth == 3:
+            stacked_count += 1
+    updated["single_operator_boundary_count"] = single_count
+    updated["stacked_operator_boundary_count"] = stacked_count
+    updated["total_boundary_count"] = single_count + stacked_count
+    updated["boundary_candidate_count"] = updated["total_boundary_count"]
+    updated["boundary_target"] = updated["total_boundary_hard_cap"]
+    return updated
+
+
+def _refresh_pending_frontier_counts(state: Dict[str, Any]) -> None:
+    count = len(state.get("frontier_node_ids") or [])
+    state["pending_expandable_node_count"] = count
+    state["pending_frontier_count"] = count
+
+
+def _complete_from_quotas_or_exhaustion(
+    state: Dict[str, Any],
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Apply quota precedence without confusing it with human review."""
+
+    total = int(state["total_boundary_count"])
+    if total >= int(state["total_boundary_hard_cap"]):
+        state["status"] = "completed"
+        state["termination_reason"] = "total_boundary_hard_cap_reached"
+        state["frontier_node_ids"] = []
+    elif (
+        int(state["stacked_operator_boundary_target"]) > 0
+        and int(state["stacked_operator_boundary_count"])
+        >= int(state["stacked_operator_boundary_target"])
+    ):
+        state["status"] = "completed"
+        state["termination_reason"] = "stacked_operator_boundary_target_reached"
+        state["frontier_node_ids"] = []
+    elif not state.get("frontier_node_ids"):
+        state["status"] = "completed"
+        state["termination_reason"] = (
+            "single_operator_boundary_target_reached"
+            if state.get("single_operator_root_expansion_stopped")
+            else "operator_space_exhausted"
+        )
+    _refresh_pending_frontier_counts(state)
+    state["last_progress_at"] = float(now if now is not None else time.time())
+    return state
+
+
+def _parent_is_expandable(
+    state: Mapping[str, Any], node: Mapping[str, Any]
+) -> bool:
+    depth = int(node.get("depth") or 0)
+    if depth >= int(state["max_depth"]):
+        return False
+    if int(state["total_boundary_count"]) >= int(state["total_boundary_hard_cap"]):
+        return False
+    if depth == 1:
+        return int(state["single_operator_boundary_count"]) < int(
+            state["single_operator_boundary_target"]
+        )
+    if depth == 2:
+        return (
+            int(state["max_depth"]) == 3
+            and int(state["stacked_operator_boundary_target"]) > 0
+            and int(state["stacked_operator_boundary_count"])
+            < int(state["stacked_operator_boundary_target"])
+        )
+    return False
+
+
 def claim_next_frontier(
     state: Mapping[str, Any],
     nodes_by_id: Mapping[str, Mapping[str, Any]],
@@ -511,7 +721,7 @@ def claim_next_frontier(
         for node_id in updated["frontier_node_ids"]
         if node_id not in set(updated["completed_parent_node_ids"])
         and node_id in nodes_by_id
-        and int(nodes_by_id[node_id].get("depth") or 0) < updated["max_depth"]
+        and _parent_is_expandable(updated, nodes_by_id[node_id])
     ]
     candidates.sort(
         key=lambda node_id: (
@@ -521,12 +731,8 @@ def claim_next_frontier(
         )
     )
     if not candidates:
-        updated["status"] = "completed"
-        updated["termination_reason"] = "operator_space_exhausted"
         updated["frontier_node_ids"] = []
-        updated["pending_expandable_node_count"] = 0
-        updated["last_progress_at"] = float(now if now is not None else time.time())
-        return updated, None
+        return _complete_from_quotas_or_exhaustion(updated, now=now), None
 
     node_id = candidates[0]
     updated["active_parent_node_id"] = node_id
@@ -553,7 +759,7 @@ def complete_frontier(
     memory_version: Optional[Mapping[str, Any]] = None,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Merge one fully processed parent and enqueue only decreasing children."""
+    """Merge one processed parent and enqueue only depth-2 decreasing nodes."""
 
     updated = upgrade_vertical_search_state(state)
     parent_id = _clean(parent_node.get("node_id"))
@@ -570,30 +776,65 @@ def complete_frontier(
     updated["completed_operator_attempt_count"] += _nonnegative_int(
         completed_attempt_count
     )
+    parent_depth = int(parent_node.get("depth") or 0)
     for record in child_records:
         node = record.get("vertical_node")
         node = node if isinstance(node, Mapping) else record
         node_id = _clean(node.get("node_id"))
         if not node_id:
             raise ValueError("completed child record is missing node_id")
-        if node_id not in updated["registered_node_ids"]:
+        is_new_node = node_id not in updated["registered_node_ids"]
+        if is_new_node:
             updated["registered_node_ids"].append(node_id)
         prompt_hash = normalized_prompt_hash(record.get("prompt"))
-        if prompt_hash:
+        if prompt_hash and is_new_node:
             if prompt_hash in updated["registered_prompt_hashes"]:
                 raise ValueError(f"duplicate prompt reached completed node: {node_id}")
             updated["registered_prompt_hashes"].append(prompt_hash)
-        if _clean(node.get("node_status")) != "boundary_candidate":
+        if not is_new_node or _clean(node.get("node_status")) != "boundary_candidate":
             continue
-        if updated["boundary_candidate_count"] >= updated["boundary_target"]:
-            raise ValueError("vertical boundary target overflow")
-        updated["boundary_candidate_count"] += 1
+        child_depth = int(node.get("depth") or 0)
+        if int(updated["total_boundary_count"]) >= int(
+            updated["total_boundary_hard_cap"]
+        ):
+            raise ValueError("vertical total boundary hard-cap overflow")
+        if child_depth == 2:
+            if int(updated["single_operator_boundary_count"]) >= int(
+                updated["single_operator_boundary_target"]
+            ):
+                raise ValueError("single-operator boundary target overflow")
+            updated["single_operator_boundary_count"] += 1
+        elif child_depth == 3:
+            if int(updated["stacked_operator_boundary_count"]) >= int(
+                updated["stacked_operator_boundary_target"]
+            ):
+                raise ValueError("stacked-operator boundary target overflow")
+            updated["stacked_operator_boundary_count"] += 1
+        else:
+            raise ValueError(f"unsupported vertical boundary depth: {child_depth}")
+        updated["total_boundary_count"] = (
+            int(updated["single_operator_boundary_count"])
+            + int(updated["stacked_operator_boundary_count"])
+        )
+        updated["boundary_candidate_count"] = updated["total_boundary_count"]
         if (
+            child_depth == 2
+            and
             _clean(node.get("frontier_status")) == "eligible"
-            and updated["boundary_candidate_count"] < updated["boundary_target"]
+            and int(updated["max_depth"]) == 3
+            and int(updated["stacked_operator_boundary_target"]) > 0
+            and int(updated["stacked_operator_boundary_count"])
+            < int(updated["stacked_operator_boundary_target"])
+            and int(updated["total_boundary_count"])
+            < int(updated["total_boundary_hard_cap"])
             and node_id not in updated["frontier_node_ids"]
         ):
             updated["frontier_node_ids"].append(node_id)
+
+    if parent_depth == 1 and int(updated["single_operator_boundary_count"]) >= int(
+        updated["single_operator_boundary_target"]
+    ):
+        updated["single_operator_root_expansion_stopped"] = True
 
     for execution in reversed(updated["execution_sequence"]):
         if _clean(execution.get("parent_node_id")) == parent_id:
@@ -603,14 +844,7 @@ def complete_frontier(
                 execution["memory_version"] = deepcopy(dict(memory_version))
             break
     updated.pop("active_parent_node_id", None)
-    if updated["boundary_candidate_count"] >= updated["boundary_target"]:
-        updated["status"] = "completed"
-        updated["termination_reason"] = "boundary_target_reached"
-        updated["frontier_node_ids"] = []
-    elif not updated["frontier_node_ids"]:
-        updated["status"] = "completed"
-        updated["termination_reason"] = "operator_space_exhausted"
-    else:
+    if updated["frontier_node_ids"]:
         updated["current_depth"] = min(
             int(record.get("vertical_node", record).get("depth") or 1)
             for record in child_records
@@ -621,6 +855,4 @@ def complete_frontier(
             in updated["frontier_node_ids"]
             for record in child_records
         ) else updated["current_depth"]
-    updated["pending_expandable_node_count"] = len(updated["frontier_node_ids"])
-    updated["last_progress_at"] = float(now if now is not None else time.time())
-    return updated
+    return _complete_from_quotas_or_exhaustion(updated, now=now)

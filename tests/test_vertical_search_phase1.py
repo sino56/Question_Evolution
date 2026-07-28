@@ -64,16 +64,16 @@ def test_ordered_paths_have_stable_distinct_ids():
     )
 
 
-def test_operator_plan_repeats_are_filtered_and_avoid_is_only_downranked():
+def test_operator_plan_uses_only_final_route_candidates_and_honors_path_constraints():
     record = sample()
+    record["operator_route"]["selected_operator_ids"] = [O10, O11, O15, O17]
     plan = build_vertical_operator_plan(
         record,
         operator_stack=[O10],
         registered_operator_ids=[O10, O11, O15, O17],
     )
     assert O10 not in plan
-    assert plan[:2] == [O11, O15]
-    assert plan[-1] == O17
+    assert plan == [O11, O15]
 
     repeat_plan = build_vertical_operator_plan(
         record,
@@ -81,8 +81,7 @@ def test_operator_plan_repeats_are_filtered_and_avoid_is_only_downranked():
         allow_operator_repeat_in_path=True,
         registered_operator_ids=[O10, O11, O15, O17],
     )
-    assert O10 in repeat_plan
-    assert repeat_plan.index(O10) > repeat_plan.index(O15)
+    assert repeat_plan == [O11, O15, O10]
 
 
 def test_child_uses_direct_parent_delta_and_root_cumulative_delta():

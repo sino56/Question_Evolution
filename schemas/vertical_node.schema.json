@@ -32,6 +32,7 @@
     "edge_delta_score_rate": {"type": ["number", "null"]},
     "root_delta_score_rate": {"type": "number"},
     "node_status": {"enum": ["root", "boundary_candidate", "no_score_change", "score_increased"]},
+    "boundary_kind": {"enum": ["single_operator", "stacked_operator", null]},
     "frontier_status": {"enum": ["eligible", "ineligible", "depth_limit", "expanded"]},
     "review_status": {"enum": ["pending", "approved", "rejected", null]}
   },

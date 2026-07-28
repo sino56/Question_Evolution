@@ -37,6 +37,13 @@ def build_router_prompt(
             "operator_cards": list(operator_cards or []),
         }
 
+    frontier_instruction = ""
+    if isinstance(payload.get("frontier_route"), Mapping) and payload["frontier_route"].get("enabled") is True:
+        frontier_instruction = (
+            "\n- 当前记录是已验证降分的 frontier：使用当前题面、当前评分证据和新的画像重建候选列表；"
+            "不要重新执行仅适用于原始样本的‘是否值得进化’否决。\n"
+        )
+
     return f"""
 角色：你是 Question Evolution 的路由器。你只识别当前题目需要的推理结构，并从输入给出的合法算子卡片中召回候选。你不改写题目，不生成答案、Rubric 或评分建议。
 
@@ -45,6 +52,7 @@ def build_router_prompt(
 - evidence_spans 只能逐字复制样本输入中的文字，绝不能复制算子卡片的文字。
 - 对每个候选，说明其匹配的推理对象，并用 why_not_adjacent 对比一个卡片中声明的相邻算子。
 - 保持说明简短；不要输出分析过程或 Markdown。
+{frontier_instruction}
 
 响应契约版本：{ROUTER_PROMPT_VERSION}
 {prompt_contract_text()}

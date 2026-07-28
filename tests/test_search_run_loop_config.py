@@ -68,3 +68,23 @@ def test_vertical_operator_mode_is_wired_with_depth_and_protection_controls():
     assert '"vertical_operator_search.py", "--input", $routed' in PS_LOOP
     assert '"--max-depth", $SEARCH_MAX_DEPTH' in PS_LOOP
     assert '$SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH -eq "true"' in PS_LOOP
+
+
+def test_vertical_operator_mode_uses_layered_quotas_and_current_node_rerouting():
+    assert "SEARCH_SINGLE_OPERATOR_BOUNDARY_TARGET=${SEARCH_SINGLE_OPERATOR_BOUNDARY_TARGET:-$SEARCH_BOUNDARY_TARGET}" in SH_LOOP
+    assert "SEARCH_STACKED_OPERATOR_BOUNDARY_TARGET=${SEARCH_STACKED_OPERATOR_BOUNDARY_TARGET:-$SEARCH_BOUNDARY_TARGET}" in SH_LOOP
+    assert '--single-operator-boundary-target "$SEARCH_SINGLE_OPERATOR_BOUNDARY_TARGET"' in SH_LOOP
+    assert '--stacked-operator-boundary-target "$SEARCH_STACKED_OPERATOR_BOUNDARY_TARGET"' in SH_LOOP
+    assert '--total-boundary-hard-cap "$SEARCH_TOTAL_BOUNDARY_HARD_CAP"' in SH_LOOP
+    assert '--routing-mode "$ROUTING_MODE"' in SH_LOOP
+    assert '--profile-model "$PROFILE_MODEL"' in SH_LOOP
+    assert "vertical stack cannot consume a frozen live operator plan" not in SH_LOOP
+
+    assert '$SEARCH_SINGLE_OPERATOR_BOUNDARY_TARGET = Get-EnvOrDefault "SEARCH_SINGLE_OPERATOR_BOUNDARY_TARGET" $SEARCH_BOUNDARY_TARGET' in PS_LOOP
+    assert '$SEARCH_STACKED_OPERATOR_BOUNDARY_TARGET = Get-EnvOrDefault "SEARCH_STACKED_OPERATOR_BOUNDARY_TARGET" $SEARCH_BOUNDARY_TARGET' in PS_LOOP
+    assert '"--single-operator-boundary-target", $SEARCH_SINGLE_OPERATOR_BOUNDARY_TARGET' in PS_LOOP
+    assert '"--stacked-operator-boundary-target", $SEARCH_STACKED_OPERATOR_BOUNDARY_TARGET' in PS_LOOP
+    assert '"--total-boundary-hard-cap", $SEARCH_TOTAL_BOUNDARY_HARD_CAP' in PS_LOOP
+    assert '"--routing-mode", $ROUTING_MODE' in PS_LOOP
+    assert '"--profile-model", $PROFILE_MODEL' in PS_LOOP
+    assert "vertical stack cannot consume a frozen live operator plan" not in PS_LOOP

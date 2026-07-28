@@ -301,8 +301,35 @@ def get_evolution_action(item: Dict[str, Any]) -> str:
     return _clean_text(item.get("evolution_action"))
 
 
+def frontier_route_context(item: Mapping[str, Any]) -> Dict[str, Any]:
+    context = item.get("frontier_route")
+    if not isinstance(context, Mapping) or context.get("enabled") is not True:
+        return {}
+    return {
+        key: context.get(key)
+        for key in (
+            "enabled",
+            "parent_node_id",
+            "root_node_id",
+            "parent_depth",
+            "operator_stack",
+            "direct_parent_score_rate",
+            "root_score_rate",
+            "profile_version",
+        )
+        if key in context
+    }
+
+
+def is_frontier_route(item: Mapping[str, Any]) -> bool:
+    return bool(frontier_route_context(item))
+
+
 def should_route_for_evolution(item: Dict[str, Any]) -> bool:
-    return get_evolution_action(item) in EVOLUTION_REQUIRED_ACTIONS
+    return (
+        get_evolution_action(item) in EVOLUTION_REQUIRED_ACTIONS
+        or is_frontier_route(item)
+    )
 
 
 def get_sample_profile(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -858,7 +885,8 @@ def build_operator_route(
     failure_memory_index: Optional[MemoryMatchIndex] = None,
 ) -> Dict[str, Any]:
     action = get_evolution_action(item)
-    if action in NON_EVOLUTION_ACTIONS:
+    frontier_route = is_frontier_route(item)
+    if action in NON_EVOLUTION_ACTIONS and not frontier_route:
         return {
             "primary_operator": None,
             "backup_operators": [],
@@ -868,7 +896,7 @@ def build_operator_route(
             "should_use_local_tree_search": False,
             "memory_matches": {"operator": [], "failure": []},
         }
-    if action and action not in EVOLUTION_REQUIRED_ACTIONS:
+    if action and action not in EVOLUTION_REQUIRED_ACTIONS and not frontier_route:
         raise ValueError(f"unsupported evolution_action: {action}")
 
     get_sample_profile(item)
@@ -877,6 +905,10 @@ def build_operator_route(
     primary, backups, reason = _base_rule_route(item)
     avoid: List[str] = []
     reason_parts = [reason]
+    if frontier_route:
+        reason_parts.append(
+            "frontier_route bypasses only the original-sample admission stop; current-node profile and route evidence are used."
+        )
     recommended_next = _recommended_next_methods(item)
 
     signature = build_sample_signature(item)
@@ -980,6 +1012,7 @@ def build_operator_route(
             "operator": operator_matches[:3],
             "failure": failure_matches[:3],
         },
+        "is_frontier_route": frontier_route,
     }
 
 
@@ -1471,7 +1504,10 @@ def _evidence_source_text(payload: Mapping[str, Any]) -> str:
     def visit(value: Any, *, include: bool = True) -> None:
         if isinstance(value, Mapping):
             for key, child in value.items():
-                visit(child, include=include and key != "operator_cards")
+                visit(
+                    child,
+                    include=include and key not in {"operator_cards", "frontier_route"},
+                )
         elif isinstance(value, list):
             for child in value:
                 visit(child, include=include)
@@ -1511,6 +1547,7 @@ def _build_compact_router_input(
         "avoid_operator_ids": list(rule_route.get("avoid_operators") or []),
         "recommended_operator_ids": _recommended_operator_ids(item),
         "memory_operator_ids": _memory_operator_ids(rule_route.get("memory_matches") or {}),
+        "frontier_route": frontier_route_context(item),
         "eligible_operator_ids": list(eligible_ids),
         "operator_cards": _operator_cards(eligible_ids, adjacency),
     }
@@ -1715,7 +1752,7 @@ async def route_records_hybrid_async(
             failure_memory_index=failure_memory_index,
         )
         action = get_evolution_action(record)
-        if action in NON_EVOLUTION_ACTIONS:
+        if action in NON_EVOLUTION_ACTIONS and not is_frontier_route(record):
             route = _base_hybrid_route(rule_route, settings=settings, eligible_ids=[], excluded={})
             route.update({"route_source": "not_requested", "router_status": "not_requested"})
             updated = dict(record)

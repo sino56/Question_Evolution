@@ -710,6 +710,9 @@ def uses_stage_action_contract(item: Dict[str, Any]) -> bool:
 
 
 def action_requires_evolution(item: Dict[str, Any]) -> bool:
+    frontier_route = item.get("frontier_route")
+    if isinstance(frontier_route, dict) and frontier_route.get("enabled") is True:
+        return True
     return get_evolution_action(item) in EVOLUTION_REQUIRED_ACTIONS
 
 

@@ -10,7 +10,9 @@ if str(ROOT) not in sys.path:
 
 from update_sample_state import build_failure_memory_entry
 from schema_validation import validate_records_against_schema
+import vertical_operator_search as vertical_operator_search_module
 from vertical_operator_search import VerticalOperatorSearchRunner
+from vertical_search import build_child_node, build_root_node, initialize_vertical_search_state
 
 
 O10 = "O10_evidence_sufficiency_ladder"
@@ -239,3 +241,109 @@ def test_summary_contains_operator_combination_and_budget_metrics(tmp_path):
     assert summary["combination_metrics"]["ordered_pair_boundary_hit_rates"][pair] == 1.0
     assert summary["budget_metrics"]["evaluation_count"] == 3
     assert summary["budget_metrics"]["api_request_count"] >= 3
+
+
+def test_runner_applies_single_and_stacked_targets_independently(tmp_path):
+    runner = make_runner(
+        tmp_path,
+        single_operator_boundary_target=1,
+        stacked_operator_boundary_target=1,
+        total_boundary_hard_cap=3,
+    )
+    result = runner.run([sample()])
+    state = result[0]["vertical_search_state"]
+    assert state["single_operator_boundary_count"] == 1
+    assert state["stacked_operator_boundary_count"] == 1
+    assert state["total_boundary_count"] == 2
+    assert state["termination_reason"] == "stacked_operator_boundary_target_reached"
+
+
+def test_frontier_is_reprofiled_and_rerouted_from_its_current_evidence(tmp_path, monkeypatch):
+    runner = VerticalOperatorSearchRunner(
+        project_dir=ROOT,
+        work_dir=tmp_path / "vertical",
+        memory_dir=tmp_path / "memory",
+        branch_window=1,
+        boundary_target=5,
+        max_depth=3,
+        allow_operator_repeat_in_path=False,
+        pipeline_mode="step",
+        max_iterations=10,
+        rule_only_difficulty=True,
+        defer_gpt_experimental_evaluation=False,
+        artifact_retention="compact",
+    )
+    root = build_root_node(sample(), max_depth=3)
+    frontier = build_child_node(
+        root, {"operator_id": O10, "score_rate": 0.8}, max_depth=3, generation_sequence=1
+    )
+    parent = {
+        **sample(),
+        "prompt": "frontier prompt",
+        "score_rate": 0.8,
+        "round0_score_summary": {"stable_score": 1.0},
+        "representative_round0_answer": {"candidate_answer": "stale answer"},
+        "rubric": [{"title": "current rubric", "weight": 1}],
+        "score_prompt": "current score prompt",
+        "meta_info": {"parent_snapshot": {"prompt": "root prompt"}},
+    }
+    profile_input = runner._frontier_profile_input(parent, frontier)
+    assert "round0_score_summary" not in profile_input
+    assert "representative_round0_answer" not in profile_input
+    assert profile_input["frontier_route"]["enabled"] is True
+    assert profile_input["frontier_route"]["direct_parent_score_rate"] == 0.8
+    assert profile_input["meta_info"]["frontier_evaluation_evidence"] == {
+        "rubric": [{"title": "current rubric", "weight": 1}],
+        "score_prompt": "current score prompt",
+    }
+
+    profile_calls = []
+
+    def fake_profile(parent_record, parent_node):
+        profile_calls.append(parent_node["node_id"])
+        return {
+            **parent_record,
+            "sample_profile": {
+                "core_capability": "fresh frontier capability",
+                "claim_level": "business judgment",
+                "problem_shape": "open judgment",
+                "external_knowledge_risk": "low",
+            },
+            "overscore_diagnosis": {
+                "is_worth_evolving": False,
+                "candidate_overscore_cause": "fresh diagnosis",
+                "target_failure_mode": "fresh failure mode",
+            },
+            "frontier_route": {
+                "enabled": True,
+                "parent_node_id": parent_node["node_id"],
+                "operator_stack": [O10],
+                "profile_version": "fresh-profile-v1",
+            },
+        }
+
+    def fake_route(records, **kwargs):
+        assert kwargs["routing_mode"] == "rule"
+        assert records[0]["sample_profile"]["core_capability"] == "fresh frontier capability"
+        return [
+            {
+                **records[0],
+                "operator_route": {
+                    "selected_operator_ids": [O10, O15],
+                    "primary_operator": O10,
+                    "backup_operators": [O15],
+                    "avoid_operators": [],
+                    "assignment_mode": "live",
+                },
+            }
+        ]
+
+    monkeypatch.setattr(runner, "_profile_frontier", fake_profile)
+    monkeypatch.setattr(vertical_operator_search_module, "route_records", fake_route)
+    state = initialize_vertical_search_state(sample(), max_depth=3)
+    assert state is not None
+    routed, plan, _ = runner._route_frontier(parent, frontier, state)
+    assert profile_calls == [frontier["node_id"]]
+    assert plan == [O15]
+    assert routed["operator_route"]["assignment_mode"] == "natural"
+    assert routed["operator_route"]["vertical_router_assignment_mode"] == "live"

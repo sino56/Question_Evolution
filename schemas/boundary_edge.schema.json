@@ -15,6 +15,7 @@
     "child_score_rate": {"type": "number"},
     "edge_delta_score_rate": {"type": "number"},
     "root_delta_score_rate": {"type": "number"},
+    "boundary_kind": {"enum": ["single_operator", "stacked_operator", null]},
     "review_status": {"enum": ["pending", "approved", "rejected"]}
   },
   "additionalProperties": true
