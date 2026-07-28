@@ -16,6 +16,8 @@
   "properties": {
     "search_state_version": {"const": 1},
     "parent_node_id": {"type": "string", "minLength": 1},
+    "assignment_mode": {"enum": ["natural", "live"]},
+    "route_revision": {"type": ["string", "null"]},
     "status": {"enum": ["running", "completed", "partial", "aborted"]},
     "termination_reason": {
       "type": ["string", "null"],

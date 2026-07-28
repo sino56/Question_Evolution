@@ -13,6 +13,7 @@ from local_api_config import get_config_list, get_config_value
 REQUIRED_SEED_IDS = {"801", "13364", "14865", "8638", "7337", "18485", "6582", "5486"}
 REQUIRED_IMPORTS = ("openai", "aiofiles", "tqdm", "pytest")
 API_GROUPS = {
+    "router": ("ROUTER_API_KEYS", "GPT_API_KEYS", "HIAPI_KEYS_BIG", "OPENAI_API_KEYS", "OPENAI_API_KEY"),
     "profile": ("PROFILE_API_KEYS", "EVOLVE_API_KEYS", "GPT_API_KEYS", "HIAPI_KEYS_BIG", "OPENAI_API_KEYS", "OPENAI_API_KEY"),
     "evolution": ("EVOLVE_API_KEYS", "GPT_API_KEYS", "HIAPI_KEYS_BIG", "OPENAI_API_KEYS", "OPENAI_API_KEY"),
     "answer": ("ANSWER_API_KEYS", "GPT_API_KEYS", "HIAPI_KEYS_BIG", "OPENAI_API_KEYS", "OPENAI_API_KEY"),

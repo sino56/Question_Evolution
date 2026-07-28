@@ -246,7 +246,7 @@ $NO_INFO_STOP_ROUNDS = [int](Get-EnvOrDefault "NO_INFO_STOP_ROUNDS" "2")
 $NO_INFO_MIN_DELTA = [double](Get-EnvOrDefault "NO_INFO_MIN_DELTA" "0.0001")
 $MIN_SCORE_RATE = Get-EnvOrDefault "MIN_SCORE_RATE" "0.8"
 $NUM_CANDIDATES = Get-EnvOrDefault "NUM_CANDIDATES" "2"
-$SEARCH_MODE = Get-EnvOrDefault "SEARCH_MODE" "single_branch"
+$SEARCH_MODE = Get-EnvOrDefault "SEARCH_MODE" "multi_operator_branch"
 $SEARCH_BRANCH_WINDOW = Get-EnvOrDefault "SEARCH_BRANCH_WINDOW" "1"
 $SEARCH_PIPELINE_MODE = Get-EnvOrDefault "SEARCH_PIPELINE_MODE" "step"
 $SEARCH_ARTIFACT_RETENTION = Get-EnvOrDefault "SEARCH_ARTIFACT_RETENTION" "compact"
@@ -254,6 +254,11 @@ $DEFER_GPT_EXPERIMENTAL_EVALUATION = Get-EnvOrDefault "DEFER_GPT_EXPERIMENTAL_EV
 $SEARCH_OPERATOR_SORT_MODE = Get-EnvOrDefault "SEARCH_OPERATOR_SORT_MODE" "route"
 $SEARCH_OPERATOR_EXPLORATION_RATIO = Get-EnvOrDefault "SEARCH_OPERATOR_EXPLORATION_RATIO" "0.1"
 $SEARCH_BOUNDARY_TARGET = Get-EnvOrDefault "SEARCH_BOUNDARY_TARGET" "5"
+$ROUTING_MODE = Get-EnvOrDefault "ROUTING_MODE" "hybrid"
+$ASSIGNMENT_MODE = Get-EnvOrDefault "ASSIGNMENT_MODE" "live"
+$ROUTER_CONCURRENCY = Get-EnvOrDefault "ROUTER_CONCURRENCY" "20"
+$ROUTER_TIMEOUT = Get-EnvOrDefault "ROUTER_TIMEOUT" "60"
+$ROUTER_RETRIES = Get-EnvOrDefault "ROUTER_RETRIES" "0"
 $SEARCH_MAX_DEPTH = Get-EnvOrDefault "SEARCH_MAX_DEPTH" "3"
 $SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH = Get-EnvOrDefault "SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH" "false"
 $SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE = Get-EnvOrDefault "SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE" "0"
@@ -292,6 +297,8 @@ $GPT_ANSWER_BASE_URL = Get-EnvOrDefault "GPT_ANSWER_BASE_URL" $CONFIG_GPT_ANSWER
 $GPT_ANSWER_API_KEY = Get-EnvOrDefault "GPT_ANSWER_API_KEY" $CONFIG_GPT_ANSWER_API_KEY
 $GPT_MODEL = Get-EnvOrDefault "GPT_MODEL" $CONFIG_GPT_MODEL
 $OPENAI_BASE_URL = Get-EnvOrDefault "OPENAI_BASE_URL" $CONFIG_BASE_URL
+$ROUTER_MODEL = Get-EnvOrDefault "ROUTER_MODEL" $GPT_MODEL
+$ROUTER_BASE_URL = Get-EnvOrDefault "ROUTER_BASE_URL" (Get-EnvOrDefault "GPT_BASE_URL" $OPENAI_BASE_URL)
 $PROFILE_MODEL = Get-EnvOrDefault "PROFILE_MODEL" $CONFIG_PROFILE_MODEL
 $PROFILE_BASE_URL = Get-EnvOrDefault "PROFILE_BASE_URL" $OPENAI_BASE_URL
 $DIFFICULTY_GAIN_MODEL = Get-EnvOrDefault "DIFFICULTY_GAIN_MODEL" $CONFIG_DIFFICULTY_GAIN_MODEL
@@ -424,7 +431,7 @@ for ($round = 1; $round -le $MaxRounds; $round += 1) {
 
         Invoke-Step $profiled "profile_samples" $roundInput "[Round $round] Step 1/13: profile_samples.py" { Invoke-Python "profile_samples.py" "--input" $roundInput "--output" $profiled "--model" $PROFILE_MODEL "--base-url" $PROFILE_BASE_URL "--concurrency" $PROFILE_CONCURRENCY "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
         Invoke-Step $profiledCandidates "select_evolution_candidates" $profiled "[Round $round] Step 2/13: select_evolution_candidates.py" { Invoke-Python "select_evolution_candidates.py" "--input" $profiled "--output" $profiledCandidates "--high-score-threshold" $MIN_SCORE_RATE "--report-output" (Join-Path $roundDir "evolution_candidate_report.json") "--performance-events" (Join-Path $roundDir "performance_events.jsonl") @uncertainLowProbeArgs }
-        Invoke-Step $routed "operator_router" $profiledCandidates "[Round $round] Step 3/13: operator_router.py" { Invoke-Python "operator_router.py" "--input" $profiledCandidates "--output" $routed "--memory-dir" $MEMORY_DIR "--failure-memory-window-rounds" $FAILURE_MEMORY_WINDOW_ROUNDS "--report-output" (Join-Path $roundDir "operator_router_report.json") "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
+        Invoke-Step $routed "operator_router" $profiledCandidates "[Round $round] Step 3/13: operator_router.py" { Invoke-Python "operator_router.py" "--input" $profiledCandidates "--output" $routed "--memory-dir" $MEMORY_DIR "--failure-memory-window-rounds" $FAILURE_MEMORY_WINDOW_ROUNDS "--routing-mode" $ROUTING_MODE "--assignment-mode" $ASSIGNMENT_MODE "--router-model" $ROUTER_MODEL "--router-base-url" $ROUTER_BASE_URL "--router-concurrency" $ROUTER_CONCURRENCY "--router-timeout" $ROUTER_TIMEOUT "--router-retries" $ROUTER_RETRIES "--router-cache" (Join-Path $EXP_DIR "router_cache.jsonl") "--router-trace-output" (Join-Path $roundDir "router_traces.jsonl.gz") "--report-output" (Join-Path $roundDir "operator_router_report.json") "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
         if ($SEARCH_MODE -in @("multi_operator_branch", "multi_operator_vertical_stack")) {
             $env:EVO_CONCURRENCY = [string]$EVO_CONCURRENCY
             $env:DIFFICULTY_GAIN_CONCURRENCY = [string]$DIFFICULTY_GAIN_CONCURRENCY
@@ -447,10 +454,11 @@ for ($round = 1; $round -le $MaxRounds; $round += 1) {
             $env:WEAK_PROBE_MODE = [string]$WEAK_PROBE_MODE
             $searchStateOutput = Join-Path $roundDir "search_state_updated.jsonl"
             if ($SEARCH_MODE -eq "multi_operator_vertical_stack") {
+                if ($ASSIGNMENT_MODE -eq "live") { throw "ASSIGNMENT_MODE=live requires SEARCH_MODE=multi_operator_branch; vertical stack cannot consume a frozen live operator plan." }
                 $searchArgs = @("vertical_operator_search.py", "--input", $routed, "--output", $searchStateOutput, "--work-dir", (Join-Path $roundDir "search"), "--memory-dir", $MEMORY_DIR, "--branch-window", $SEARCH_BRANCH_WINDOW, "--boundary-target", $SEARCH_BOUNDARY_TARGET, "--max-depth", $SEARCH_MAX_DEPTH, "--pipeline-mode", $SEARCH_PIPELINE_MODE, "--artifact-retention", $SEARCH_ARTIFACT_RETENTION, "--max-request-attempts-per-sample", $SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE, "--max-evaluations-per-sample", $SEARCH_MAX_EVALUATIONS_PER_SAMPLE, "--sample-timeout-seconds", $SEARCH_SAMPLE_TIMEOUT_SECONDS)
                 if ($SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH -eq "true") { $searchArgs += "--allow-operator-repeat-in-path" }
             } else {
-                $searchArgs = @("multi_operator_search.py", "--input", $routed, "--output", $searchStateOutput, "--work-dir", (Join-Path $roundDir "search"), "--memory-dir", $MEMORY_DIR, "--branch-window", $SEARCH_BRANCH_WINDOW, "--boundary-target", $SEARCH_BOUNDARY_TARGET, "--pipeline-mode", $SEARCH_PIPELINE_MODE, "--artifact-retention", $SEARCH_ARTIFACT_RETENTION, "--operator-sort-mode", $SEARCH_OPERATOR_SORT_MODE, "--exploration-ratio", $SEARCH_OPERATOR_EXPLORATION_RATIO)
+                $searchArgs = @("multi_operator_search.py", "--input", $routed, "--output", $searchStateOutput, "--work-dir", (Join-Path $roundDir "search"), "--memory-dir", $MEMORY_DIR, "--branch-window", $SEARCH_BRANCH_WINDOW, "--boundary-target", $SEARCH_BOUNDARY_TARGET, "--pipeline-mode", $SEARCH_PIPELINE_MODE, "--artifact-retention", $SEARCH_ARTIFACT_RETENTION, "--operator-sort-mode", $SEARCH_OPERATOR_SORT_MODE, "--exploration-ratio", $SEARCH_OPERATOR_EXPLORATION_RATIO, "--assignment-mode", $ASSIGNMENT_MODE)
                 if ($env:SEARCH_OPERATOR_STATISTICS) { $searchArgs += @("--operator-statistics", $env:SEARCH_OPERATOR_STATISTICS) }
             }
             if ($env:SEARCH_RULE_ONLY_DIFFICULTY -eq "true") { $searchArgs += "--rule-only-difficulty" }

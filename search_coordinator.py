@@ -26,6 +26,8 @@ from prompts.operators import OPERATOR_SPECS
 SEARCH_STATE_VERSION = 1
 DEFAULT_BOUNDARY_TARGET = 5
 DEFAULT_BRANCH_WINDOW = 1
+ASSIGNMENT_MODE_NATURAL = "natural"
+ASSIGNMENT_MODE_LIVE = "live"
 
 OPERATOR_TERMINAL_STATUSES = {
     "completed",
@@ -81,6 +83,18 @@ def _as_nonnegative_int(value: Any, default: int = 0) -> int:
 def _as_positive_int(value: Any, default: int) -> int:
     parsed = _as_nonnegative_int(value, default)
     return parsed if parsed > 0 else default
+
+
+def _assignment_mode(value: Any, default: str = ASSIGNMENT_MODE_NATURAL) -> str:
+    mode = _clean_text(value).lower() or default
+    if mode not in {ASSIGNMENT_MODE_NATURAL, ASSIGNMENT_MODE_LIVE}:
+        raise ValueError(f"unsupported assignment_mode: {mode}")
+    return mode
+
+
+def _route_assignment_mode(record: Optional[Mapping[str, Any]]) -> str:
+    route = record.get("operator_route") if isinstance(record, Mapping) else None
+    return _assignment_mode(route.get("assignment_mode") if isinstance(route, Mapping) else None)
 
 
 def parent_node_id(record: Mapping[str, Any]) -> str:
@@ -152,6 +166,37 @@ def selected_operator_ids(record: Mapping[str, Any], *, forced_coverage: bool = 
             continue
         selected.append(operator_id)
     return selected
+
+
+def _validate_live_operator_route(record: Mapping[str, Any]) -> None:
+    """Validate the frozen Router-to-search business interface.
+
+    The search coordinator intentionally knows no Router evidence or scoring
+    metrics.  It only checks the immutable selected list and its compatibility
+    projections before it creates branch plans.
+    """
+
+    route = record.get("operator_route")
+    if not isinstance(route, Mapping):
+        raise ValueError("live assignment requires operator_route")
+    if _clean_text(route.get("routing_mode")) != "hybrid":
+        raise ValueError("live assignment requires routing_mode=hybrid")
+    selected = route.get("selected_operator_ids")
+    if not isinstance(selected, list):
+        raise ValueError("live assignment requires operator_route.selected_operator_ids")
+    normalized = _unique_strings(selected)
+    if normalized != selected:
+        raise ValueError("live selected_operator_ids must be unique, ordered strings")
+    valid = selected_operator_ids(record)
+    if valid != normalized:
+        raise ValueError("live selected_operator_ids contain a non-executable or avoided operator")
+    if normalized:
+        if _clean_text(route.get("primary_operator")) != normalized[0]:
+            raise ValueError("live primary_operator must project selected_operator_ids[0]")
+        if _unique_strings(route.get("backup_operators") or []) != normalized[1:]:
+            raise ValueError("live backup_operators must project the remaining selected_operator_ids")
+    elif _clean_text(route.get("primary_operator")) or _unique_strings(route.get("backup_operators") or []):
+        raise ValueError("empty live selected_operator_ids cannot have compatibility candidates")
 
 
 def _operator_entry(parent_id: str, operator_id: str) -> Dict[str, Any]:
@@ -235,6 +280,7 @@ def upgrade_search_state(
     record: Optional[Mapping[str, Any]] = None,
     branch_window: Optional[int] = None,
     boundary_target: Optional[int] = None,
+    assignment_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Upgrade legacy/unversioned scheduling state without resetting progress."""
 
@@ -258,6 +304,24 @@ def upgrade_search_state(
     if not parent_id:
         raise ValueError("search state is missing parent_node_id")
 
+    route_mode = _route_assignment_mode(record)
+    existing_assignment = state.get("assignment_mode")
+    if existing_assignment is None:
+        # A state created before assignment mode existed is historical.  It
+        # remains natural and cannot be silently promoted by a live route.
+        if route_mode == ASSIGNMENT_MODE_LIVE:
+            raise ValueError(
+                "legacy search state has no assignment_mode; start a new live experiment instead of upgrading it"
+            )
+        resolved_assignment = ASSIGNMENT_MODE_NATURAL
+    else:
+        resolved_assignment = _assignment_mode(existing_assignment)
+    requested_assignment = _assignment_mode(assignment_mode, resolved_assignment) if assignment_mode else resolved_assignment
+    if requested_assignment != resolved_assignment:
+        raise ValueError("search state assignment_mode mismatch; refuse to mix route revisions")
+    if record is not None and route_mode != resolved_assignment:
+        raise ValueError("operator route assignment_mode does not match the frozen search state")
+
     selected = _unique_strings(state.get("selected_operator_ids") or [])
     if not selected:
         raw_plan = state.get("operator_plan")
@@ -275,6 +339,7 @@ def upgrade_search_state(
 
     state["search_state_version"] = SEARCH_STATE_VERSION
     state["parent_node_id"] = parent_id
+    state["assignment_mode"] = resolved_assignment
     state["selected_operator_ids"] = selected
     state["selected_operator_count"] = len(selected)
     state["operator_plan"] = _upgrade_operator_plan(
@@ -286,9 +351,11 @@ def upgrade_search_state(
         boundary_target if boundary_target is not None else state.get("boundary_target"),
         DEFAULT_BOUNDARY_TARGET,
     )
-    state["boundary_candidate_count"] = min(
-        _as_nonnegative_int(state.get("boundary_candidate_count")),
-        state["boundary_target"],
+    raw_boundary_count = _as_nonnegative_int(state.get("boundary_candidate_count"))
+    state["boundary_candidate_count"] = (
+        raw_boundary_count
+        if resolved_assignment == ASSIGNMENT_MODE_LIVE
+        else min(raw_boundary_count, state["boundary_target"])
     )
     state["branch_window"] = _as_positive_int(
         branch_window if branch_window is not None else state.get("branch_window"),
@@ -325,6 +392,7 @@ def upgrade_search_state_with_artifacts(
     record: Optional[Mapping[str, Any]] = None,
     branch_window: Optional[int] = None,
     boundary_target: Optional[int] = None,
+    assignment_mode: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     lightweight, artifacts = split_legacy_search_state(raw_state)
     return (
@@ -333,6 +401,7 @@ def upgrade_search_state_with_artifacts(
             record=record,
             branch_window=branch_window,
             boundary_target=boundary_target,
+            assignment_mode=assignment_mode,
         ),
         artifacts,
     )
@@ -347,6 +416,7 @@ def initialize_search_state(
     operator_sort_mode: str = "route",
     operator_statistics: Optional[Mapping[str, Any]] = None,
     exploration_ratio: float = 0.1,
+    assignment_mode: Optional[str] = None,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Create state once, or resume existing state without reinitialization."""
@@ -360,12 +430,24 @@ def initialize_search_state(
             record=record,
             branch_window=branch_window,
             boundary_target=boundary_target,
+            assignment_mode=assignment_mode,
         )
 
     parent_id = parent_node_id(record)
+    resolved_assignment = _assignment_mode(
+        assignment_mode,
+        _route_assignment_mode(record),
+    )
+    route_assignment = _route_assignment_mode(record)
+    if route_assignment != resolved_assignment:
+        raise ValueError("operator route assignment_mode does not match search initialization")
+    if resolved_assignment == ASSIGNMENT_MODE_LIVE:
+        _validate_live_operator_route(record)
     selected = selected_operator_ids(record, forced_coverage=forced_coverage)
     if operator_sort_mode not in {"route", "yield_per_time"}:
         raise ValueError(f"unsupported operator_sort_mode: {operator_sort_mode}")
+    if resolved_assignment == ASSIGNMENT_MODE_LIVE and operator_sort_mode != "route":
+        raise ValueError("live assignment preserves Router rank and cannot use operator statistics sorting")
     if operator_sort_mode == "yield_per_time":
         route = record.get("operator_route")
         route = route if isinstance(route, Mapping) else {}
@@ -384,6 +466,13 @@ def initialize_search_state(
         "search_state_version": SEARCH_STATE_VERSION,
         "parent_node_id": parent_id,
         "parent_record_key": stable_record_key(dict(record)),
+        "assignment_mode": resolved_assignment,
+        "route_revision": _clean_text(
+            (record.get("operator_route") or {}).get("route_revision")
+            if isinstance(record.get("operator_route"), Mapping)
+            else ""
+        )
+        or None,
         "status": "running",
         "termination_reason": None,
         "boundary_target": _as_positive_int(boundary_target, DEFAULT_BOUNDARY_TARGET),
@@ -575,7 +664,8 @@ def _refresh_search_state(
         updated["operator_plan"]
     )
     pending = any(entry.get("status") == "pending" for entry in updated["operator_plan"])
-    if updated["boundary_candidate_count"] >= updated["boundary_target"]:
+    live_assignment = updated.get("assignment_mode") == ASSIGNMENT_MODE_LIVE
+    if not live_assignment and updated["boundary_candidate_count"] >= updated["boundary_target"]:
         updated["termination_reason"] = "boundary_target_reached"
         updated["coverage_status"] = (
             "complete"
@@ -642,7 +732,10 @@ def merge_decision_result(
     else:
         branch_status = "no_score_change"
     if branch_status == "boundary_candidate":
-        if updated["boundary_candidate_count"] >= updated["boundary_target"]:
+        if (
+            updated.get("assignment_mode") != ASSIGNMENT_MODE_LIVE
+            and updated["boundary_candidate_count"] >= updated["boundary_target"]
+        ):
             raise ValueError("boundary target overflow")
         updated["boundary_candidate_count"] += 1
 
@@ -763,9 +856,10 @@ def claim_branches(
         return updated, []
 
     in_flight = _derive_in_flight_branch_ids(updated["operator_plan"])
-    remaining_boundary_slots = max(
-        0,
-        updated["boundary_target"] - updated["boundary_candidate_count"],
+    remaining_boundary_slots = (
+        len(updated["operator_plan"])
+        if updated.get("assignment_mode") == ASSIGNMENT_MODE_LIVE
+        else max(0, updated["boundary_target"] - updated["boundary_candidate_count"])
     )
     available_in_flight_slots = max(0, updated["branch_window"] - len(in_flight))
     pending_entries = [
@@ -891,6 +985,7 @@ def initialize_records(
     operator_sort_mode: str = "route",
     operator_statistics: Optional[Mapping[str, Any]] = None,
     exploration_ratio: float = 0.1,
+    assignment_mode: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     return [
         attach_search_state(
@@ -903,6 +998,7 @@ def initialize_records(
                 operator_sort_mode=operator_sort_mode,
                 operator_statistics=operator_statistics,
                 exploration_ratio=exploration_ratio,
+                assignment_mode=assignment_mode,
             ),
         )
         for record in records
@@ -993,6 +1089,11 @@ def parse_args() -> argparse.Namespace:
     )
     initialize.add_argument("--operator-statistics", default=None)
     initialize.add_argument("--exploration-ratio", type=float, default=0.1)
+    initialize.add_argument(
+        "--assignment-mode",
+        choices=[ASSIGNMENT_MODE_NATURAL, ASSIGNMENT_MODE_LIVE],
+        default=ASSIGNMENT_MODE_NATURAL,
+    )
     dispatch = subparsers.add_parser("dispatch")
     dispatch.add_argument("--input", required=True)
     dispatch.add_argument("--state-output", required=True)
@@ -1024,6 +1125,7 @@ def main() -> None:
             operator_sort_mode=args.operator_sort_mode,
             operator_statistics=operator_statistics,
             exploration_ratio=args.exploration_ratio,
+            assignment_mode=args.assignment_mode,
         )
         _write_jsonl_atomic(initialized, args.output)
     elif args.command == "dispatch":

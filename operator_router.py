@@ -1,11 +1,29 @@
 import argparse
+import asyncio
+import hashlib
 import json
 import os
+import re
 import time
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from pipeline_runtime import StageMetrics, load_json_records, publish_records, sha256_file
+from local_api_config import get_config_list, get_config_value
+from operator_registry import runtime_policy
+from pipeline_runtime import StageMetrics, TraceStore, load_json_records, publish_records, sha256_file, stable_record_key
+from prompts.operators import OPERATOR_SPECS
+from prompts.router_prompt import build_router_prompt
+from router_contract import (
+    ROUTER_PROMPT_VERSION,
+    ROUTER_REGISTRY_POLICY_VERSION,
+    ROUTER_TRANSPORT_POLICY_VERSION,
+    ROUTING_SCHEMA_VERSION,
+    ParsedRouterResponse,
+    RouterContractError,
+    parse_router_response,
+)
 
 from select_evolution_candidates import (
     EVOLVE_HIGH_SCORE_OVERSCORE,
@@ -965,6 +983,949 @@ def build_operator_route(
     }
 
 
+ROUTING_MODE_RULE = "rule"
+ROUTING_MODE_HYBRID = "hybrid"
+ASSIGNMENT_MODE_NATURAL = "natural"
+ASSIGNMENT_MODE_LIVE = "live"
+DEFAULT_ROUTER_TIMEOUT_SECONDS = 60.0
+DEFAULT_ROUTER_CONCURRENCY = 20
+DEFAULT_ROUTER_RETRIES = 0
+ROUTER_TEMPERATURE = 0.0
+ROUTE_REVISION = "hybrid-live-route-v1"
+
+
+def _digest_json(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _provider_identifier(base_url: str) -> str:
+    return hashlib.sha256(str(base_url or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _configured_router_api_keys(cli_keys: Optional[Sequence[str]] = None) -> List[str]:
+    if cli_keys:
+        values = [str(value).strip() for value in cli_keys if str(value).strip()]
+        if values:
+            return values
+    for name in (
+        "ROUTER_API_KEYS",
+        "GPT_API_KEYS",
+        "HIAPI_KEYS_BIG",
+        "OPENAI_API_KEYS",
+        "OPENAI_API_KEY",
+    ):
+        raw = os.getenv(name, "")
+        values = [part.strip() for part in raw.split(",") if part.strip()]
+        if values:
+            return values
+    return get_config_list(
+        "ROUTER_API_KEYS",
+        "GPT_API_KEYS",
+        "HIAPI_KEYS_BIG",
+        "OPENAI_API_KEYS",
+        "OPENAI_API_KEY",
+    )
+
+
+def _configured_router_base_url() -> str:
+    for name in ("ROUTER_BASE_URL", "GPT_BASE_URL", "OPENAI_BASE_URL"):
+        value = _clean_text(os.getenv(name))
+        if value:
+            return value
+    return get_config_value(
+        "ROUTER_BASE_URL",
+        "GPT_BASE_URL",
+        "BASE_URL",
+        "OPENAI_BASE_URL",
+        default="",
+    )
+
+
+def _configured_router_model() -> str:
+    return (
+        _clean_text(os.getenv("ROUTER_MODEL"))
+        or _clean_text(os.getenv("GPT_MODEL"))
+        or get_config_value("ROUTER_MODEL", "GPT_MODEL", "QA_MODEL", default="gpt-5.4")
+    )
+
+
+@dataclass(frozen=True)
+class RouterSettings:
+    routing_mode: str = ROUTING_MODE_RULE
+    assignment_mode: str = ASSIGNMENT_MODE_NATURAL
+    model: str = ""
+    base_url: str = ""
+    timeout_seconds: float = DEFAULT_ROUTER_TIMEOUT_SECONDS
+    retries: int = DEFAULT_ROUTER_RETRIES
+    concurrency: int = DEFAULT_ROUTER_CONCURRENCY
+    temperature: float = ROUTER_TEMPERATURE
+
+    @classmethod
+    def from_values(
+        cls,
+        *,
+        routing_mode: str = ROUTING_MODE_RULE,
+        assignment_mode: str = ASSIGNMENT_MODE_NATURAL,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        timeout_seconds: float = DEFAULT_ROUTER_TIMEOUT_SECONDS,
+        retries: int = DEFAULT_ROUTER_RETRIES,
+        concurrency: int = DEFAULT_ROUTER_CONCURRENCY,
+    ) -> "RouterSettings":
+        normalized_mode = _clean_text(routing_mode).lower() or ROUTING_MODE_RULE
+        normalized_assignment = _clean_text(assignment_mode).lower() or ASSIGNMENT_MODE_NATURAL
+        if normalized_mode not in {ROUTING_MODE_RULE, ROUTING_MODE_HYBRID}:
+            raise ValueError(f"unsupported routing mode: {normalized_mode}")
+        if normalized_assignment not in {ASSIGNMENT_MODE_NATURAL, ASSIGNMENT_MODE_LIVE}:
+            raise ValueError(f"unsupported assignment mode: {normalized_assignment}")
+        if timeout_seconds <= 0:
+            raise ValueError("router timeout must be positive")
+        if retries != 0:
+            raise ValueError("Router retries must be 0; failures use deterministic fallback")
+        if concurrency < 1:
+            raise ValueError("router concurrency must be >= 1")
+        return cls(
+            routing_mode=normalized_mode,
+            assignment_mode=normalized_assignment,
+            model=_clean_text(model) or _configured_router_model(),
+            base_url=_clean_text(base_url) or _configured_router_base_url(),
+            timeout_seconds=float(timeout_seconds),
+            retries=int(retries),
+            concurrency=int(concurrency),
+        )
+
+    @property
+    def provider_id(self) -> str:
+        return _provider_identifier(self.base_url)
+
+    def cache_policy(self) -> Dict[str, Any]:
+        return {
+            "routing_mode": self.routing_mode,
+            "assignment_mode": self.assignment_mode,
+            "model": self.model,
+            "temperature": self.temperature,
+            "provider_id": self.provider_id,
+            "timeout_seconds": self.timeout_seconds,
+            "retries": self.retries,
+            "transport_policy_version": ROUTER_TRANSPORT_POLICY_VERSION,
+            "registry_policy_version": ROUTER_REGISTRY_POLICY_VERSION,
+            "prompt_version": ROUTER_PROMPT_VERSION,
+            "schema_version": ROUTING_SCHEMA_VERSION,
+        }
+
+
+@dataclass(frozen=True)
+class RouterCallResult:
+    raw_response: str
+    input_tokens: Optional[int]
+    output_tokens: Optional[int]
+    elapsed_seconds: float
+
+
+class HybridRouterClient:
+    """One-attempt OpenAI-compatible Router client.
+
+    ``max_retries=0`` prevents the SDK from turning a logical routing task into
+    multiple hidden HTTP attempts.  Key rotation is intentionally not used:
+    every routing task gets one request and then deterministic fallback.
+    """
+
+    def __init__(self, settings: RouterSettings, api_keys: Sequence[str]):
+        if not api_keys:
+            raise ValueError("Router requires ROUTER_API_KEYS/GPT_API_KEYS/OPENAI_API_KEY")
+        self.settings = settings
+        self.api_keys = list(api_keys)
+        self._client: Any = None
+
+    async def _client_or_create(self) -> Any:
+        if self._client is None:
+            try:
+                from openai import AsyncOpenAI
+            except ImportError as exc:
+                raise RuntimeError("Missing dependency: install openai to run hybrid routing") from exc
+            kwargs: Dict[str, Any] = {
+                "api_key": self.api_keys[0],
+                "timeout": self.settings.timeout_seconds,
+                "max_retries": 0,
+            }
+            if self.settings.base_url:
+                kwargs["base_url"] = self.settings.base_url
+            self._client = AsyncOpenAI(**kwargs)
+        return self._client
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.close()
+
+    async def route(self, prompt: str) -> RouterCallResult:
+        started = time.monotonic()
+        client = await self._client_or_create()
+        response = await client.chat.completions.create(
+            model=self.settings.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=self.settings.temperature,
+            max_tokens=8192,
+        )
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            raise RuntimeError("empty_response")
+        content = _clean_text(getattr(getattr(choices[0], "message", None), "content", ""))
+        if not content:
+            raise RuntimeError("empty_response")
+        usage = getattr(response, "usage", None)
+        return RouterCallResult(
+            raw_response=content,
+            input_tokens=getattr(usage, "prompt_tokens", None) if usage is not None else None,
+            output_tokens=getattr(usage, "completion_tokens", None) if usage is not None else None,
+            elapsed_seconds=time.monotonic() - started,
+        )
+
+
+class _RouterKeyLock:
+    """Small cross-process advisory lock used while populating one cache key."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.handle: Optional[Any] = None
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = open(self.path, "a+b")
+        self.handle.seek(0)
+        self.handle.write(b"0")
+        self.handle.flush()
+        deadline = time.monotonic() + 120.0
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    self.handle.seek(0)
+                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out waiting for router cache lock: {self.path}")
+                time.sleep(0.05)
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        try:
+            self.handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.handle.close()
+            self.handle = None
+
+
+class RouterCache:
+    """Append-only, fsynced cache that stores only successful parsed routes."""
+
+    def __init__(self, path: Optional[str]):
+        self.path = Path(path).resolve() if path else None
+        self._entries: Dict[str, Dict[str, Any]] = {}
+        if self.path and self.path.exists():
+            with self.path.open("r", encoding="utf-8") as source:
+                for line in source:
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    key = _clean_text(entry.get("cache_key")) if isinstance(entry, Mapping) else ""
+                    if key and entry.get("status") == "succeeded" and isinstance(entry.get("parsed_response"), Mapping):
+                        self._entries[key] = dict(entry)
+
+    def get(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        entry = self._entries.get(cache_key)
+        return dict(entry) if entry else None
+
+    def key_lock(self, cache_key: str) -> Optional[_RouterKeyLock]:
+        if self.path is None:
+            return None
+        lock_dir = self.path.parent / f"{self.path.name}.locks"
+        return _RouterKeyLock(lock_dir / f"{cache_key}.lock")
+
+    def reload_key(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        if self.path is None or not self.path.exists():
+            return self.get(cache_key)
+        with self.path.open("r", encoding="utf-8") as source:
+            for line in source:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(entry, Mapping)
+                    and entry.get("cache_key") == cache_key
+                    and entry.get("status") == "succeeded"
+                    and isinstance(entry.get("parsed_response"), Mapping)
+                ):
+                    self._entries[cache_key] = dict(entry)
+        return self.get(cache_key)
+
+    def put_success(
+        self,
+        cache_key: str,
+        parsed_response: Mapping[str, Any],
+        *,
+        raw_candidate_count: int,
+    ) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "cache_key": cache_key,
+            "status": "succeeded",
+            "created_at": time.time(),
+            "raw_candidate_count": max(0, int(raw_candidate_count)),
+            "parsed_response": dict(parsed_response),
+        }
+        line = (json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        descriptor = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        try:
+            os.write(descriptor, line)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        self._entries[cache_key] = entry
+
+
+def _operator_adjacency() -> Dict[str, Set[str]]:
+    by_number = {
+        operator_id.split("_", 1)[0]: operator_id
+        for operator_id in OPERATOR_SPECS
+        if "_" in operator_id
+    }
+    adjacency: Dict[str, Set[str]] = {}
+    for operator_id, spec in OPERATOR_SPECS.items():
+        values: Set[str] = set()
+        for boundary in getattr(spec, "adjacent_operator_boundaries", ()) or ():
+            text = str(boundary)
+            for marker in re.findall(r"\bO\d{2}(?:_[a-z0-9_]+)?\b", text):
+                values.add(marker if marker in OPERATOR_SPECS else by_number.get(marker, ""))
+        values.discard("")
+        values.discard(operator_id)
+        adjacency[operator_id] = values
+    return adjacency
+
+
+def _terminal_operator_ids(item: Mapping[str, Any]) -> Set[str]:
+    state = item.get("search_state")
+    if not isinstance(state, Mapping):
+        state = item.get("multi_operator_search_state")
+    terminal = {"completed", "duplicate_exhausted", "not_applicable", "validation_failed", "branch_error"}
+    result: Set[str] = set()
+    if isinstance(state, Mapping):
+        for entry in state.get("operator_plan") or []:
+            if isinstance(entry, Mapping) and _clean_text(entry.get("status")) in terminal:
+                operator_id = _normalize_operator(entry.get("operator_id"))
+                if operator_id:
+                    result.add(operator_id)
+    return result
+
+
+def _fact_ledger_exclusions(item: Mapping[str, Any]) -> Dict[str, str]:
+    """Use only an explicitly authoritative and complete fact ledger.
+
+    The current pipeline normally has no such ledger.  Missing or partial facts
+    deliberately leave every otherwise runnable operator eligible.
+    """
+
+    ledger = item.get("fact_ledger")
+    if not isinstance(ledger, Mapping):
+        return {}
+    if ledger.get("authoritative") is not True or ledger.get("complete") is not True:
+        return {}
+    preconditions = ledger.get("operator_preconditions")
+    if not isinstance(preconditions, Mapping):
+        return {}
+    excluded: Dict[str, str] = {}
+    for operator_id, raw_value in preconditions.items():
+        normalized = _normalize_operator(operator_id)
+        if not normalized:
+            continue
+        unsatisfied = raw_value is False or (
+            isinstance(raw_value, Mapping) and raw_value.get("satisfied") is False
+        )
+        if unsatisfied:
+            excluded[normalized] = "authoritative_fact_ledger_precondition_false"
+    return excluded
+
+
+def eligible_operator_ids(
+    item: Mapping[str, Any],
+    *,
+    avoid_operators: Sequence[str] = (),
+) -> Tuple[List[str], Dict[str, str]]:
+    """Return the one ordered candidate space shared by cards and validation."""
+
+    avoid = {_clean_text(operator_id) for operator_id in avoid_operators if _clean_text(operator_id)}
+    completed = _terminal_operator_ids(item)
+    ledger_exclusions = _fact_ledger_exclusions(item)
+    eligible: List[str] = []
+    excluded: Dict[str, str] = {}
+    for operator_id, spec in OPERATOR_SPECS.items():
+        policy = runtime_policy(operator_id)
+        if not bool(getattr(spec, "generates_question", True)) or not bool(policy["generation_enabled"]):
+            excluded[operator_id] = "generation_disabled"
+        elif bool(policy["validation_only"]):
+            excluded[operator_id] = "validation_only"
+        elif _clean_text(policy["qualification_status"]) == "suspended":
+            excluded[operator_id] = "suspended"
+        elif operator_id in avoid:
+            excluded[operator_id] = "avoid_operators"
+        elif operator_id in completed:
+            excluded[operator_id] = "parent_terminal"
+        elif operator_id in ledger_exclusions:
+            excluded[operator_id] = ledger_exclusions[operator_id]
+        else:
+            eligible.append(operator_id)
+    return eligible, excluded
+
+
+def _normalize_reference_materials(item: Mapping[str, Any]) -> List[str]:
+    raw_values: List[Any] = []
+    meta_info = item.get("meta_info")
+    if isinstance(meta_info, Mapping):
+        raw_values.extend(meta_info.get("references") if isinstance(meta_info.get("references"), list) else [])
+        raw_values.extend(meta_info.get("answers_list") if isinstance(meta_info.get("answers_list"), list) else [])
+    for field in ("reference_answer", "answer_from_book"):
+        raw_values.append(item.get(field))
+    values: List[str] = []
+    for raw_value in raw_values:
+        if not isinstance(raw_value, str):
+            continue
+        normalized = " ".join(raw_value.split())
+        if normalized and normalized not in values:
+            values.append(normalized)
+    return values
+
+
+def _candidate_answer_for_router(item: Mapping[str, Any]) -> str:
+    scoring_result = item.get("scoring_result")
+    if isinstance(scoring_result, Mapping) and isinstance(scoring_result.get("candidate_answer"), str):
+        return scoring_result["candidate_answer"].strip()
+    return _clean_text(item.get("candidate_answer"))
+
+
+def _memory_operator_ids(matches: Mapping[str, Any]) -> List[str]:
+    result: List[str] = []
+    for group in ("operator", "failure"):
+        rows = matches.get(group) if isinstance(matches, Mapping) else []
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, Mapping):
+                operator_id = _operator_from_failure_record(dict(row))
+                if operator_id and operator_id not in result:
+                    result.append(operator_id)
+    return result
+
+
+def _recommended_operator_ids(item: Mapping[str, Any]) -> List[str]:
+    return _recommended_next_methods(dict(item))
+
+
+def _operator_cards(operator_ids: Sequence[str], adjacency: Mapping[str, Set[str]]) -> List[Dict[str, str]]:
+    cards: List[Dict[str, str]] = []
+    for operator_id in operator_ids:
+        spec = OPERATOR_SPECS[operator_id]
+        adjacent_difference = "；".join(
+            str(value) for value in (getattr(spec, "adjacent_operator_boundaries", ()) or ())
+        )
+        if not adjacent_difference:
+            adjacent_difference = "与相邻算子的边界由注册表定义。"
+        cards.append(
+            {
+                "operator_id": operator_id,
+                "reasoning_object": _clean_text(getattr(spec, "reasoning_object", "")) or _clean_text(getattr(spec, "ability_axis", "")),
+                "when_to_use": _clean_text(getattr(spec, "goal", "")),
+                "adjacent_difference": adjacent_difference,
+            }
+        )
+    return cards
+
+
+def _evidence_source_text(payload: Mapping[str, Any]) -> str:
+    """Concatenate only sample-input strings, deliberately excluding cards."""
+
+    parts: List[str] = []
+
+    def visit(value: Any, *, include: bool = True) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                visit(child, include=include and key != "operator_cards")
+        elif isinstance(value, list):
+            for child in value:
+                visit(child, include=include)
+        elif include and isinstance(value, str) and value:
+            parts.append(value)
+
+    visit(payload)
+    return "\n".join(parts)
+
+
+def _build_compact_router_input(
+    item: Mapping[str, Any],
+    *,
+    settings: RouterSettings,
+    rule_route: Mapping[str, Any],
+    eligible_ids: Sequence[str],
+    adjacency: Mapping[str, Set[str]],
+) -> Dict[str, Any]:
+    profile = item.get("sample_profile") if isinstance(item.get("sample_profile"), Mapping) else {}
+    diagnosis = item.get("overscore_diagnosis") if isinstance(item.get("overscore_diagnosis"), Mapping) else {}
+    core_diagnosis = {
+        field: diagnosis.get(field)
+        for field in ("is_worth_evolving", "candidate_overscore_cause", "target_failure_mode")
+        if field in diagnosis
+    }
+    return {
+        "sample_id": item.get("sample_id", item.get("index")),
+        "score_rate": get_score_rate(dict(item)),
+        "evolution_action": get_evolution_action(dict(item)),
+        "prompt": _clean_text(item.get("prompt")),
+        "candidate_answer": _candidate_answer_for_router(item),
+        "reference_materials": _normalize_reference_materials(item),
+        "sample_profile": dict(profile),
+        "overscore_diagnosis": core_diagnosis,
+        "routing_mode": settings.routing_mode,
+        "assignment_mode": settings.assignment_mode,
+        "avoid_operator_ids": list(rule_route.get("avoid_operators") or []),
+        "recommended_operator_ids": _recommended_operator_ids(item),
+        "memory_operator_ids": _memory_operator_ids(rule_route.get("memory_matches") or {}),
+        "eligible_operator_ids": list(eligible_ids),
+        "operator_cards": _operator_cards(eligible_ids, adjacency),
+    }
+
+
+def _registry_revision() -> str:
+    return _digest_json(
+        [
+            {
+                "operator_id": operator_id,
+                "generates_question": bool(getattr(spec, "generates_question", True)),
+                "generation_enabled": bool(runtime_policy(operator_id)["generation_enabled"]),
+                "validation_only": bool(runtime_policy(operator_id)["validation_only"]),
+                "qualification_status": _clean_text(runtime_policy(operator_id)["qualification_status"]),
+                "adjacent_operator_boundaries": list(getattr(spec, "adjacent_operator_boundaries", ()) or ()),
+            }
+            for operator_id, spec in OPERATOR_SPECS.items()
+        ]
+    )
+
+
+def _cache_key(compact_input: Mapping[str, Any], settings: RouterSettings) -> str:
+    return _digest_json(
+        {
+            "compact_input": compact_input,
+            "cache_policy": settings.cache_policy(),
+            "registry_revision": _registry_revision(),
+            "memory_snapshot": _digest_json(
+                {
+                    "memory_operator_ids": compact_input.get("memory_operator_ids", []),
+                    "avoid_operator_ids": compact_input.get("avoid_operator_ids", []),
+                    "recommended_operator_ids": compact_input.get("recommended_operator_ids", []),
+                }
+            ),
+        }
+    )
+
+
+def _parsed_response_to_dict(parsed: ParsedRouterResponse) -> Dict[str, Any]:
+    return {
+        "routing_schema_version": parsed.routing_schema_version,
+        "reasoning_objects": parsed.reasoning_objects,
+        "valid_candidates": parsed.valid_candidates,
+        "rejected_candidates": parsed.rejected_candidates,
+        "not_selected_reasons": parsed.not_selected_reasons,
+        "router_comment": parsed.router_comment,
+    }
+
+
+def _parsed_response_from_dict(value: Mapping[str, Any]) -> ParsedRouterResponse:
+    return ParsedRouterResponse(
+        routing_schema_version=_clean_text(value.get("routing_schema_version")),
+        reasoning_objects=list(value.get("reasoning_objects") or []),
+        valid_candidates=list(value.get("valid_candidates") or []),
+        rejected_candidates=list(value.get("rejected_candidates") or []),
+        not_selected_reasons=list(value.get("not_selected_reasons") or []),
+        router_comment=_clean_text(value.get("router_comment")),
+    )
+
+
+def _minimal_operator_filter(
+    operator_ids: Iterable[Any],
+    *,
+    eligible_ids: Sequence[str],
+) -> List[str]:
+    eligible = set(eligible_ids)
+    selected: List[str] = []
+    for raw_operator_id in operator_ids:
+        operator_id = _clean_text(raw_operator_id)
+        if operator_id and operator_id in eligible and operator_id not in selected:
+            selected.append(operator_id)
+    return selected
+
+
+def _base_hybrid_route(
+    rule_route: Mapping[str, Any],
+    *,
+    settings: RouterSettings,
+    eligible_ids: Sequence[str],
+    excluded: Mapping[str, str],
+) -> Dict[str, Any]:
+    route = dict(rule_route)
+    deterministic_fallback_operator_ids = _minimal_operator_filter(
+        [rule_route.get("primary_operator"), *(rule_route.get("backup_operators") or [])],
+        eligible_ids=eligible_ids,
+    )
+    route.update(
+        {
+            "route_revision": ROUTE_REVISION,
+            "routing_mode": settings.routing_mode,
+            "assignment_mode": settings.assignment_mode,
+            "routing_schema_version": ROUTING_SCHEMA_VERSION,
+            "router_prompt_version": ROUTER_PROMPT_VERSION,
+            "router_transport_policy_version": ROUTER_TRANSPORT_POLICY_VERSION,
+            "router_registry_policy_version": ROUTER_REGISTRY_POLICY_VERSION,
+            "router_registry_revision": _registry_revision(),
+            "router_model": settings.model,
+            "router_provider_id": settings.provider_id,
+            "router_timeout_seconds": settings.timeout_seconds,
+            "router_retries": settings.retries,
+            "router_concurrency": settings.concurrency,
+            "eligible_operator_ids": list(eligible_ids),
+            "executable_operator_ids": list(eligible_ids),
+            "excluded_operator_reasons": dict(excluded),
+            "selected_operator_ids": [],
+            "primary_operator": None,
+            "backup_operators": [],
+            "deterministic_fallback_operator_ids": deterministic_fallback_operator_ids,
+            "logical_task_count": 0,
+            "http_attempt_count": 0,
+            "router_cache_hit": False,
+            "router_input_tokens": None,
+            "router_output_tokens": None,
+            "router_elapsed_seconds": 0.0,
+            "router_rejected_candidates": [],
+            "router_fallback_used": False,
+            "router_raw_candidate_count": 0,
+            "router_valid_candidate_count": 0,
+        }
+    )
+    return route
+
+
+def _fallback_route(
+    route: Mapping[str, Any],
+    *,
+    eligible_ids: Sequence[str],
+    error_classification: str,
+    error_detail: str,
+) -> Dict[str, Any]:
+    result = dict(route)
+    candidates = _minimal_operator_filter(
+        route.get("deterministic_fallback_operator_ids")
+        or [route.get("primary_operator"), *(route.get("backup_operators") or [])],
+        eligible_ids=eligible_ids,
+    )
+    result.update(
+        {
+            "route_source": "deterministic_fallback",
+            "router_status": "fallback",
+            "router_error_classification": error_classification,
+            "router_error_detail": error_detail,
+            "router_fallback_used": True,
+            "selected_operator_ids": candidates,
+            "primary_operator": candidates[0] if candidates else None,
+            "backup_operators": candidates[1:],
+        }
+    )
+    if not candidates:
+        result["router_status"] = "excluded"
+        result["router_error_classification"] = "no_eligible_fallback_candidate"
+    return result
+
+
+async def _call_router(
+    client: Any,
+    prompt: str,
+) -> RouterCallResult:
+    result = await client.route(prompt)
+    if not isinstance(result, RouterCallResult):
+        raise TypeError("Router client must return RouterCallResult")
+    return result
+
+
+async def route_records_hybrid_async(
+    records: Sequence[Dict[str, Any]],
+    *,
+    operator_memory: Sequence[Dict[str, Any]] = (),
+    failure_memory: Sequence[Dict[str, Any]] = (),
+    full_score_threshold: float = 0.99,
+    failure_memory_window_rounds: int = FAILURE_MEMORY_WINDOW_ROUNDS,
+    settings: RouterSettings,
+    cache: Optional[RouterCache] = None,
+    client: Optional[Any] = None,
+    trace_store: Optional[TraceStore] = None,
+    close_client: bool = False,
+) -> List[Dict[str, Any]]:
+    """Route all records with LLM success and deterministic-fallback paths."""
+
+    if settings.routing_mode != ROUTING_MODE_HYBRID:
+        raise ValueError("hybrid routing requires routing_mode=hybrid")
+    operator_memory_index = MemoryMatchIndex(operator_memory)
+    failure_memory_index = MemoryMatchIndex(failure_memory)
+    adjacency = _operator_adjacency()
+    cache = cache or RouterCache(None)
+    owned_client = client is None
+    if client is None:
+        client = HybridRouterClient(settings, _configured_router_api_keys())
+    semaphore = asyncio.Semaphore(settings.concurrency)
+    cache_key_locks: Dict[str, asyncio.Lock] = {}
+    prepared: List[Tuple[Any, ...]] = []
+    results: List[Optional[Dict[str, Any]]] = [None] * len(records)
+
+    for index, record in enumerate(records):
+        rule_route = build_operator_route(
+            record,
+            operator_memory=operator_memory,
+            failure_memory=failure_memory,
+            full_score_threshold=full_score_threshold,
+            failure_memory_window_rounds=failure_memory_window_rounds,
+            operator_memory_index=operator_memory_index,
+            failure_memory_index=failure_memory_index,
+        )
+        action = get_evolution_action(record)
+        if action in NON_EVOLUTION_ACTIONS:
+            route = _base_hybrid_route(rule_route, settings=settings, eligible_ids=[], excluded={})
+            route.update({"route_source": "not_requested", "router_status": "not_requested"})
+            updated = dict(record)
+            updated["operator_route"] = route
+            results[index] = updated
+            continue
+        eligible_ids, excluded = eligible_operator_ids(
+            record,
+            avoid_operators=rule_route.get("avoid_operators") or [],
+        )
+        route = _base_hybrid_route(
+            rule_route,
+            settings=settings,
+            eligible_ids=eligible_ids,
+            excluded=excluded,
+        )
+        if not eligible_ids:
+            route.update(
+                {
+                    "route_source": "excluded",
+                    "router_status": "excluded",
+                    "router_error_classification": "no_eligible_operator",
+                }
+            )
+            updated = dict(record)
+            updated["operator_route"] = route
+            results[index] = updated
+            continue
+        compact_input = _build_compact_router_input(
+            record,
+            settings=settings,
+            rule_route=rule_route,
+            eligible_ids=eligible_ids,
+            adjacency=adjacency,
+        )
+        evidence_text = _evidence_source_text(compact_input)
+        prompt = build_router_prompt(record, compact_input=compact_input)
+        prepared.append(
+            (
+                index,
+                dict(record),
+                route,
+                compact_input,
+                eligible_ids,
+                excluded,
+                {operator_id: adjacency.get(operator_id, set()) for operator_id in eligible_ids},
+                evidence_text,
+                prompt,
+                _cache_key(compact_input, settings),
+            )
+        )
+
+    async def run_prepared(
+        entry: Tuple[Any, ...]
+    ) -> None:
+        (
+            index,
+            record,
+            base_route,
+            compact_input,
+            eligible_ids,
+            _excluded,
+            adjacency_for_eligible,
+            evidence_text,
+            prompt,
+            cache_key,
+        ) = entry
+        route = dict(base_route)
+        raw_candidate_count = 0
+        trace_id: Optional[str] = None
+        call_result: Optional[RouterCallResult] = None
+        try:
+            key_lock = cache_key_locks.setdefault(cache_key, asyncio.Lock())
+            async with key_lock:
+                lock = cache.key_lock(cache_key)
+                if lock is not None:
+                    await asyncio.to_thread(lock.acquire)
+                try:
+                    cached = cache.reload_key(cache_key)
+                    if cached is not None:
+                        parsed = _parsed_response_from_dict(cached["parsed_response"])
+                        cache_hit = True
+                        call_result = None
+                        raw_candidate_count = int(cached.get("raw_candidate_count") or len(parsed.valid_candidates))
+                    else:
+                        async with semaphore:
+                            call_result = await asyncio.wait_for(
+                                _call_router(client, prompt),
+                                timeout=settings.timeout_seconds,
+                            )
+                        if trace_store is not None:
+                            trace_id = trace_store.add(
+                                record_key=stable_record_key(record),
+                                raw_text=call_result.raw_response,
+                                trace_kind="router_response",
+                                metadata={"cache_key": cache_key, "provider_id": settings.provider_id},
+                            )
+                        raw_candidate_count = 0
+                        try:
+                            raw_payload = json.loads(call_result.raw_response)
+                            if isinstance(raw_payload, Mapping) and isinstance(raw_payload.get("operator_candidates"), list):
+                                raw_candidate_count = len(raw_payload["operator_candidates"])
+                        except json.JSONDecodeError:
+                            pass
+                        parsed = parse_router_response(
+                            call_result.raw_response,
+                            eligible_operator_ids=eligible_ids,
+                            adjacent_operator_ids=adjacency_for_eligible,
+                            evidence_source_text=evidence_text,
+                        )
+                        cache.put_success(
+                            cache_key,
+                            _parsed_response_to_dict(parsed),
+                            raw_candidate_count=raw_candidate_count,
+                        )
+                        cache_hit = False
+                finally:
+                    if lock is not None:
+                        await asyncio.to_thread(lock.release)
+
+            selected = [
+                candidate["operator_id"]
+                for candidate in parsed.valid_candidates
+                if candidate.get("applicability") in {"applicable", "unknown"}
+            ]
+            route.update(
+                {
+                    "route_source": "llm",
+                    "router_status": "succeeded",
+                    "router_error_classification": None,
+                    "selected_operator_ids": selected,
+                    "primary_operator": selected[0],
+                    "backup_operators": selected[1:],
+                    "router_reasoning_objects": parsed.reasoning_objects,
+                    "router_candidates": parsed.valid_candidates,
+                    "router_rejected_candidates": parsed.rejected_candidates,
+                    "router_not_selected_reasons": parsed.not_selected_reasons,
+                    "router_comment": parsed.router_comment,
+                    "router_fallback_used": False,
+                    "router_cache_hit": cache_hit,
+                    "logical_task_count": 1,
+                    "http_attempt_count": 0 if cache_hit else 1,
+                    "router_raw_candidate_count": raw_candidate_count,
+                    "router_valid_candidate_count": len(parsed.valid_candidates),
+                    "router_input_tokens": call_result.input_tokens if call_result else None,
+                    "router_output_tokens": call_result.output_tokens if call_result else None,
+                    "router_elapsed_seconds": call_result.elapsed_seconds if call_result else 0.0,
+                }
+            )
+            if trace_id:
+                route["router_raw_response_trace_id"] = trace_id
+        except RouterContractError as exc:
+            route = _fallback_route(
+                route,
+                eligible_ids=eligible_ids,
+                error_classification=exc.classification,
+                error_detail=str(exc),
+            )
+            route["logical_task_count"] = 1
+            route["http_attempt_count"] = 1
+            route["router_raw_candidate_count"] = raw_candidate_count
+            route["router_input_tokens"] = call_result.input_tokens if call_result else None
+            route["router_output_tokens"] = call_result.output_tokens if call_result else None
+            route["router_elapsed_seconds"] = call_result.elapsed_seconds if call_result else 0.0
+            if trace_id:
+                route["router_raw_response_trace_id"] = trace_id
+        except asyncio.TimeoutError:
+            route = _fallback_route(
+                route,
+                eligible_ids=eligible_ids,
+                error_classification="timeout",
+                error_detail="router request timed out",
+            )
+            route["logical_task_count"] = 1
+            route["http_attempt_count"] = 1
+            route["router_raw_candidate_count"] = raw_candidate_count
+            route["router_input_tokens"] = call_result.input_tokens if call_result else None
+            route["router_output_tokens"] = call_result.output_tokens if call_result else None
+            route["router_elapsed_seconds"] = call_result.elapsed_seconds if call_result else 0.0
+            if trace_id:
+                route["router_raw_response_trace_id"] = trace_id
+        except Exception as exc:
+            detail = str(exc)
+            classification = "empty_response" if "empty_response" in detail else "network_error"
+            route = _fallback_route(
+                route,
+                eligible_ids=eligible_ids,
+                error_classification=classification,
+                error_detail=detail,
+            )
+            route["logical_task_count"] = 1
+            route["http_attempt_count"] = 1
+            route["router_raw_candidate_count"] = raw_candidate_count
+            route["router_input_tokens"] = call_result.input_tokens if call_result else None
+            route["router_output_tokens"] = call_result.output_tokens if call_result else None
+            route["router_elapsed_seconds"] = call_result.elapsed_seconds if call_result else 0.0
+            if trace_id:
+                route["router_raw_response_trace_id"] = trace_id
+        updated = dict(record)
+        updated["operator_route"] = route
+        results[index] = updated
+
+    try:
+        await asyncio.gather(*(run_prepared(entry) for entry in prepared))
+    finally:
+        if owned_client or close_client:
+            await client.close()
+    return [record for record in results if record is not None]
+
+
 def attach_operator_route(
     item: Dict[str, Any],
     *,
@@ -995,7 +1956,36 @@ def route_records(
     failure_memory: Sequence[Dict[str, Any]] = (),
     full_score_threshold: float = 0.99,
     failure_memory_window_rounds: int = FAILURE_MEMORY_WINDOW_ROUNDS,
+    routing_mode: str = ROUTING_MODE_RULE,
+    assignment_mode: str = ASSIGNMENT_MODE_NATURAL,
+    router_model: Optional[str] = None,
+    router_base_url: Optional[str] = None,
+    router_timeout_seconds: float = DEFAULT_ROUTER_TIMEOUT_SECONDS,
+    router_retries: int = DEFAULT_ROUTER_RETRIES,
+    router_concurrency: int = DEFAULT_ROUTER_CONCURRENCY,
+    router_cache: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
+    settings = RouterSettings.from_values(
+        routing_mode=routing_mode,
+        assignment_mode=assignment_mode,
+        model=router_model,
+        base_url=router_base_url,
+        timeout_seconds=router_timeout_seconds,
+        retries=router_retries,
+        concurrency=router_concurrency,
+    )
+    if settings.routing_mode == ROUTING_MODE_HYBRID:
+        return asyncio.run(
+            route_records_hybrid_async(
+                records,
+                operator_memory=operator_memory,
+                failure_memory=failure_memory,
+                full_score_threshold=full_score_threshold,
+                failure_memory_window_rounds=failure_memory_window_rounds,
+                settings=settings,
+                cache=RouterCache(router_cache),
+            )
+        )
     operator_memory_index = MemoryMatchIndex(operator_memory)
     failure_memory_index = MemoryMatchIndex(failure_memory)
     return [
@@ -1017,12 +2007,32 @@ def build_router_report(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     downrank_count = 0
     avoid_count = 0
     distribution: Counter = Counter()
+    router_statuses: Counter = Counter()
+    router_errors: Counter = Counter()
+    logical_tasks = 0
+    http_attempts = 0
+    cache_hits = 0
+    raw_candidates = 0
+    valid_candidates = 0
+    fallback_count = 0
+    selected_counts: List[int] = []
     for record in records:
         route = record.get("operator_route")
         route = route if isinstance(route, dict) else {}
         warn_count += len(route.get("memory_warnings") or [])
         downrank_count += len(route.get("downrank_operator_surface_forms") or [])
         avoid_count += len(route.get("avoid_operator_surface_forms") or [])
+        router_statuses[_clean_text(route.get("router_status")) or "legacy_rule"] += 1
+        error = _clean_text(route.get("router_error_classification"))
+        if error:
+            router_errors[error] += 1
+        logical_tasks += int(route.get("logical_task_count") or 0)
+        http_attempts += int(route.get("http_attempt_count") or 0)
+        cache_hits += int(bool(route.get("router_cache_hit")))
+        raw_candidates += int(route.get("router_raw_candidate_count") or 0)
+        valid_candidates += int(route.get("router_valid_candidate_count") or 0)
+        fallback_count += int(bool(route.get("router_fallback_used")))
+        selected_counts.append(len(route.get("selected_operator_ids") or []))
         for field in ("memory_warnings", "downrank_operator_surface_forms", "avoid_operator_surface_forms"):
             for action in route.get(field) or []:
                 key = f"{_clean_text(action.get('operator_used'))}+{_clean_text(action.get('surface_form_family'))}+{_clean_text(action.get('failure_type'))}"
@@ -1033,6 +2043,15 @@ def build_router_report(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "failure_memory_downrank_count": downrank_count,
         "failure_memory_avoid_count": avoid_count,
         "operator_surface_form_failure_distribution": dict(sorted(distribution.items())),
+        "router_statuses": dict(sorted(router_statuses.items())),
+        "router_error_classifications": dict(sorted(router_errors.items())),
+        "router_logical_task_count": logical_tasks,
+        "router_http_attempt_count": http_attempts,
+        "router_cache_hit_count": cache_hits,
+        "router_raw_candidate_count": raw_candidates,
+        "router_valid_candidate_count": valid_candidates,
+        "router_fallback_count": fallback_count,
+        "router_selected_candidate_counts": selected_counts,
     }
 
 
@@ -1064,6 +2083,49 @@ def parse_args() -> argparse.Namespace:
         default=FAILURE_MEMORY_WINDOW_ROUNDS,
         help="Recent round window used for operator+surface-form failure memory convergence.",
     )
+    parser.add_argument(
+        "--routing-mode",
+        choices=[ROUTING_MODE_RULE, ROUTING_MODE_HYBRID],
+        default=os.getenv("ROUTING_MODE", ROUTING_MODE_RULE),
+    )
+    parser.add_argument(
+        "--assignment-mode",
+        choices=[ASSIGNMENT_MODE_NATURAL, ASSIGNMENT_MODE_LIVE],
+        default=os.getenv("ASSIGNMENT_MODE", ASSIGNMENT_MODE_NATURAL),
+    )
+    parser.add_argument("--router-model", default=os.getenv("ROUTER_MODEL") or None)
+    parser.add_argument("--router-base-url", default=os.getenv("ROUTER_BASE_URL") or None)
+    parser.add_argument(
+        "--router-api-key",
+        action="append",
+        default=None,
+        help="May be supplied repeatedly; otherwise use Router/GPT provider configuration.",
+    )
+    parser.add_argument(
+        "--router-timeout",
+        type=float,
+        default=float(os.getenv("ROUTER_TIMEOUT", str(DEFAULT_ROUTER_TIMEOUT_SECONDS))),
+    )
+    parser.add_argument(
+        "--router-retries",
+        type=int,
+        default=int(os.getenv("ROUTER_RETRIES", str(DEFAULT_ROUTER_RETRIES))),
+    )
+    parser.add_argument(
+        "--router-concurrency",
+        type=int,
+        default=int(os.getenv("ROUTER_CONCURRENCY", str(DEFAULT_ROUTER_CONCURRENCY))),
+    )
+    parser.add_argument(
+        "--router-cache",
+        default=None,
+        help="Append-only successful-route cache JSONL. Defaults to memory/router_cache.jsonl in hybrid mode.",
+    )
+    parser.add_argument(
+        "--router-trace-output",
+        default=None,
+        help="Compressed raw Router response trace sidecar; defaults beside --output in hybrid mode.",
+    )
     parser.add_argument("--report-output", default=None, help="Optional operator-router memory action report JSON path.")
     parser.add_argument("--performance-events", default=None)
     return parser.parse_args()
@@ -1082,14 +2144,61 @@ def main() -> None:
     failure_memory = load_jsonl_if_exists(failure_memory_path)
     metrics.parse_seconds += time.monotonic() - parse_started
     compute_started = time.monotonic()
-    routed = route_records(
-        records,
-        operator_memory=operator_memory,
-        failure_memory=failure_memory,
-        full_score_threshold=args.full_score_threshold,
-        failure_memory_window_rounds=max(1, args.failure_memory_window_rounds),
+    settings = RouterSettings.from_values(
+        routing_mode=args.routing_mode,
+        assignment_mode=args.assignment_mode,
+        model=args.router_model,
+        base_url=args.router_base_url,
+        timeout_seconds=args.router_timeout,
+        retries=args.router_retries,
+        concurrency=args.router_concurrency,
     )
+    if settings.routing_mode == ROUTING_MODE_HYBRID and settings.assignment_mode != ASSIGNMENT_MODE_LIVE:
+        raise ValueError("hybrid routing requires --assignment-mode live; historical modes must not be silently upgraded")
+    router_cache_path = args.router_cache or (
+        os.path.join(args.memory_dir, "router_cache.jsonl")
+        if settings.routing_mode == ROUTING_MODE_HYBRID
+        else None
+    )
+    router_trace_path = args.router_trace_output or (
+        args.output + ".router_traces.jsonl.gz"
+        if settings.routing_mode == ROUTING_MODE_HYBRID
+        else None
+    )
+    trace_store = (
+        TraceStore(stage, recovery_path=router_trace_path + ".partial")
+        if router_trace_path
+        else None
+    )
+    if settings.routing_mode == ROUTING_MODE_HYBRID:
+        routed = asyncio.run(
+            route_records_hybrid_async(
+                records,
+                operator_memory=operator_memory,
+                failure_memory=failure_memory,
+                full_score_threshold=args.full_score_threshold,
+                failure_memory_window_rounds=max(1, args.failure_memory_window_rounds),
+                settings=settings,
+                cache=RouterCache(router_cache_path),
+                client=HybridRouterClient(settings, _configured_router_api_keys(args.router_api_key)),
+                trace_store=trace_store,
+                close_client=True,
+            )
+        )
+    else:
+        routed = route_records(
+            records,
+            operator_memory=operator_memory,
+            failure_memory=failure_memory,
+            full_score_threshold=args.full_score_threshold,
+            failure_memory_window_rounds=max(1, args.failure_memory_window_rounds),
+        )
     metrics.compute_seconds += time.monotonic() - compute_started
+    sidecars: List[Tuple[str, str, int]] = []
+    if trace_store is not None and router_trace_path is not None:
+        trace_path, trace_count = trace_store.write(router_trace_path)
+        trace_store.finalize_recovery()
+        sidecars.append((trace_path, "router_raw_response_trace", trace_count))
     publish_records(
         routed,
         args.output,
@@ -1110,10 +2219,20 @@ def main() -> None:
             ),
             "full_score_threshold": args.full_score_threshold,
             "failure_memory_window_rounds": max(1, args.failure_memory_window_rounds),
+            "routing_mode": settings.routing_mode,
+            "assignment_mode": settings.assignment_mode,
+            "router_model": settings.model,
+            "router_provider_id": settings.provider_id,
+            "router_timeout_seconds": settings.timeout_seconds,
+            "router_retries": settings.retries,
+            "router_concurrency": settings.concurrency,
+            "router_cache": os.path.abspath(router_cache_path) if router_cache_path else None,
+            "route_revision": ROUTE_REVISION if settings.routing_mode == ROUTING_MODE_HYBRID else None,
         },
         performance_path=args.performance_events,
         code_paths=[__file__],
         metrics=metrics,
+        sidecars=sidecars,
     )
     if args.report_output:
         write_json(build_router_report(routed), args.report_output)

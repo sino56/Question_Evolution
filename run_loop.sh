@@ -60,7 +60,7 @@ NO_INFO_STOP_ROUNDS=${NO_INFO_STOP_ROUNDS:-2}    # 连续多少轮无新信息�
 NO_INFO_MIN_DELTA=${NO_INFO_MIN_DELTA:-0.0001}   # 平均分变化小于该值视为无新信息
 MIN_SCORE_RATE=${MIN_SCORE_RATE:-0.8}            # legacy question_evolution 触发阈值
 NUM_CANDIDATES=${NUM_CANDIDATES:-2}              # 每条待进化样本最多生成候选数，范围 1-4
-SEARCH_MODE=${SEARCH_MODE:-single_branch}         # single_branch | multi_operator_branch | multi_operator_vertical_stack
+SEARCH_MODE=${SEARCH_MODE:-multi_operator_branch} # normal live mode exhausts the frozen Router plan
 SEARCH_BRANCH_WINDOW=${SEARCH_BRANCH_WINDOW:-1}   # 灰度默认 1；验证后可设为 3
 SEARCH_PIPELINE_MODE=${SEARCH_PIPELINE_MODE:-step} # step | stream
 SEARCH_ARTIFACT_RETENTION=${SEARCH_ARTIFACT_RETENTION:-compact} # compact | full
@@ -68,6 +68,11 @@ DEFER_GPT_EXPERIMENTAL_EVALUATION=${DEFER_GPT_EXPERIMENTAL_EVALUATION:-false}
 SEARCH_OPERATOR_SORT_MODE=${SEARCH_OPERATOR_SORT_MODE:-route} # route | yield_per_time
 SEARCH_OPERATOR_EXPLORATION_RATIO=${SEARCH_OPERATOR_EXPLORATION_RATIO:-0.1}
 SEARCH_BOUNDARY_TARGET=${SEARCH_BOUNDARY_TARGET:-5}
+ROUTING_MODE=${ROUTING_MODE:-hybrid}             # hybrid is the normal Router path
+ASSIGNMENT_MODE=${ASSIGNMENT_MODE:-live}         # live freezes and exhausts Router candidates
+ROUTER_CONCURRENCY=${ROUTER_CONCURRENCY:-20}
+ROUTER_TIMEOUT=${ROUTER_TIMEOUT:-60}
+ROUTER_RETRIES=${ROUTER_RETRIES:-0}
 SEARCH_MAX_DEPTH=${SEARCH_MAX_DEPTH:-3}
 SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH=${SEARCH_ALLOW_OPERATOR_REPEAT_IN_PATH:-false}
 SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE=${SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE:-0}
@@ -119,6 +124,8 @@ GPT_ANSWER_API_KEY=${GPT_ANSWER_API_KEY:-$CONFIG_GPT_ANSWER_API_KEY}
 # PROFILE_API_KEYS、EVOLVE_API_KEYS、OPENAI_API_KEYS 或 OPENAI_API_KEY。
 GPT_MODEL=${GPT_MODEL:-$CONFIG_GPT_MODEL}
 OPENAI_BASE_URL=${OPENAI_BASE_URL:-$CONFIG_BASE_URL}
+ROUTER_MODEL=${ROUTER_MODEL:-$GPT_MODEL}
+ROUTER_BASE_URL=${ROUTER_BASE_URL:-${GPT_BASE_URL:-$OPENAI_BASE_URL}}
 PROFILE_MODEL=${PROFILE_MODEL:-$CONFIG_PROFILE_MODEL}
 PROFILE_BASE_URL=${PROFILE_BASE_URL:-$OPENAI_BASE_URL}
 DIFFICULTY_GAIN_MODEL=${DIFFICULTY_GAIN_MODEL:-$CONFIG_DIFFICULTY_GAIN_MODEL}
@@ -517,6 +524,15 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --output "$ROUND_DIR/routed.jsonl" \
                 --memory-dir "$MEMORY_DIR" \
                 --failure-memory-window-rounds "$FAILURE_MEMORY_WINDOW_ROUNDS" \
+                --routing-mode "$ROUTING_MODE" \
+                --assignment-mode "$ASSIGNMENT_MODE" \
+                --router-model "$ROUTER_MODEL" \
+                --router-base-url "$ROUTER_BASE_URL" \
+                --router-concurrency "$ROUTER_CONCURRENCY" \
+                --router-timeout "$ROUTER_TIMEOUT" \
+                --router-retries "$ROUTER_RETRIES" \
+                --router-cache "$EXP_DIR/router_cache.jsonl" \
+                --router-trace-output "$ROUND_DIR/router_traces.jsonl.gz" \
                 --report-output "$ROUND_DIR/operator_router_report.json" \
                 --performance-events "$ROUND_DIR/performance_events.jsonl"
 
@@ -540,6 +556,10 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 SEARCH_EXTRA_ARGS+=(--defer-gpt-experimental-evaluation)
             fi
             if [ "$SEARCH_MODE" = "multi_operator_vertical_stack" ]; then
+                if [ "$ASSIGNMENT_MODE" = "live" ]; then
+                    echo "ASSIGNMENT_MODE=live requires SEARCH_MODE=multi_operator_branch; vertical stack cannot consume a frozen live operator plan." >&2
+                    exit 2
+                fi
                 VERTICAL_EXTRA_ARGS=()
                 if [ "${SEARCH_RULE_ONLY_DIFFICULTY:-false}" = "true" ]; then
                     VERTICAL_EXTRA_ARGS+=(--rule-only-difficulty)
@@ -576,6 +596,7 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                     --artifact-retention "$SEARCH_ARTIFACT_RETENTION" \
                     --operator-sort-mode "$SEARCH_OPERATOR_SORT_MODE" \
                     --exploration-ratio "$SEARCH_OPERATOR_EXPLORATION_RATIO" \
+                    --assignment-mode "$ASSIGNMENT_MODE" \
                     "${SEARCH_EXTRA_ARGS[@]}"
             fi
             PREV_SCORED="$ROUND_DIR/search_state_updated.jsonl"

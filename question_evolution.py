@@ -806,8 +806,14 @@ def resolve_candidate_operator_ids(item: Dict[str, Any], max_candidates: int) ->
         for operator in route.get("avoid_operators", [])
         if isinstance(operator, str) and operator.strip()
     }
+    selected = route.get("selected_operator_ids")
+    if isinstance(selected, list):
+        raw_operator_ids = selected
+    else:
+        raw_operator_ids = [route.get("primary_operator")] + list(route.get("backup_operators", []))
+    live_assignment = str(route.get("assignment_mode") or "").strip().lower() == "live"
     candidates: List[str] = []
-    for operator_id in [route.get("primary_operator")] + list(route.get("backup_operators", [])):
+    for operator_id in raw_operator_ids:
         if not isinstance(operator_id, str):
             continue
         operator_id = operator_id.strip()
@@ -815,7 +821,10 @@ def resolve_candidate_operator_ids(item: Dict[str, Any], max_candidates: int) ->
             continue
         get_operator_spec(operator_id)
         candidates.append(operator_id)
-        if len(candidates) >= max_candidates:
+        # A live hybrid route has already frozen its complete candidate list.
+        # The direct legacy generator remains budgeted, while the branch runner
+        # receives one claimed operator per dispatch and never truncates it.
+        if not live_assignment and len(candidates) >= max_candidates:
             break
 
     if not candidates:

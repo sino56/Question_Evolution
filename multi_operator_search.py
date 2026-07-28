@@ -27,6 +27,8 @@ from branch_artifacts import BranchArtifactStore
 from branch_pipeline import ALL_STAGES, BranchPipeline
 from pipeline_runtime import FairRequestPool, load_json_records, publish_records
 from search_coordinator import (
+    ASSIGNMENT_MODE_LIVE,
+    ASSIGNMENT_MODE_NATURAL,
     _write_jsonl_atomic,
     attach_search_state,
     build_dispatch_records,
@@ -206,6 +208,7 @@ class MultiOperatorSearchRunner:
         operator_sort_mode: str,
         operator_statistics: Optional[Mapping[str, Any]],
         exploration_ratio: float,
+        assignment_mode: str = ASSIGNMENT_MODE_NATURAL,
         max_iterations: int,
         rule_only_difficulty: bool,
         defer_gpt_experimental_evaluation: bool,
@@ -219,6 +222,11 @@ class MultiOperatorSearchRunner:
         self.operator_sort_mode = operator_sort_mode
         self.operator_statistics = operator_statistics
         self.exploration_ratio = exploration_ratio
+        if assignment_mode not in {ASSIGNMENT_MODE_NATURAL, ASSIGNMENT_MODE_LIVE}:
+            raise ValueError("assignment_mode must be natural or live")
+        if assignment_mode == ASSIGNMENT_MODE_LIVE and operator_sort_mode != "route":
+            raise ValueError("live assignment preserves Router rank and requires operator_sort_mode=route")
+        self.assignment_mode = assignment_mode
         self.max_iterations = max_iterations
         self.rule_only_difficulty = rule_only_difficulty
         self.defer_gpt_experimental_evaluation = bool(
@@ -247,6 +255,7 @@ class MultiOperatorSearchRunner:
                     record=record,
                     branch_window=self.branch_window,
                     boundary_target=self.boundary_target,
+                    assignment_mode=self.assignment_mode,
                 )
                 with self._artifact_lock:
                     for artifact in legacy_artifacts:
@@ -260,6 +269,7 @@ class MultiOperatorSearchRunner:
                     operator_sort_mode=self.operator_sort_mode,
                     operator_statistics=self.operator_statistics,
                     exploration_ratio=self.exploration_ratio,
+                    assignment_mode=self.assignment_mode,
                 )
             state_records.append(attach_search_state(record, state))
         return state_records
@@ -1748,6 +1758,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--operator-sort-mode", choices=["route", "yield_per_time"], default="route")
     parser.add_argument("--operator-statistics", default=None)
     parser.add_argument("--exploration-ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--assignment-mode",
+        choices=[ASSIGNMENT_MODE_NATURAL, ASSIGNMENT_MODE_LIVE],
+        default=os.getenv("ASSIGNMENT_MODE", ASSIGNMENT_MODE_NATURAL),
+    )
     parser.add_argument("--max-iterations", type=int, default=1000)
     parser.add_argument("--rule-only-difficulty", action="store_true")
     parser.add_argument(
@@ -1789,6 +1804,7 @@ def main() -> None:
         operator_sort_mode=args.operator_sort_mode,
         operator_statistics=operator_statistics,
         exploration_ratio=args.exploration_ratio,
+        assignment_mode=args.assignment_mode,
         max_iterations=args.max_iterations,
         rule_only_difficulty=args.rule_only_difficulty,
         defer_gpt_experimental_evaluation=args.defer_gpt_experimental_evaluation,
@@ -1821,6 +1837,7 @@ def main() -> None:
             "pipeline_mode": args.pipeline_mode,
             "operator_sort_mode": args.operator_sort_mode,
             "exploration_ratio": args.exploration_ratio,
+            "assignment_mode": args.assignment_mode,
             "max_iterations": args.max_iterations,
             "rule_only_difficulty": args.rule_only_difficulty,
             "defer_gpt_experimental_evaluation": (

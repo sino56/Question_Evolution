@@ -90,6 +90,7 @@ def test_runner_publishes_terminal_no_candidate_state_without_model_calls(tmp_pa
             "pipeline_mode": "step",
             "operator_sort_mode": "route",
             "exploration_ratio": 0.1,
+            "assignment_mode": "natural",
             "max_iterations": 1000,
             "rule_only_difficulty": False,
             "defer_gpt_experimental_evaluation": False,

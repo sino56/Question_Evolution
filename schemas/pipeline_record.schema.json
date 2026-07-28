@@ -102,6 +102,17 @@
         "primary_operator": {
           "type": ["string", "null"]
         },
+        "selected_operator_ids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "routing_mode": {"type": "string"},
+        "assignment_mode": {"enum": ["natural", "live"]},
+        "route_revision": {"type": "string"},
+        "routing_schema_version": {"type": "string"},
+        "route_source": {"type": "string"},
+        "router_status": {"type": "string"},
         "backup_operators": {
           "type": "array",
           "items": {

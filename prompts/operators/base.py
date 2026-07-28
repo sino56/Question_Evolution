@@ -50,11 +50,19 @@ def build_prompt(
     evolution_state: Dict[str, Any],
     operator_route: Dict[str, Any],
 ) -> str:
+    # Router evidence, ranking explanations, raw candidates, cache metadata and
+    # Memory matches are routing-only audit data.  They must never become facts
+    # or hints in the downstream question-generation prompt.
+    route_context = {
+        "routing_mode": str(operator_route.get("routing_mode", "") or ""),
+        "assignment_mode": str(operator_route.get("assignment_mode", "") or ""),
+        "route_source": str(operator_route.get("route_source", "") or ""),
+    }
     input_payload = {
         "sample_profile": sample_profile,
         "overscore_diagnosis": overscore_diagnosis,
         "evolution_state": evolution_state,
-        "operator_route": operator_route,
+        "operator_route_context": route_context,
     }
     content_spec = {
         "reasoning_object": spec.reasoning_object,

@@ -6,10 +6,10 @@ SH_LOOP = (ROOT / "run_loop.sh").read_text(encoding="utf-8")
 PS_LOOP = (ROOT / "run_loop.ps1").read_text(encoding="utf-8")
 
 
-def test_search_window_defaults_to_safe_single_branch_in_both_loops():
-    assert "SEARCH_MODE=${SEARCH_MODE:-single_branch}" in SH_LOOP
+def test_search_window_defaults_to_live_multi_operator_branch_in_both_loops():
+    assert "SEARCH_MODE=${SEARCH_MODE:-multi_operator_branch}" in SH_LOOP
     assert "SEARCH_BRANCH_WINDOW=${SEARCH_BRANCH_WINDOW:-1}" in SH_LOOP
-    assert '$SEARCH_MODE = Get-EnvOrDefault "SEARCH_MODE" "single_branch"' in PS_LOOP
+    assert '$SEARCH_MODE = Get-EnvOrDefault "SEARCH_MODE" "multi_operator_branch"' in PS_LOOP
     assert '$SEARCH_BRANCH_WINDOW = Get-EnvOrDefault "SEARCH_BRANCH_WINDOW" "1"' in PS_LOOP
 
 
@@ -37,6 +37,26 @@ def test_multi_operator_mode_is_wired_to_the_production_search_runner():
     assert '"--artifact-retention", $SEARCH_ARTIFACT_RETENTION' in PS_LOOP
     assert '$searchArgs += "--defer-gpt-experimental-evaluation"' in PS_LOOP
     assert "$env:EVO_CONCURRENCY = [string]$EVO_CONCURRENCY" in PS_LOOP
+
+
+def test_default_entrypoints_use_hybrid_live_router_and_pass_its_transport_settings():
+    assert "ROUTING_MODE=${ROUTING_MODE:-hybrid}" in SH_LOOP
+    assert "ASSIGNMENT_MODE=${ASSIGNMENT_MODE:-live}" in SH_LOOP
+    assert "ROUTER_CONCURRENCY=${ROUTER_CONCURRENCY:-20}" in SH_LOOP
+    assert "ROUTER_TIMEOUT=${ROUTER_TIMEOUT:-60}" in SH_LOOP
+    assert "ROUTER_RETRIES=${ROUTER_RETRIES:-0}" in SH_LOOP
+    assert '--routing-mode "$ROUTING_MODE"' in SH_LOOP
+    assert '--assignment-mode "$ASSIGNMENT_MODE"' in SH_LOOP
+    assert '--router-cache "$EXP_DIR/router_cache.jsonl"' in SH_LOOP
+    assert '--router-trace-output "$ROUND_DIR/router_traces.jsonl.gz"' in SH_LOOP
+    assert '--assignment-mode "$ASSIGNMENT_MODE"' in SH_LOOP
+
+    assert '$ROUTING_MODE = Get-EnvOrDefault "ROUTING_MODE" "hybrid"' in PS_LOOP
+    assert '$ASSIGNMENT_MODE = Get-EnvOrDefault "ASSIGNMENT_MODE" "live"' in PS_LOOP
+    assert '$ROUTER_CONCURRENCY = Get-EnvOrDefault "ROUTER_CONCURRENCY" "20"' in PS_LOOP
+    assert '"--routing-mode" $ROUTING_MODE' in PS_LOOP
+    assert '"--assignment-mode" $ASSIGNMENT_MODE' in PS_LOOP
+    assert '"--router-cache" (Join-Path $EXP_DIR "router_cache.jsonl")' in PS_LOOP
 
 
 def test_vertical_operator_mode_is_wired_with_depth_and_protection_controls():
