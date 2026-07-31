@@ -14,6 +14,10 @@
     "branch_id": {"type": "string", "minLength": 1},
     "parent_node_id": {"type": "string", "minLength": 1},
     "operator_id": {"type": "string", "minLength": 1},
+    "route_integrity_version": {"type": "string"},
+    "route_revision": {"type": "string"},
+    "routing_schema_version": {"type": "string"},
+    "route_fingerprint": {"type": "string", "minLength": 1},
     "branch_status": {
       "enum": [
         "boundary_candidate",

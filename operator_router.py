@@ -12,10 +12,19 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 from local_api_config import get_config_list, get_config_value
 from operator_registry import runtime_policy
-from pipeline_runtime import StageMetrics, TraceStore, load_json_records, publish_records, sha256_file, stable_record_key
+from pipeline_runtime import (
+    StageMetrics,
+    TraceStore,
+    load_json_records,
+    publish_records,
+    sha256_file,
+    stable_record_key,
+    validate_published_artifact,
+)
 from prompts.operators import OPERATOR_SPECS
 from prompts.router_prompt import build_router_prompt
 from router_contract import (
+    ROUTE_REVISION,
     ROUTER_PROMPT_VERSION,
     ROUTER_REGISTRY_POLICY_VERSION,
     ROUTER_TRANSPORT_POLICY_VERSION,
@@ -24,6 +33,7 @@ from router_contract import (
     RouterContractError,
     parse_router_response,
 )
+from route_integrity import attach_live_route_integrity, validate_live_route_integrity
 
 from select_evolution_candidates import (
     EVOLVE_HIGH_SCORE_OVERSCORE,
@@ -1024,9 +1034,6 @@ DEFAULT_ROUTER_TIMEOUT_SECONDS = 60.0
 DEFAULT_ROUTER_CONCURRENCY = 20
 DEFAULT_ROUTER_RETRIES = 0
 ROUTER_TEMPERATURE = 0.0
-ROUTE_REVISION = "hybrid-live-route-v1"
-
-
 def _digest_json(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -1756,7 +1763,7 @@ async def route_records_hybrid_async(
             route = _base_hybrid_route(rule_route, settings=settings, eligible_ids=[], excluded={})
             route.update({"route_source": "not_requested", "router_status": "not_requested"})
             updated = dict(record)
-            updated["operator_route"] = route
+            updated["operator_route"] = attach_live_route_integrity(route)
             results[index] = updated
             continue
         eligible_ids, excluded = eligible_operator_ids(
@@ -1778,7 +1785,7 @@ async def route_records_hybrid_async(
                 }
             )
             updated = dict(record)
-            updated["operator_route"] = route
+            updated["operator_route"] = attach_live_route_integrity(route)
             results[index] = updated
             continue
         compact_input = _build_compact_router_input(
@@ -1952,7 +1959,7 @@ async def route_records_hybrid_async(
             if trace_id:
                 route["router_raw_response_trace_id"] = trace_id
         updated = dict(record)
-        updated["operator_route"] = route
+        updated["operator_route"] = attach_live_route_integrity(route)
         results[index] = updated
 
     try:
@@ -2101,6 +2108,60 @@ def write_json(data: Dict[str, Any], output_path: str) -> None:
         f.write("\n")
 
 
+def _router_manifest_config(
+    *,
+    args: argparse.Namespace,
+    settings: RouterSettings,
+    operator_memory_path: str,
+    failure_memory_path: str,
+    router_cache_path: Optional[str],
+) -> Dict[str, Any]:
+    """Keep router publication and resume validation on one config contract."""
+
+    return {
+        "operator_memory_path": os.path.abspath(operator_memory_path),
+        "failure_memory_path": os.path.abspath(failure_memory_path),
+        "operator_memory_sha256": (
+            sha256_file(operator_memory_path)
+            if os.path.isfile(operator_memory_path)
+            else None
+        ),
+        "failure_memory_sha256": (
+            sha256_file(failure_memory_path)
+            if os.path.isfile(failure_memory_path)
+            else None
+        ),
+        "full_score_threshold": args.full_score_threshold,
+        "failure_memory_window_rounds": max(1, args.failure_memory_window_rounds),
+        "routing_mode": settings.routing_mode,
+        "assignment_mode": settings.assignment_mode,
+        "router_model": settings.model,
+        "router_provider_id": settings.provider_id,
+        "router_timeout_seconds": settings.timeout_seconds,
+        "router_retries": settings.retries,
+        "router_concurrency": settings.concurrency,
+        "router_cache": os.path.abspath(router_cache_path) if router_cache_path else None,
+        "route_revision": ROUTE_REVISION if settings.routing_mode == ROUTING_MODE_HYBRID else None,
+    }
+
+
+def _router_integrity_manifest(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    fingerprints: List[str] = []
+    for record in records:
+        route = record.get("operator_route") if isinstance(record, Mapping) else None
+        if not isinstance(route, Mapping):
+            continue
+        if route.get("routing_mode") == ROUTING_MODE_HYBRID and route.get("assignment_mode") == ASSIGNMENT_MODE_LIVE:
+            validate_live_route_integrity(route)
+            fingerprint = _clean_text(route.get("route_fingerprint"))
+            if fingerprint not in fingerprints:
+                fingerprints.append(fingerprint)
+    return {
+        "route_integrity_version": "live-route-integrity-v1",
+        "live_route_fingerprints": sorted(fingerprints),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Route profiled evolution candidates to question operators.")
     parser.add_argument("--input", required=True, help="Input profiled_candidates JSON/JSONL path.")
@@ -2202,6 +2263,28 @@ def main() -> None:
         if settings.routing_mode == ROUTING_MODE_HYBRID
         else None
     )
+    manifest_config = _router_manifest_config(
+        args=args,
+        settings=settings,
+        operator_memory_path=operator_memory_path,
+        failure_memory_path=failure_memory_path,
+        router_cache_path=router_cache_path,
+    )
+    if os.path.exists(args.output):
+        valid, reason = validate_published_artifact(
+            args.output,
+            stage=stage,
+            input_path=args.input,
+            config=manifest_config,
+        )
+        if valid:
+            if settings.routing_mode == ROUTING_MODE_HYBRID and settings.assignment_mode == ASSIGNMENT_MODE_LIVE:
+                _router_integrity_manifest(load_json_or_jsonl(args.output))
+            return
+        raise ValueError(
+            "existing Router artifact is incompatible or incomplete "
+            f"({reason}); start a new experiment instead of mixing route revisions"
+        )
     trace_store = (
         TraceStore(stage, recovery_path=router_trace_path + ".partial")
         if router_trace_path
@@ -2241,35 +2324,12 @@ def main() -> None:
         args.output,
         stage=stage,
         input_path=args.input,
-        config={
-            "operator_memory_path": os.path.abspath(operator_memory_path),
-            "failure_memory_path": os.path.abspath(failure_memory_path),
-            "operator_memory_sha256": (
-                sha256_file(operator_memory_path)
-                if os.path.isfile(operator_memory_path)
-                else None
-            ),
-            "failure_memory_sha256": (
-                sha256_file(failure_memory_path)
-                if os.path.isfile(failure_memory_path)
-                else None
-            ),
-            "full_score_threshold": args.full_score_threshold,
-            "failure_memory_window_rounds": max(1, args.failure_memory_window_rounds),
-            "routing_mode": settings.routing_mode,
-            "assignment_mode": settings.assignment_mode,
-            "router_model": settings.model,
-            "router_provider_id": settings.provider_id,
-            "router_timeout_seconds": settings.timeout_seconds,
-            "router_retries": settings.retries,
-            "router_concurrency": settings.concurrency,
-            "router_cache": os.path.abspath(router_cache_path) if router_cache_path else None,
-            "route_revision": ROUTE_REVISION if settings.routing_mode == ROUTING_MODE_HYBRID else None,
-        },
+        config=manifest_config,
         performance_path=args.performance_events,
         code_paths=[__file__],
         metrics=metrics,
         sidecars=sidecars,
+        extra_manifest={"route_integrity": _router_integrity_manifest(routed)},
     )
     if args.report_output:
         write_json(build_router_report(routed), args.report_output)

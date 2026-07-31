@@ -25,7 +25,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from branch_artifacts import BranchArtifactStore
 from branch_pipeline import ALL_STAGES, BranchPipeline
-from pipeline_runtime import FairRequestPool, load_json_records, publish_records
+from pipeline_runtime import (
+    FairRequestPool,
+    load_json_records,
+    publish_records,
+    read_manifest,
+    validate_published_artifact,
+)
 from search_coordinator import (
     ASSIGNMENT_MODE_LIVE,
     ASSIGNMENT_MODE_NATURAL,
@@ -38,8 +44,10 @@ from search_coordinator import (
     merge_decision_result,
     recover_in_flight_branches,
     register_generated_prompt,
+    parent_node_id,
     upgrade_search_state_with_artifacts,
 )
+from route_integrity import ROUTE_INTEGRITY_VERSION, validate_live_route_integrity
 
 
 def _env_int(name: str, default: int) -> int:
@@ -83,6 +91,96 @@ def _coerce_rate(value: Any) -> Optional[float]:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _route_integrity_manifest(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Summarize frozen live routes without serializing prompts or evidence."""
+
+    by_parent: Dict[str, Dict[str, str]] = {}
+    for record in records:
+        route = record.get("operator_route") if isinstance(record, Mapping) else None
+        if not isinstance(route, Mapping):
+            continue
+        if route.get("routing_mode") != "hybrid" or route.get("assignment_mode") != "live":
+            continue
+        identity = validate_live_route_integrity(route)
+        parent_id = parent_node_id(record)
+        entry = {
+            "route_fingerprint": _clean(route.get("route_fingerprint")),
+            "route_revision": _clean(identity.get("route_revision")),
+            "routing_schema_version": _clean(identity.get("routing_schema_version")),
+        }
+        existing = by_parent.get(parent_id)
+        if existing is not None and existing != entry:
+            raise ValueError(f"conflicting live routes for parent {parent_id}")
+        by_parent[parent_id] = entry
+    return {
+        "route_integrity_version": ROUTE_INTEGRITY_VERSION,
+        "live_routes": [
+            {"parent_node_id": parent_id, **by_parent[parent_id]}
+            for parent_id in sorted(by_parent)
+        ],
+    }
+
+
+def _live_routes_by_parent(route_manifest: Mapping[str, Any]) -> Dict[str, Dict[str, str]]:
+    if route_manifest.get("route_integrity_version") != ROUTE_INTEGRITY_VERSION:
+        raise ValueError("route integrity manifest version mismatch")
+    rows = route_manifest.get("live_routes")
+    if not isinstance(rows, list):
+        raise ValueError("route integrity manifest is missing live_routes")
+    result: Dict[str, Dict[str, str]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("route integrity manifest has an invalid route entry")
+        parent_id = _clean(row.get("parent_node_id"))
+        values = {
+            "route_fingerprint": _clean(row.get("route_fingerprint")),
+            "route_revision": _clean(row.get("route_revision")),
+            "routing_schema_version": _clean(row.get("routing_schema_version")),
+        }
+        if not parent_id or any(not value for value in values.values()) or parent_id in result:
+            raise ValueError("route integrity manifest has an incomplete route entry")
+        result[parent_id] = values
+    return result
+
+
+def _validate_branch_artifact_routes(
+    artifact_path: Path,
+    route_manifest: Mapping[str, Any],
+) -> None:
+    """Ensure every existing branch artifact belongs to this frozen route set."""
+
+    expected_by_parent = _live_routes_by_parent(route_manifest)
+    if not artifact_path.exists():
+        return
+    for line_number, line in enumerate(artifact_path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            envelope = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid branch artifact {artifact_path}:{line_number}") from exc
+        record = envelope.get("record") if isinstance(envelope, Mapping) else None
+        if not isinstance(record, Mapping):
+            raise ValueError(f"branch artifact {artifact_path}:{line_number} is missing its record")
+        parent_id = _clean(record.get("parent_node_id"))
+        route = record.get("operator_route")
+        if not isinstance(route, Mapping) or route.get("assignment_mode") != "live":
+            continue
+        expected = expected_by_parent.get(parent_id)
+        if expected is None:
+            raise ValueError(f"branch artifact {artifact_path}:{line_number} has an unknown live parent")
+        identity = validate_live_route_integrity(route)
+        actual = {
+            "route_fingerprint": _clean(record.get("route_fingerprint")),
+            "route_revision": _clean(record.get("route_revision")),
+            "routing_schema_version": _clean(record.get("routing_schema_version")),
+        }
+        if actual != expected or actual["route_fingerprint"] != _clean(route.get("route_fingerprint")):
+            raise ValueError(f"branch artifact {artifact_path}:{line_number} route identity mismatch")
+        if actual["route_revision"] != _clean(identity.get("route_revision")):
+            raise ValueError(f"branch artifact {artifact_path}:{line_number} route revision mismatch")
 
 
 def _percentile(values: Sequence[float], percentile: float) -> Optional[float]:
@@ -240,10 +338,70 @@ class MultiOperatorSearchRunner:
         self._artifact_lock = threading.Lock()
         self._artifact_cleanup_errors: List[Dict[str, str]] = []
 
+    def _resume_state_paths(self) -> List[Path]:
+        """Return newest durable scheduler snapshots first.
+
+        Only these atomically-written state files are used for recovery.  A
+        final published output is handled by ``main`` before a runner is
+        created, so an unfinished directory never silently restarts from the
+        newly routed parent records.
+        """
+
+        candidates = [self.work_dir / "stream_search_state.jsonl"]
+        for wave_dir in self.work_dir.glob("wave_*"):
+            candidates.extend(
+                [
+                    wave_dir / "search_state_updated.jsonl",
+                    wave_dir / "search_state_claimed.jsonl",
+                ]
+            )
+        return sorted(
+            (path for path in candidates if path.is_file()),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+
+    def _load_resumable_records(
+        self,
+        records: Sequence[Mapping[str, Any]],
+    ) -> Sequence[Mapping[str, Any]]:
+        expected_by_parent = {parent_node_id(record): record for record in records}
+        if len(expected_by_parent) != len(records):
+            raise ValueError("input contains duplicate parent_node_id values")
+        expected_manifest = _route_integrity_manifest(records)
+
+        for state_path in self._resume_state_paths():
+            persisted = load_json_records(str(state_path), stage="search_resume_state")
+            by_parent: Dict[str, Mapping[str, Any]] = {}
+            for row in persisted:
+                parent_id = _clean(row.get("parent_node_id"))
+                state = row.get("search_state")
+                if not parent_id or not isinstance(state, Mapping) or parent_id in by_parent:
+                    raise ValueError(f"invalid resumable search state: {state_path}")
+                by_parent[parent_id] = row
+            if set(by_parent) != set(expected_by_parent):
+                raise ValueError(
+                    "resumable search state parent set differs from routed input; "
+                    "start a new experiment instead of mixing artifacts"
+                )
+            if _route_integrity_manifest(list(by_parent.values())) != expected_manifest:
+                raise ValueError(
+                    "resumable search state route identity differs from routed input"
+                )
+
+            resumed: List[Dict[str, Any]] = []
+            for parent_id, current in expected_by_parent.items():
+                result = deepcopy(dict(current))
+                result["search_state"] = deepcopy(dict(by_parent[parent_id]["search_state"]))
+                resumed.append(result)
+            return resumed
+        return records
+
     def _initialize_state_records(
         self,
         records: Sequence[Mapping[str, Any]],
     ) -> List[Dict[str, Any]]:
+        records = self._load_resumable_records(records)
         state_records: List[Dict[str, Any]] = []
         for record in records:
             existing_state = record.get("search_state")
@@ -272,6 +430,10 @@ class MultiOperatorSearchRunner:
                     assignment_mode=self.assignment_mode,
                 )
             state_records.append(attach_search_state(record, state))
+        _validate_branch_artifact_routes(
+            self.work_dir / "branch_results.jsonl",
+            _route_integrity_manifest(state_records),
+        )
         return state_records
 
     def _write(self, path: Path, records: Sequence[Mapping[str, Any]]) -> None:
@@ -1782,6 +1944,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _search_manifest_config(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "branch_window": args.branch_window,
+        "boundary_target": args.boundary_target,
+        "pipeline_mode": args.pipeline_mode,
+        "operator_sort_mode": args.operator_sort_mode,
+        "exploration_ratio": args.exploration_ratio,
+        "assignment_mode": args.assignment_mode,
+        "max_iterations": args.max_iterations,
+        "rule_only_difficulty": args.rule_only_difficulty,
+        "defer_gpt_experimental_evaluation": args.defer_gpt_experimental_evaluation,
+        "artifact_retention": args.artifact_retention,
+    }
+
+
 def main() -> None:
     args = parse_args()
     if args.branch_window < 1:
@@ -1795,6 +1972,27 @@ def main() -> None:
             Path(args.operator_statistics).read_text(encoding="utf-8")
         )
     records = load_json_records(args.input, stage="multi_operator_search")
+    route_manifest = _route_integrity_manifest(records)
+    manifest_config = _search_manifest_config(args)
+    output_path = Path(args.output)
+    branch_artifact_path = Path(args.work_dir) / "branch_results.jsonl"
+    if output_path.exists():
+        valid, reason = validate_published_artifact(
+            args.output,
+            stage="multi_operator_search",
+            input_path=args.input,
+            config=manifest_config,
+        )
+        if not valid:
+            raise ValueError(
+                "existing search artifact is incompatible or incomplete "
+                f"({reason}); start a new experiment instead of mixing route revisions"
+            )
+        manifest = read_manifest(args.output) or {}
+        if manifest.get("route_integrity") != route_manifest:
+            raise ValueError("existing search manifest route identity mismatch")
+        _validate_branch_artifact_routes(branch_artifact_path, route_manifest)
+        return
     runner = MultiOperatorSearchRunner(
         project_dir=project_dir,
         work_dir=Path(args.work_dir),
@@ -1815,7 +2013,6 @@ def main() -> None:
         if args.pipeline_mode == "stream"
         else runner.run(records, output_path=Path(args.output))
     )
-    branch_artifact_path = Path(args.work_dir) / "branch_results.jsonl"
     search_summary_path = Path(args.work_dir) / "search_summary.json"
     branch_count = (
         sum(
@@ -1831,20 +2028,7 @@ def main() -> None:
         args.output,
         stage="multi_operator_search",
         input_path=args.input,
-        config={
-            "branch_window": args.branch_window,
-            "boundary_target": args.boundary_target,
-            "pipeline_mode": args.pipeline_mode,
-            "operator_sort_mode": args.operator_sort_mode,
-            "exploration_ratio": args.exploration_ratio,
-            "assignment_mode": args.assignment_mode,
-            "max_iterations": args.max_iterations,
-            "rule_only_difficulty": args.rule_only_difficulty,
-            "defer_gpt_experimental_evaluation": (
-                args.defer_gpt_experimental_evaluation
-            ),
-            "artifact_retention": args.artifact_retention,
-        },
+        config=manifest_config,
         code_paths=[__file__, str(project_dir / "search_coordinator.py")],
         performance_path=str(Path(args.work_dir) / "performance_events.jsonl"),
         sidecars=[
@@ -1855,6 +2039,7 @@ def main() -> None:
             ),
             (str(search_summary_path), "search_performance_summary", 1),
         ],
+        extra_manifest={"route_integrity": route_manifest},
     )
     # Cleanup is deliberately last: step-mode wave files remain available if
     # final publication fails, while successful runs retain only canonical

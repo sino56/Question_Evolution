@@ -18,6 +18,38 @@
     "parent_node_id": {"type": "string", "minLength": 1},
     "assignment_mode": {"enum": ["natural", "live"]},
     "route_revision": {"type": ["string", "null"]},
+    "route_integrity_version": {"type": "string"},
+    "route_fingerprint": {"type": "string", "minLength": 1},
+    "route_identity": {
+      "type": "object",
+      "required": [
+        "route_integrity_version",
+        "routing_mode",
+        "assignment_mode",
+        "route_revision",
+        "routing_schema_version",
+        "selected_operator_ids",
+        "eligible_operator_ids"
+      ],
+      "properties": {
+        "route_integrity_version": {"type": "string"},
+        "routing_mode": {"const": "hybrid"},
+        "assignment_mode": {"const": "live"},
+        "route_revision": {"type": "string", "minLength": 1},
+        "routing_schema_version": {"type": "string", "minLength": 1},
+        "selected_operator_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "eligible_operator_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": true
+    },
     "status": {"enum": ["running", "completed", "partial", "aborted"]},
     "termination_reason": {
       "type": ["string", "null"],

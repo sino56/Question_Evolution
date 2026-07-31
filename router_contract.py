@@ -15,6 +15,7 @@ ROUTING_SCHEMA_VERSION = "hybrid-router-v1"
 ROUTER_PROMPT_VERSION = "hybrid-router-prompt-v1"
 ROUTER_TRANSPORT_POLICY_VERSION = "router-transport-v1"
 ROUTER_REGISTRY_POLICY_VERSION = "eligible-operators-v1"
+ROUTE_REVISION = "hybrid-live-route-v1"
 
 TOP_LEVEL_FIELDS = frozenset(
     {

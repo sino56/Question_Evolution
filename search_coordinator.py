@@ -20,7 +20,15 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from pipeline_runtime import load_json_records, stable_record_key
 from operator_ranking import rank_selected_operators
 from branch_artifacts import split_legacy_search_state
+from operator_registry import runtime_policy
 from prompts.operators import OPERATOR_SPECS
+from route_integrity import (
+    ROUTE_INTEGRITY_VERSION,
+    RouteIntegrityError,
+    live_route_identity,
+    route_fingerprint,
+    validate_live_route_integrity,
+)
 
 
 SEARCH_STATE_VERSION = 1
@@ -168,7 +176,7 @@ def selected_operator_ids(record: Mapping[str, Any], *, forced_coverage: bool = 
     return selected
 
 
-def _validate_live_operator_route(record: Mapping[str, Any]) -> None:
+def _validate_live_operator_route(record: Mapping[str, Any]) -> Dict[str, Any]:
     """Validate the frozen Router-to-search business interface.
 
     The search coordinator intentionally knows no Router evidence or scoring
@@ -179,8 +187,10 @@ def _validate_live_operator_route(record: Mapping[str, Any]) -> None:
     route = record.get("operator_route")
     if not isinstance(route, Mapping):
         raise ValueError("live assignment requires operator_route")
-    if _clean_text(route.get("routing_mode")) != "hybrid":
-        raise ValueError("live assignment requires routing_mode=hybrid")
+    try:
+        identity = validate_live_route_integrity(route)
+    except RouteIntegrityError as exc:
+        raise ValueError(str(exc)) from exc
     selected = route.get("selected_operator_ids")
     if not isinstance(selected, list):
         raise ValueError("live assignment requires operator_route.selected_operator_ids")
@@ -190,6 +200,14 @@ def _validate_live_operator_route(record: Mapping[str, Any]) -> None:
     valid = selected_operator_ids(record)
     if valid != normalized:
         raise ValueError("live selected_operator_ids contain a non-executable or avoided operator")
+    for operator_id in normalized:
+        policy = runtime_policy(operator_id)
+        if (
+            not bool(policy["generation_enabled"])
+            or bool(policy["validation_only"])
+            or _clean_text(policy["qualification_status"]) == "suspended"
+        ):
+            raise ValueError("live selected_operator_ids contain a non-executable or avoided operator")
     if normalized:
         if _clean_text(route.get("primary_operator")) != normalized[0]:
             raise ValueError("live primary_operator must project selected_operator_ids[0]")
@@ -197,6 +215,38 @@ def _validate_live_operator_route(record: Mapping[str, Any]) -> None:
             raise ValueError("live backup_operators must project the remaining selected_operator_ids")
     elif _clean_text(route.get("primary_operator")) or _unique_strings(route.get("backup_operators") or []):
         raise ValueError("empty live selected_operator_ids cannot have compatibility candidates")
+    return identity
+
+
+def _validate_live_search_state_identity(
+    state: Mapping[str, Any],
+    *,
+    route_identity: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Reject a resumed live state whose frozen route is not identical.
+
+    A persisted operator plan is the only resume source.  This guard prevents
+    a new Router result, policy revision, or selected-list mutation from being
+    combined with it in the same experiment directory.
+    """
+
+    persisted = state.get("route_identity")
+    persisted_fingerprint = _clean_text(state.get("route_fingerprint"))
+    if not isinstance(persisted, Mapping) or not persisted_fingerprint:
+        raise ValueError(
+            "live search state is missing route integrity metadata; start a new live experiment instead of upgrading it"
+        )
+    normalized_persisted = dict(persisted)
+    expected_persisted_fingerprint = route_fingerprint(normalized_persisted)
+    if persisted_fingerprint != expected_persisted_fingerprint:
+        raise ValueError("live search state route fingerprint is invalid")
+    if route_identity is not None and normalized_persisted != dict(route_identity):
+        raise ValueError("live search state route identity mismatch; refuse to mix route revisions")
+    state_revision = _clean_text(state.get("route_revision"))
+    identity_revision = _clean_text(normalized_persisted.get("route_revision"))
+    if state_revision != identity_revision:
+        raise ValueError("live search state route revision mismatch")
+    return normalized_persisted
 
 
 def _operator_entry(parent_id: str, operator_id: str) -> Dict[str, Any]:
@@ -322,6 +372,11 @@ def upgrade_search_state(
     if record is not None and route_mode != resolved_assignment:
         raise ValueError("operator route assignment_mode does not match the frozen search state")
 
+    route_identity: Optional[Dict[str, Any]] = None
+    if resolved_assignment == ASSIGNMENT_MODE_LIVE:
+        route_identity = _validate_live_operator_route(record) if record is not None else None
+        _validate_live_search_state_identity(state, route_identity=route_identity)
+
     selected = _unique_strings(state.get("selected_operator_ids") or [])
     if not selected:
         raw_plan = state.get("operator_plan")
@@ -340,6 +395,15 @@ def upgrade_search_state(
     state["search_state_version"] = SEARCH_STATE_VERSION
     state["parent_node_id"] = parent_id
     state["assignment_mode"] = resolved_assignment
+    if resolved_assignment == ASSIGNMENT_MODE_LIVE:
+        # Preserve the frozen identity after the compatibility upgrade above;
+        # no current Router state may replace it during resume.
+        state["route_identity"] = _validate_live_search_state_identity(
+            state,
+            route_identity=route_identity,
+        )
+        state["route_integrity_version"] = ROUTE_INTEGRITY_VERSION
+        state["route_fingerprint"] = route_fingerprint(state["route_identity"])
     state["selected_operator_ids"] = selected
     state["selected_operator_count"] = len(selected)
     state["operator_plan"] = _upgrade_operator_plan(
@@ -441,8 +505,9 @@ def initialize_search_state(
     route_assignment = _route_assignment_mode(record)
     if route_assignment != resolved_assignment:
         raise ValueError("operator route assignment_mode does not match search initialization")
+    route_identity: Optional[Dict[str, Any]] = None
     if resolved_assignment == ASSIGNMENT_MODE_LIVE:
-        _validate_live_operator_route(record)
+        route_identity = _validate_live_operator_route(record)
     selected = selected_operator_ids(record, forced_coverage=forced_coverage)
     if operator_sort_mode not in {"route", "yield_per_time"}:
         raise ValueError(f"unsupported operator_sort_mode: {operator_sort_mode}")
@@ -503,6 +568,10 @@ def initialize_search_state(
         if _clean_text(record.get("prompt"))
         else [],
     }
+    if route_identity is not None:
+        state["route_integrity_version"] = ROUTE_INTEGRITY_VERSION
+        state["route_identity"] = route_identity
+        state["route_fingerprint"] = route_fingerprint(route_identity)
     if not selected:
         state["status"] = "completed"
         state["coverage_status"] = "complete"
@@ -833,6 +902,13 @@ def build_dispatch_records(
         route["backup_operators"] = []
         route["avoid_operators"] = []
         branch_record["operator_route"] = route
+        if updated.get("assignment_mode") == ASSIGNMENT_MODE_LIVE:
+            branch_record["route_integrity_version"] = updated["route_integrity_version"]
+            branch_record["route_revision"] = updated["route_revision"]
+            branch_record["routing_schema_version"] = updated["route_identity"][
+                "routing_schema_version"
+            ]
+            branch_record["route_fingerprint"] = updated["route_fingerprint"]
         branch_record["search_dispatch"] = {
             "branch_window": updated["branch_window"],
             "scheduler_iteration": updated["scheduler_iteration"],
@@ -840,6 +916,10 @@ def build_dispatch_records(
             "sibling_generation_serial": True,
             "resume_from_stage": claim["resume_from_stage"],
         }
+        if updated.get("assignment_mode") == ASSIGNMENT_MODE_LIVE:
+            branch_record["search_dispatch"]["route_fingerprint"] = updated[
+                "route_fingerprint"
+            ]
         records.append(branch_record)
     return updated, records
 

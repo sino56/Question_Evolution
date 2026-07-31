@@ -67,9 +67,11 @@ strong success examples without review.
 ## Multi-Operator Search
 
 - `search_state.schema.json` defines the lightweight scheduler state and
-  explicitly forbids embedded full branch collections.
+  explicitly forbids embedded full branch collections. Live states additionally
+  persist a secret-free route identity and fingerprint for safe resume.
 - `branch_result.schema.json` defines complete append-only branch results,
-  including independent decision and experimental evaluation status.
+  including independent decision and experimental evaluation status; live
+  branches carry the same route fingerprint as their frozen parent plan.
 - `vertical_search_state.schema.json` keeps only recoverable vertical scheduler
   references; full nodes and paths stay in sidecar artifacts.
 - `vertical_node.schema.json`, `vertical_attempt.schema.json`,

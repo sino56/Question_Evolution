@@ -983,6 +983,7 @@ def publish_records(
     code_paths: Sequence[str] = (),
     metrics: Optional[StageMetrics] = None,
     sidecars: Sequence[Tuple[str, str, Optional[int]]] = (),
+    extra_manifest: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Publish a local synchronous stage through the common artifact contract."""
 
@@ -1025,7 +1026,7 @@ def publish_records(
                 kind=sidecar_kind,
                 record_count=sidecar_count,
             )
-        manifest = writer.publish()
+        manifest = writer.publish(extra_manifest=extra_manifest)
     except Exception:
         writer.close()
         append_performance_event(performance_path, metrics.event(status="failed"))

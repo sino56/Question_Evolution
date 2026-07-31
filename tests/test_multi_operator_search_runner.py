@@ -2,6 +2,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -9,12 +11,55 @@ if str(ROOT) not in sys.path:
 
 import multi_operator_search
 from pipeline_runtime import validate_published_artifact
+from route_integrity import attach_live_route_integrity
+from router_contract import ROUTE_REVISION, ROUTING_SCHEMA_VERSION
 from search_coordinator import (
+    ASSIGNMENT_MODE_LIVE,
+    build_dispatch_records,
     initialize_search_state,
     mark_experimental_evaluation_completed,
     mark_experimental_evaluation_finished,
     merge_decision_result,
 )
+
+
+def live_parent():
+    operators = [
+        "O10_evidence_sufficiency_ladder",
+        "O11_unobserved_state_attribution",
+    ]
+    route = attach_live_route_integrity(
+        {
+            "routing_mode": "hybrid",
+            "assignment_mode": "live",
+            "route_revision": ROUTE_REVISION,
+            "routing_schema_version": ROUTING_SCHEMA_VERSION,
+            "router_prompt_version": "hybrid-router-prompt-v1",
+            "router_transport_policy_version": "router-transport-v1",
+            "router_registry_policy_version": "eligible-operators-v1",
+            "router_registry_revision": "test-registry-revision",
+            "router_model": "test-router",
+            "router_provider_id": "test-provider",
+            "router_timeout_seconds": 60.0,
+            "router_retries": 0,
+            "router_concurrency": 20,
+            "route_source": "llm",
+            "router_status": "succeeded",
+            "router_fallback_used": False,
+            "eligible_operator_ids": operators,
+            "selected_operator_ids": operators,
+            "primary_operator": operators[0],
+            "backup_operators": operators[1:],
+            "avoid_operators": [],
+        }
+    )
+    return {
+        "sample_id": "live-artifact-parent",
+        "prompt": "parent",
+        "score_rate": 1.0,
+        "evolution_action": "evolve_high_score_overscore",
+        "operator_route": route,
+    }
 
 
 def make_runner(tmp_path, **overrides):
@@ -100,6 +145,69 @@ def test_runner_publishes_terminal_no_candidate_state_without_model_calls(tmp_pa
     assert valid, reason
     assert (work_dir / "search_summary.json").exists()
     assert list(work_dir.glob("wave_[0-9][0-9][0-9][0-9]")) == []
+
+    # A matching published state is a no-op; a changed scheduler policy must
+    # fail before the runner can issue another branch request in this directory.
+    multi_operator_search.main()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "multi_operator_search.py",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--work-dir",
+            str(work_dir),
+            "--memory-dir",
+            str(tmp_path / "memory"),
+            "--branch-window",
+            "2",
+        ],
+    )
+    with pytest.raises(ValueError, match="incompatible or incomplete"):
+        multi_operator_search.main()
+
+
+def test_live_branch_artifacts_must_match_the_frozen_route_identity(tmp_path):
+    parent = live_parent()
+    manifest = multi_operator_search._route_integrity_manifest([parent])
+    state = initialize_search_state(parent, assignment_mode=ASSIGNMENT_MODE_LIVE)
+    _, branches = build_dispatch_records(parent, state)
+    artifact_path = tmp_path / "branch_results.jsonl"
+    store = multi_operator_search.BranchArtifactStore(artifact_path)
+    store.append(branches[0], "complete_branch")
+
+    multi_operator_search._validate_branch_artifact_routes(artifact_path, manifest)
+
+    tampered = dict(branches[0])
+    tampered["route_fingerprint"] = "tampered"
+    store.append(tampered, "terminal_branch")
+    with pytest.raises(ValueError, match="route identity mismatch"):
+        multi_operator_search._validate_branch_artifact_routes(artifact_path, manifest)
+
+
+def test_runner_recovers_only_a_matching_durable_live_search_state(tmp_path):
+    parent = live_parent()
+    runner = make_runner(tmp_path, assignment_mode=ASSIGNMENT_MODE_LIVE)
+    state = initialize_search_state(parent, assignment_mode=ASSIGNMENT_MODE_LIVE)
+    state["operator_plan"][0]["status"] = "completed"
+    state["status"] = "running"
+    runner.work_dir.mkdir(parents=True, exist_ok=True)
+    runner._write(
+        runner.work_dir / "stream_search_state.jsonl",
+        [{**parent, "parent_node_id": state["parent_node_id"], "search_state": state}],
+    )
+
+    resumed = runner._initialize_state_records([parent])
+    assert resumed[0]["search_state"]["operator_plan"][0]["status"] == "completed"
+    assert resumed[0]["search_state"]["route_fingerprint"] == parent["operator_route"]["route_fingerprint"]
+
+    changed = live_parent()
+    changed["operator_route"]["router_model"] = "different-router"
+    with pytest.raises(ValueError, match="route_fingerprint|route identity"):
+        runner._initialize_state_records([changed])
 
 
 def test_full_and_terminal_branch_artifacts_match_the_declared_schema():

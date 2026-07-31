@@ -11,11 +11,14 @@ if str(ROOT) not in sys.path:
 from question_evolution import resolve_candidate_operator_ids
 from search_coordinator import (
     ASSIGNMENT_MODE_LIVE,
+    build_dispatch_records,
     claim_branches,
     initialize_search_state,
     merge_decision_result,
     upgrade_search_state,
 )
+from route_integrity import attach_live_route_integrity
+from router_contract import ROUTE_REVISION, ROUTING_SCHEMA_VERSION
 
 
 OPERATORS = [
@@ -26,20 +29,35 @@ OPERATORS = [
 
 
 def live_record():
+    route = {
+        "routing_mode": "hybrid",
+        "assignment_mode": "live",
+        "route_revision": ROUTE_REVISION,
+        "routing_schema_version": ROUTING_SCHEMA_VERSION,
+        "router_prompt_version": "hybrid-router-prompt-v1",
+        "router_transport_policy_version": "router-transport-v1",
+        "router_registry_policy_version": "eligible-operators-v1",
+        "router_registry_revision": "test-registry-revision",
+        "router_model": "test-router",
+        "router_provider_id": "test-provider",
+        "router_timeout_seconds": 60.0,
+        "router_retries": 0,
+        "router_concurrency": 20,
+        "route_source": "llm",
+        "router_status": "succeeded",
+        "router_fallback_used": False,
+        "eligible_operator_ids": list(OPERATORS),
+        "selected_operator_ids": list(OPERATORS),
+        "primary_operator": OPERATORS[0],
+        "backup_operators": OPERATORS[1:],
+        "avoid_operators": [],
+    }
     return {
         "sample_id": "live-parent",
         "prompt": "parent prompt",
         "score_rate": 1.0,
         "evolution_action": "evolve_high_score_overscore",
-        "operator_route": {
-            "routing_mode": "hybrid",
-            "assignment_mode": "live",
-            "route_revision": "hybrid-live-route-v1",
-            "selected_operator_ids": list(OPERATORS),
-            "primary_operator": OPERATORS[0],
-            "backup_operators": OPERATORS[1:],
-            "avoid_operators": [],
-        },
+        "operator_route": attach_live_route_integrity(route),
     }
 
 
@@ -71,6 +89,7 @@ def test_live_scheduler_exhausts_frozen_candidates_after_boundary_target():
     assert state["termination_reason"] == "candidate_list_exhausted"
     assert state["status"] == "completed"
     assert state["attempted_selected_operator_ids"] == OPERATORS
+    assert state["route_fingerprint"] == live_record()["operator_route"]["route_fingerprint"]
     assert claim_branches(state)[1] == []
 
 
@@ -91,6 +110,20 @@ def test_legacy_search_state_cannot_be_silently_promoted_to_live():
     }
     with pytest.raises(ValueError, match="start a new live experiment"):
         upgrade_search_state(legacy_state, record=live_record())
+
+
+def test_live_resume_rejects_changed_route_identity_and_dispatch_propagates_it():
+    record = live_record()
+    state = initialize_search_state(record, assignment_mode=ASSIGNMENT_MODE_LIVE)
+    mutated = live_record()
+    mutated["operator_route"]["router_model"] = "other-router"
+    with pytest.raises(ValueError, match="route_fingerprint|route identity"):
+        upgrade_search_state(state, record=mutated)
+
+    updated, dispatched = build_dispatch_records(record, state)
+    assert updated["route_fingerprint"] == record["operator_route"]["route_fingerprint"]
+    assert dispatched[0]["route_fingerprint"] == updated["route_fingerprint"]
+    assert dispatched[0]["search_dispatch"]["route_fingerprint"] == updated["route_fingerprint"]
 
 
 def test_live_direct_generator_does_not_truncate_frozen_operator_list():

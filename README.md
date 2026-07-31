@@ -449,6 +449,12 @@ pip install -r requirements.txt
 export OPENAI_BASE_URL="https://your-openai-compatible-endpoint/v1"
 export OPENAI_API_KEY="..."
 
+# Router 默认复用 GPT/OpenAI provider；可选覆盖项
+export ROUTER_MODEL="${GPT_MODEL}"
+export ROUTER_CONCURRENCY=20
+export ROUTER_TIMEOUT=60
+export ROUTER_RETRIES=0
+
 # 如需拆分配置，可分别设置
 export PROFILE_API_KEYS="..."
 export EVOLVE_API_KEYS="..."
@@ -605,10 +611,18 @@ python select_evolution_candidates.py \
   --high-score-threshold 0.8
 
 # Step 3：算子路由
+# 正常运行固定为 hybrid + live：LLM 的全部合法候选会冻结成分支；
+# timeout、网络或契约失败时才使用确定性规则回退。
 python operator_router.py \
   --input round_1_profiled_candidates.jsonl \
   --output round_1_routed.jsonl \
-  --memory-dir memory
+  --memory-dir memory \
+  --routing-mode hybrid \
+  --assignment-mode live \
+  --router-model "$ROUTER_MODEL" \
+  --router-concurrency 20 \
+  --router-timeout 60 \
+  --router-retries 0
 
 # Step 4：多候选进化，含 validate-retry
 python question_evolution.py \
@@ -900,8 +914,9 @@ python update_sample_state.py --input effect_analysis.jsonl --output state_updat
 
 ## 8. 多算子分支搜索与效率优化
 
-项目现已提供基于同一已评分父题的多算子横向分支搜索。自然搜索只使用当前
-`operator_route` 中冻结的候选算子，不会自动把注册表其余算子追加到计划中。
+项目现已提供基于同一已评分父题的多算子横向分支搜索。默认的 `hybrid + live`
+Router 只使用 LLM 返回并通过最小契约校验的冻结候选；Router 失败或没有合法候选
+时才使用确定性回退。两条路径都不会自动把注册表其余算子追加到计划中。
 同一父节点和算子使用稳定 `branch_id`，窗口按剩余边界名额、当前在途数和剩余候选数
 动态领取。
 
@@ -933,6 +948,10 @@ SEARCH_OPERATOR_SORT_MODE=route         恢复路由既有顺序
 `SEARCH_PIPELINE_MODE=step` 复用按波次的阶段 CLI，`stream` 使用长期存活 worker、
 有界队列和逐分支 checkpoint，并在一个分支完成决策后立即按动态窗口补位。两种模式
 共享稳定分支 ID、状态归并和完整分支产物。
+
+每个 live 路由都会记录 schema、route revision、provider 标识、策略版本和冻结候选的
+无密钥指纹。恢复时，Router 产物、搜索状态、分支产物与 manifest 必须使用同一指纹；
+模型、Memory、运行策略或路由版本变化时请新建实验目录，而不是复用旧目录。
 
 评分支持 `complete`、`decision` 和 `experimental` 三种模式。`decision` 只发布
 Qwen 在线决策检查点；`experimental` 从检查点补齐 GPT 对 Qwen 回答的复评和 GPT

@@ -521,8 +521,11 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --performance-events "$ROUND_DIR/performance_events.jsonl" \
                 "${UNCERTAIN_LOW_PROBE_ARGS[@]}"
 
-        run_if_missing "$ROUND_DIR/routed.jsonl" "operator_router" "$ROUND_DIR/profiled_candidates.jsonl" "[Round $ROUND] Step 3/13: operator_router.py" \
-            python operator_router.py \
+        # Router performs its own exact-config manifest preflight.  The generic
+        # stage helper only verifies the input hash, which is insufficient for
+        # a frozen live route when provider, policy or Memory changes.
+        echo "[Round $ROUND] Step 3/13: operator_router.py"
+        python operator_router.py \
                 --input "$ROUND_DIR/profiled_candidates.jsonl" \
                 --output "$ROUND_DIR/routed.jsonl" \
                 --memory-dir "$MEMORY_DIR" \

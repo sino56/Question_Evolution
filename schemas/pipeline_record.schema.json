@@ -111,6 +111,22 @@
         "assignment_mode": {"enum": ["natural", "live"]},
         "route_revision": {"type": "string"},
         "routing_schema_version": {"type": "string"},
+        "route_integrity_version": {"type": "string"},
+        "route_fingerprint": {"type": "string", "minLength": 1},
+        "eligible_operator_ids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "router_prompt_version": {"type": "string"},
+        "router_transport_policy_version": {"type": "string"},
+        "router_registry_policy_version": {"type": "string"},
+        "router_registry_revision": {"type": "string"},
+        "router_model": {"type": "string"},
+        "router_provider_id": {"type": "string"},
+        "router_timeout_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "router_retries": {"type": "integer", "minimum": 0},
+        "router_concurrency": {"type": "integer", "minimum": 1},
         "route_source": {"type": "string"},
         "router_status": {"type": "string"},
         "backup_operators": {
