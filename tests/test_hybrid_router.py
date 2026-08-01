@@ -3,6 +3,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -62,17 +64,33 @@ def sample():
     }
 
 
-def response(candidates):
+def response(candidates, *, audit=None, reasoning_span="实体甲在第一时段将物品交给实体乙"):
+    if audit is None:
+        audit = {
+            "selected_operator_rationales": [
+                {
+                    "operator_id": item["operator_id"],
+                    "matched_failure_mechanism": "候选答案的目标失败机制与该推理结构直接对应。",
+                    "satisfied_hard_slots": ["题面已给出该结构所需事实。"],
+                    "no_fabricated_facts": True,
+                }
+                for item in candidates
+            ],
+            "not_selected_operator_rationales": [],
+            "uncertain_operator_rationales": [],
+            "operator_improvement_notes": [],
+        }
     return {
         "routing_schema_version": ROUTING_SCHEMA_VERSION,
         "reasoning_objects": [
             {
                 "name": "实体与时段绑定",
-                "evidence_spans": ["实体甲在第一时段将物品交给实体乙"],
+                "evidence_spans": [reasoning_span],
                 "confidence": 0.7,
             }
         ],
         "operator_candidates": candidates,
+        "operator_decision_audit": audit,
         "not_selected_reasons": [],
         "router_comment": "",
     }
@@ -174,6 +192,178 @@ def test_invalid_candidate_does_not_discard_valid_sibling():
     assert route["route_source"] == "llm"
     assert route["selected_operator_ids"] == ["O20_multistage_event_breakpoint"]
     assert route["router_rejected_candidates"][0]["reason"] == "hallucinated_evidence"
+
+
+def test_audit_only_directions_do_not_add_or_reorder_execution_candidates():
+    selected = candidate("O19_multi_entity_role_binding", 1, "O29_entity_identity_conflict_resolution")
+    audit = {
+        "selected_operator_rationales": [
+            {
+                "operator_id": "O19_multi_entity_role_binding",
+                "matched_failure_mechanism": "错误地把角色和定向行为归属给同一实体。",
+                "satisfied_hard_slots": ["竞争实体", "跨节点绑定线索", "定向行为事实"],
+                "no_fabricated_facts": True,
+            }
+        ],
+        "not_selected_operator_rationales": [
+            {
+                "operator_id": "O29_entity_identity_conflict_resolution",
+                "reason": "题面没有排他性身份冲突，当前失败是角色绑定而非同一性裁决。",
+                "nearer_selected_operator_id": "O19_multi_entity_role_binding",
+            }
+        ],
+        "uncertain_operator_rationales": [
+            {
+                "operator_id": "O22_path_topology_reachability",
+                "missing_hard_slots": ["路径图节点", "边通行约束", "端点时间窗"],
+                "would_need_fabricated_facts": "强行构题需要补写路径节点、通行边和时间窗口。",
+            }
+        ],
+        "operator_improvement_notes": [],
+    }
+    client = FakeRouterClient([response([selected], audit=audit)])
+
+    routed = asyncio.run(route_records_hybrid_async([sample()], settings=settings(), client=client))
+
+    route = routed[0]["operator_route"]
+    assert route["selected_operator_ids"] == ["O19_multi_entity_role_binding"]
+    assert route["primary_operator"] == "O19_multi_entity_role_binding"
+    assert route["operator_decision_audit"] == audit
+
+
+def test_well_formed_empty_candidate_list_keeps_audit_and_creates_no_branch():
+    audit = {
+        "selected_operator_rationales": [],
+        "not_selected_operator_rationales": [],
+        "uncertain_operator_rationales": [
+            {
+                "operator_id": "O11_unobserved_state_attribution",
+                "missing_hard_slots": ["预期出口窗口", "路径约束", "候选假设比较"],
+                "would_need_fabricated_facts": "强行构题需要补写盲区端点、路径和候选解释。",
+            }
+        ],
+        "operator_improvement_notes": ["当前算子卡片可进一步区分端点时序与事件链恢复。"],
+    }
+    client = FakeRouterClient([response([], audit=audit)])
+
+    routed = asyncio.run(route_records_hybrid_async([sample()], settings=settings(), client=client))
+
+    route = routed[0]["operator_route"]
+    assert route["route_source"] == "llm"
+    assert route["selected_operator_ids"] == []
+    assert route["primary_operator"] is None
+    assert route["backup_operators"] == []
+    assert route["operator_decision_audit"] == audit
+
+
+@pytest.mark.parametrize(
+    ("prompt", "candidate_answer", "operator_id", "missing_slots"),
+    (
+        (
+            "视频在盲区前后出现同一车辆，但没有入口或出口的具体时间窗口。",
+            "车辆再次出现，因此盲区内必然完成了目标行为。",
+            "O11_unobserved_state_attribution",
+            ["入口与出口时间窗", "路径或速度约束", "候选假设比较"],
+        ),
+        (
+            "多人在同一地点出现，但材料没有跨节点身份线索或定向行为事实。",
+            "多人共同出现，说明每个人都参与了同一行为。",
+            "O19_multi_entity_role_binding",
+            ["竞争实体绑定线索", "节点差异", "定向行为事实"],
+        ),
+        (
+            "材料提到一条可能路线，但没有节点、边、通行限制或端点时间窗。",
+            "既然存在路线，就一定能够在该时间到达终点。",
+            "O22_path_topology_reachability",
+            ["路径节点", "边通行限制", "端点时间窗"],
+        ),
+    ),
+)
+def test_hard_slot_missing_route_decision_fixtures_stay_in_uncertain_audit(
+    prompt,
+    candidate_answer,
+    operator_id,
+    missing_slots,
+):
+    record = sample()
+    record["prompt"] = prompt
+    record["candidate_answer"] = candidate_answer
+    audit = {
+        "selected_operator_rationales": [],
+        "not_selected_operator_rationales": [],
+        "uncertain_operator_rationales": [
+            {
+                "operator_id": operator_id,
+                "missing_hard_slots": missing_slots,
+                "would_need_fabricated_facts": "强行构题需要补写题面尚未提供的关键结构事实。",
+            }
+        ],
+        "operator_improvement_notes": [],
+    }
+    client = FakeRouterClient([response([], audit=audit, reasoning_span=candidate_answer)])
+
+    routed = asyncio.run(route_records_hybrid_async([record], settings=settings(), client=client))
+
+    route = routed[0]["operator_route"]
+    assert route["selected_operator_ids"] == []
+    assert route["operator_decision_audit"]["uncertain_operator_rationales"] == audit["uncertain_operator_rationales"]
+
+
+def test_conclusion_layer_fixture_prefers_o27_over_surface_related_o23_and_o31():
+    record = sample()
+    record["prompt"] = "视频片段提供的是线索支持，题面同时给出事实表述和行动处置各自的条件。"
+    record["candidate_answer"] = "候选答案将视频线索直接写成可执行处置结论。"
+    record["overscore_diagnosis"] = {
+        "is_worth_evolving": True,
+        "candidate_overscore_cause": "证据支持被直接上推为行动结论",
+        "target_failure_mode": "将线索越级写成可执行处置结论",
+    }
+    selected = {
+        "operator_id": "O27_cross_layer_conclusion_calibration",
+        "rank": 1,
+        "applicability": "applicable",
+        "confidence": 0.9,
+        "reasoning_object": "从线索支持到可执行结论的跨层边界",
+        "evidence_spans": ["候选答案将视频线索直接写成可执行处置结论。"],
+        "why_fit": "目标失败是结论层级越界，题面已给出各层条件。",
+        "why_not_adjacent": {
+            "O17_action_vs_fact_threshold": "当前核心不是两套规则对象映射，而是支持效力的跨层传递。"
+        },
+    }
+    audit = {
+        "selected_operator_rationales": [
+            {
+                "operator_id": "O27_cross_layer_conclusion_calibration",
+                "matched_failure_mechanism": "线索支持被越级上推为可执行处置结论。",
+                "satisfied_hard_slots": ["支持材料", "层级规则", "越级结论"],
+                "no_fabricated_facts": True,
+            }
+        ],
+        "not_selected_operator_rationales": [
+            {
+                "operator_id": "O23_observation_reliability_conflict",
+                "reason": "题面没有决定性的观测质量冲突，核心是结论跨层而非可靠性。",
+                "nearer_selected_operator_id": "O27_cross_layer_conclusion_calibration",
+            },
+            {
+                "operator_id": "O31_observation_accumulation_calibration",
+                "reason": "题面没有多次观测的独立性问题，核心不是证据累积校准。",
+                "nearer_selected_operator_id": "O27_cross_layer_conclusion_calibration",
+            },
+        ],
+        "uncertain_operator_rationales": [],
+        "operator_improvement_notes": [],
+    }
+    client = FakeRouterClient([response([selected], audit=audit, reasoning_span=record["candidate_answer"])])
+
+    routed = asyncio.run(route_records_hybrid_async([record], settings=settings(), client=client))
+
+    route = routed[0]["operator_route"]
+    assert route["selected_operator_ids"] == ["O27_cross_layer_conclusion_calibration"]
+    assert {item["operator_id"] for item in route["operator_decision_audit"]["not_selected_operator_rationales"]} == {
+        "O23_observation_reliability_conflict",
+        "O31_observation_accumulation_calibration",
+    }
 
 
 def test_all_invalid_llm_candidates_use_deterministic_fallback():

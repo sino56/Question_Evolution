@@ -11,17 +11,18 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Set
 
 
-ROUTING_SCHEMA_VERSION = "hybrid-router-v1"
-ROUTER_PROMPT_VERSION = "hybrid-router-prompt-v1"
+ROUTING_SCHEMA_VERSION = "hybrid-router-v2"
+ROUTER_PROMPT_VERSION = "hybrid-router-prompt-v2"
 ROUTER_TRANSPORT_POLICY_VERSION = "router-transport-v1"
 ROUTER_REGISTRY_POLICY_VERSION = "eligible-operators-v1"
-ROUTE_REVISION = "hybrid-live-route-v1"
+ROUTE_REVISION = "hybrid-hard-slot-route-v2"
 
 TOP_LEVEL_FIELDS = frozenset(
     {
         "routing_schema_version",
         "reasoning_objects",
         "operator_candidates",
+        "operator_decision_audit",
         "not_selected_reasons",
         "router_comment",
     }
@@ -39,14 +40,42 @@ OPERATOR_CANDIDATE_FIELDS = frozenset(
         "why_not_adjacent",
     }
 )
+OPERATOR_DECISION_AUDIT_FIELDS = frozenset(
+    {
+        "selected_operator_rationales",
+        "not_selected_operator_rationales",
+        "uncertain_operator_rationales",
+        "operator_improvement_notes",
+    }
+)
+SELECTED_OPERATOR_RATIONALE_FIELDS = frozenset(
+    {
+        "operator_id",
+        "matched_failure_mechanism",
+        "satisfied_hard_slots",
+        "no_fabricated_facts",
+    }
+)
+NOT_SELECTED_OPERATOR_RATIONALE_FIELDS = frozenset(
+    {"operator_id", "reason", "nearer_selected_operator_id"}
+)
+UNCERTAIN_OPERATOR_RATIONALE_FIELDS = frozenset(
+    {"operator_id", "missing_hard_slots", "would_need_fabricated_facts"}
+)
 
-APPLICABILITY_VALUES = frozenset({"applicable", "unknown", "not_applicable"})
+# A candidate is an execution request.  Uncertain and not-applicable directions
+# belong exclusively in operator_decision_audit, never in this list.
+APPLICABILITY_VALUES = frozenset({"applicable"})
 MAX_EVIDENCE_SPANS = 2
 MIN_EVIDENCE_SPANS = 1
 MAX_EVIDENCE_SPAN_CHARS = 240
 MAX_REASONING_OBJECT_CHARS = 120
 MAX_EXPLANATION_CHARS = 180
 MAX_NOT_SELECTED_REASONS = 1
+MAX_AUDIT_RATIONALES_PER_GROUP = 12
+MAX_AUDIT_SLOTS_PER_RATIONALE = 8
+MAX_AUDIT_SLOT_CHARS = 120
+MAX_AUDIT_IMPROVEMENT_NOTES = 8
 
 
 class RouterContractError(ValueError):
@@ -63,6 +92,7 @@ class ParsedRouterResponse:
     reasoning_objects: List[Dict[str, Any]]
     valid_candidates: List[Dict[str, Any]]
     rejected_candidates: List[Dict[str, Any]]
+    operator_decision_audit: Dict[str, Any]
     not_selected_reasons: List[str]
     router_comment: str
 
@@ -208,6 +238,179 @@ def _validate_candidate(
     }
 
 
+def _validate_audit_slot_list(value: Any, *, label: str, allow_empty: bool = False) -> List[str]:
+    if not isinstance(value, list) or len(value) > MAX_AUDIT_SLOTS_PER_RATIONALE:
+        raise RouterContractError("schema_error", f"{label} must be an array with at most {MAX_AUDIT_SLOTS_PER_RATIONALE} items")
+    if not allow_empty and not value:
+        raise RouterContractError("schema_error", f"{label} must not be empty")
+    slots = [
+        _validate_text(
+            raw_slot,
+            label=f"{label}[{index}]",
+            maximum=MAX_AUDIT_SLOT_CHARS,
+        )
+        for index, raw_slot in enumerate(value)
+    ]
+    if len(set(slots)) != len(slots):
+        raise RouterContractError("schema_error", f"{label} must not contain duplicate entries")
+    return slots
+
+
+def _validate_audit_operator_id(
+    value: Any,
+    *,
+    label: str,
+    eligible_operator_ids: Set[str],
+) -> str:
+    operator_id = _validate_text(value, label=label, maximum=200)
+    if operator_id not in eligible_operator_ids:
+        raise RouterContractError("ineligible_operator", f"{label} is not eligible: {operator_id}")
+    return operator_id
+
+
+def _validate_operator_decision_audit(
+    value: Any,
+    *,
+    eligible_operator_ids: Set[str],
+) -> Dict[str, Any]:
+    """Validate audit-only route explanations without making them executable."""
+
+    if not isinstance(value, Mapping):
+        raise RouterContractError("schema_error", "operator_decision_audit must be an object")
+    _assert_exact_fields(value, set(OPERATOR_DECISION_AUDIT_FIELDS), "operator_decision_audit")
+
+    groups = (
+        "selected_operator_rationales",
+        "not_selected_operator_rationales",
+        "uncertain_operator_rationales",
+    )
+    for group in groups:
+        if not isinstance(value[group], list) or len(value[group]) > MAX_AUDIT_RATIONALES_PER_GROUP:
+            raise RouterContractError(
+                "schema_error",
+                f"operator_decision_audit.{group} must be an array with at most {MAX_AUDIT_RATIONALES_PER_GROUP} items",
+            )
+    if (
+        not isinstance(value["operator_improvement_notes"], list)
+        or len(value["operator_improvement_notes"]) > MAX_AUDIT_IMPROVEMENT_NOTES
+    ):
+        raise RouterContractError(
+            "schema_error",
+            f"operator_decision_audit.operator_improvement_notes must be an array with at most {MAX_AUDIT_IMPROVEMENT_NOTES} items",
+        )
+
+    selected: List[Dict[str, Any]] = []
+    for index, raw_rationale in enumerate(value["selected_operator_rationales"]):
+        label = f"operator_decision_audit.selected_operator_rationales[{index}]"
+        if not isinstance(raw_rationale, Mapping):
+            raise RouterContractError("schema_error", f"{label} must be an object")
+        _assert_exact_fields(raw_rationale, set(SELECTED_OPERATOR_RATIONALE_FIELDS), label)
+        if raw_rationale["no_fabricated_facts"] is not True:
+            raise RouterContractError("schema_error", f"{label}.no_fabricated_facts must be true")
+        selected.append(
+            {
+                "operator_id": _validate_audit_operator_id(
+                    raw_rationale["operator_id"],
+                    label=f"{label}.operator_id",
+                    eligible_operator_ids=eligible_operator_ids,
+                ),
+                "matched_failure_mechanism": _validate_text(
+                    raw_rationale["matched_failure_mechanism"],
+                    label=f"{label}.matched_failure_mechanism",
+                    maximum=MAX_EXPLANATION_CHARS,
+                ),
+                "satisfied_hard_slots": _validate_audit_slot_list(
+                    raw_rationale["satisfied_hard_slots"],
+                    label=f"{label}.satisfied_hard_slots",
+                ),
+                "no_fabricated_facts": True,
+            }
+        )
+
+    not_selected: List[Dict[str, Any]] = []
+    for index, raw_rationale in enumerate(value["not_selected_operator_rationales"]):
+        label = f"operator_decision_audit.not_selected_operator_rationales[{index}]"
+        if not isinstance(raw_rationale, Mapping):
+            raise RouterContractError("schema_error", f"{label} must be an object")
+        _assert_exact_fields(raw_rationale, set(NOT_SELECTED_OPERATOR_RATIONALE_FIELDS), label)
+        raw_nearer = raw_rationale["nearer_selected_operator_id"]
+        if raw_nearer is not None and not isinstance(raw_nearer, str):
+            raise RouterContractError("schema_error", f"{label}.nearer_selected_operator_id must be a string or null")
+        nearer_selected_operator_id = (
+            _validate_audit_operator_id(
+                raw_nearer,
+                label=f"{label}.nearer_selected_operator_id",
+                eligible_operator_ids=eligible_operator_ids,
+            )
+            if raw_nearer is not None
+            else None
+        )
+        not_selected.append(
+            {
+                "operator_id": _validate_audit_operator_id(
+                    raw_rationale["operator_id"],
+                    label=f"{label}.operator_id",
+                    eligible_operator_ids=eligible_operator_ids,
+                ),
+                "reason": _validate_text(
+                    raw_rationale["reason"],
+                    label=f"{label}.reason",
+                    maximum=MAX_EXPLANATION_CHARS,
+                ),
+                "nearer_selected_operator_id": nearer_selected_operator_id,
+            }
+        )
+
+    uncertain: List[Dict[str, Any]] = []
+    for index, raw_rationale in enumerate(value["uncertain_operator_rationales"]):
+        label = f"operator_decision_audit.uncertain_operator_rationales[{index}]"
+        if not isinstance(raw_rationale, Mapping):
+            raise RouterContractError("schema_error", f"{label} must be an object")
+        _assert_exact_fields(raw_rationale, set(UNCERTAIN_OPERATOR_RATIONALE_FIELDS), label)
+        uncertain.append(
+            {
+                "operator_id": _validate_audit_operator_id(
+                    raw_rationale["operator_id"],
+                    label=f"{label}.operator_id",
+                    eligible_operator_ids=eligible_operator_ids,
+                ),
+                "missing_hard_slots": _validate_audit_slot_list(
+                    raw_rationale["missing_hard_slots"],
+                    label=f"{label}.missing_hard_slots",
+                ),
+                "would_need_fabricated_facts": _validate_text(
+                    raw_rationale["would_need_fabricated_facts"],
+                    label=f"{label}.would_need_fabricated_facts",
+                    maximum=MAX_EXPLANATION_CHARS,
+                ),
+            }
+        )
+
+    all_operator_ids = [
+        *(entry["operator_id"] for entry in selected),
+        *(entry["operator_id"] for entry in not_selected),
+        *(entry["operator_id"] for entry in uncertain),
+    ]
+    if len(set(all_operator_ids)) != len(all_operator_ids):
+        raise RouterContractError(
+            "schema_error",
+            "an operator may appear in only one operator_decision_audit rationale group",
+        )
+    return {
+        "selected_operator_rationales": selected,
+        "not_selected_operator_rationales": not_selected,
+        "uncertain_operator_rationales": uncertain,
+        "operator_improvement_notes": [
+            _validate_text(
+                note,
+                label=f"operator_decision_audit.operator_improvement_notes[{index}]",
+                maximum=MAX_EXPLANATION_CHARS,
+            )
+            for index, note in enumerate(value["operator_improvement_notes"])
+        ],
+    }
+
+
 def parse_router_response(
     raw_response: str,
     *,
@@ -219,8 +422,9 @@ def parse_router_response(
 
     Top-level and reasoning-object contract violations invalidate the response.
     Individual candidate violations are audited and do not discard valid sibling
-    candidates.  The caller uses deterministic fallback only when no selectable
-    candidate remains.
+    candidates.  A syntactically valid empty candidate list is an intentional
+    no-branch decision; deterministic fallback is reserved for a non-empty
+    list whose entries all fail validation or for a top-level contract failure.
     """
 
     try:
@@ -236,6 +440,11 @@ def parse_router_response(
         raise RouterContractError("schema_error", "reasoning_objects must be an array")
     if not isinstance(payload["operator_candidates"], list):
         raise RouterContractError("schema_error", "operator_candidates must be an array")
+    eligible = set(eligible_operator_ids)
+    audit = _validate_operator_decision_audit(
+        payload["operator_decision_audit"],
+        eligible_operator_ids=eligible,
+    )
     if not isinstance(payload["not_selected_reasons"], list):
         raise RouterContractError("schema_error", "not_selected_reasons must be an array")
     if len(payload["not_selected_reasons"]) > MAX_NOT_SELECTED_REASONS:
@@ -260,7 +469,6 @@ def parse_router_response(
         allow_empty=True,
     )
 
-    eligible = set(eligible_operator_ids)
     valid_candidates: List[Dict[str, Any]] = []
     rejected_candidates: List[Dict[str, Any]] = []
     seen_operator_ids: Set[str] = set()
@@ -298,19 +506,59 @@ def parse_router_response(
             continue
         valid_candidates.append(candidate)
 
-    selectable = [
-        candidate
-        for candidate in valid_candidates
-        if candidate["applicability"] in {"applicable", "unknown"}
-    ]
-    if not selectable:
-        raise RouterContractError("no_valid_candidates", "router response contains no selectable valid candidates")
     valid_candidates.sort(key=lambda candidate: (candidate["rank"], candidate["operator_id"]))
+    selected_audits = {
+        entry["operator_id"]: entry
+        for entry in audit["selected_operator_rationales"]
+    }
+    audited_candidates: List[Dict[str, Any]] = []
+    for candidate in valid_candidates:
+        if candidate["operator_id"] not in selected_audits:
+            rejected_candidates.append(
+                {
+                    "operator_id": candidate["operator_id"],
+                    "reason": "missing_selected_operator_rationale",
+                }
+            )
+            continue
+        audited_candidates.append(candidate)
+
+    # A well-formed empty list is an intentional no-branch decision.  A
+    # non-empty list whose entries all violate the contract (including missing
+    # audit bases) remains an error and follows deterministic fallback.
+    if payload["operator_candidates"] and not audited_candidates:
+        raise RouterContractError("no_valid_candidates", "router response contains no selectable valid candidates")
+    if not payload["operator_candidates"] and selected_audits:
+        raise RouterContractError(
+            "schema_error",
+            "selected_operator_rationales must be empty when operator_candidates is empty",
+        )
+
+    valid_candidates = audited_candidates
+    selected_ids = {candidate["operator_id"] for candidate in valid_candidates}
+    audit["selected_operator_rationales"] = [
+        selected_audits[candidate["operator_id"]]
+        for candidate in valid_candidates
+    ]
+    normalized_not_selected: List[Dict[str, Any]] = []
+    for rationale in audit["not_selected_operator_rationales"]:
+        nearer = rationale["nearer_selected_operator_id"]
+        # A malformed sibling must not cause a valid selected candidate to be
+        # discarded.  Preserve the exclusion reason but remove an adjacency
+        # reference whose intended selected sibling was rejected by contract.
+        normalized_not_selected.append(
+            {
+                **rationale,
+                "nearer_selected_operator_id": nearer if nearer in selected_ids else None,
+            }
+        )
+    audit["not_selected_operator_rationales"] = normalized_not_selected
     return ParsedRouterResponse(
         routing_schema_version=ROUTING_SCHEMA_VERSION,
         reasoning_objects=reasoning_objects,
         valid_candidates=valid_candidates,
         rejected_candidates=rejected_candidates,
+        operator_decision_audit=audit,
         not_selected_reasons=not_selected_reasons,
         router_comment=router_comment,
     )
@@ -326,9 +574,12 @@ def prompt_contract_text() -> str:
 routing_schema_version 必须是 {ROUTING_SCHEMA_VERSION}。
 reasoning_objects 的每项字段必须且只能是 {sorted(REASONING_OBJECT_FIELDS)}。
 operator_candidates 的每项字段必须且只能是 {sorted(OPERATOR_CANDIDATE_FIELDS)}。
+operator_decision_audit 的字段必须且只能是 {sorted(OPERATOR_DECISION_AUDIT_FIELDS)}。其中三个 rationale 数组每个最多 {MAX_AUDIT_RATIONALES_PER_GROUP} 项；operator_improvement_notes 最多 {MAX_AUDIT_IMPROVEMENT_NOTES} 项。
+selected_operator_rationales 的每项字段必须且只能是 {sorted(SELECTED_OPERATOR_RATIONALE_FIELDS)}，且 no_fabricated_facts 必须为 true；not_selected_operator_rationales 的每项字段必须且只能是 {sorted(NOT_SELECTED_OPERATOR_RATIONALE_FIELDS)}；uncertain_operator_rationales 的每项字段必须且只能是 {sorted(UNCERTAIN_OPERATOR_RATIONALE_FIELDS)}。
 rank 必须为正整数；applicability 只能为 {sorted(APPLICABILITY_VALUES)}；confidence 必须在 0 到 1 之间。
 每个 evidence_spans 必须有 {MIN_EVIDENCE_SPANS} 至 {MAX_EVIDENCE_SPANS} 条，每条逐字复制自“样本输入”，且最多 {MAX_EVIDENCE_SPAN_CHARS} 个字符；不得从算子卡片取证。
 reasoning_object 最多 {MAX_REASONING_OBJECT_CHARS} 个字符。why_fit、why_not_adjacent 中的说明、router_comment 和 not_selected_reasons 的每项最多 {MAX_EXPLANATION_CHARS} 个字符。
 why_not_adjacent 必须是恰好包含一个相邻算子 ID 到说明文字的对象；只能使用卡片声明的相邻算子。
-not_selected_reasons 默认 []，最多 {MAX_NOT_SELECTED_REASONS} 项。不要输出额外字段、Markdown 或解释文字。
+每个通过候选契约校验的 operator_candidate 都必须有同 operator_id 的 selected_operator_rationale；在最终解析结果中二者按 rank 顺序对应。operator_candidates 可以为空，表示没有算子可在不补造事实的前提下执行。uncertain 或 not_selected 理由绝不能放入 operator_candidates。
+not_selected_reasons 默认 []，最多 {MAX_NOT_SELECTED_REASONS} 项；本轮详细审计只写入 operator_decision_audit。不要输出额外字段、Markdown 或解释文字。
 """.strip()

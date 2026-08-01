@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 from local_api_config import get_config_list, get_config_value
 from operator_registry import runtime_policy
+from operator_routing_cards import routing_card_gate
 from pipeline_runtime import (
     StageMetrics,
     TraceStore,
@@ -1483,21 +1484,26 @@ def _recommended_operator_ids(item: Mapping[str, Any]) -> List[str]:
     return _recommended_next_methods(dict(item))
 
 
-def _operator_cards(operator_ids: Sequence[str], adjacency: Mapping[str, Set[str]]) -> List[Dict[str, str]]:
-    cards: List[Dict[str, str]] = []
+def _operator_cards(operator_ids: Sequence[str], adjacency: Mapping[str, Set[str]]) -> List[Dict[str, Any]]:
+    cards: List[Dict[str, Any]] = []
     for operator_id in operator_ids:
         spec = OPERATOR_SPECS[operator_id]
-        adjacent_difference = "；".join(
-            str(value) for value in (getattr(spec, "adjacent_operator_boundaries", ()) or ())
-        )
-        if not adjacent_difference:
-            adjacent_difference = "与相邻算子的边界由注册表定义。"
+        gate = routing_card_gate(operator_id)
+        adjacent_boundaries = [
+            str(value)
+            for value in (getattr(spec, "adjacent_operator_boundaries", ()) or ())
+            if str(value).strip()
+        ]
+        if not adjacent_boundaries:
+            adjacent_boundaries = ["与相邻算子的边界由注册表定义。"]
         cards.append(
             {
                 "operator_id": operator_id,
                 "reasoning_object": _clean_text(getattr(spec, "reasoning_object", "")) or _clean_text(getattr(spec, "ability_axis", "")),
                 "when_to_use": _clean_text(getattr(spec, "goal", "")),
-                "adjacent_difference": adjacent_difference,
+                "required_slots": gate["required_slots"],
+                "reject_if_missing": gate["reject_if_missing"],
+                "adjacent_boundaries": adjacent_boundaries,
             }
         )
     return cards
@@ -1599,6 +1605,7 @@ def _parsed_response_to_dict(parsed: ParsedRouterResponse) -> Dict[str, Any]:
         "reasoning_objects": parsed.reasoning_objects,
         "valid_candidates": parsed.valid_candidates,
         "rejected_candidates": parsed.rejected_candidates,
+        "operator_decision_audit": parsed.operator_decision_audit,
         "not_selected_reasons": parsed.not_selected_reasons,
         "router_comment": parsed.router_comment,
     }
@@ -1610,6 +1617,12 @@ def _parsed_response_from_dict(value: Mapping[str, Any]) -> ParsedRouterResponse
         reasoning_objects=list(value.get("reasoning_objects") or []),
         valid_candidates=list(value.get("valid_candidates") or []),
         rejected_candidates=list(value.get("rejected_candidates") or []),
+        operator_decision_audit=dict(value.get("operator_decision_audit") or {
+            "selected_operator_rationales": [],
+            "not_selected_operator_rationales": [],
+            "uncertain_operator_rationales": [],
+            "operator_improvement_notes": [],
+        }),
         not_selected_reasons=list(value.get("not_selected_reasons") or []),
         router_comment=_clean_text(value.get("router_comment")),
     )
@@ -1670,6 +1683,12 @@ def _base_hybrid_route(
             "router_output_tokens": None,
             "router_elapsed_seconds": 0.0,
             "router_rejected_candidates": [],
+            "operator_decision_audit": {
+                "selected_operator_rationales": [],
+                "not_selected_operator_rationales": [],
+                "uncertain_operator_rationales": [],
+                "operator_improvement_notes": [],
+            },
             "router_fallback_used": False,
             "router_raw_candidate_count": 0,
             "router_valid_candidate_count": 0,
@@ -1880,22 +1899,22 @@ async def route_records_hybrid_async(
                     if lock is not None:
                         await asyncio.to_thread(lock.release)
 
-            selected = [
-                candidate["operator_id"]
-                for candidate in parsed.valid_candidates
-                if candidate.get("applicability") in {"applicable", "unknown"}
-            ]
+            # The parser guarantees that every valid candidate is a hard-slot
+            # selected candidate.  Audit records remain attached solely for
+            # human review and are deliberately not consulted here.
+            selected = [candidate["operator_id"] for candidate in parsed.valid_candidates]
             route.update(
                 {
                     "route_source": "llm",
                     "router_status": "succeeded",
                     "router_error_classification": None,
                     "selected_operator_ids": selected,
-                    "primary_operator": selected[0],
+                    "primary_operator": selected[0] if selected else None,
                     "backup_operators": selected[1:],
                     "router_reasoning_objects": parsed.reasoning_objects,
                     "router_candidates": parsed.valid_candidates,
                     "router_rejected_candidates": parsed.rejected_candidates,
+                    "operator_decision_audit": parsed.operator_decision_audit,
                     "router_not_selected_reasons": parsed.not_selected_reasons,
                     "router_comment": parsed.router_comment,
                     "router_fallback_used": False,
