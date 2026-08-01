@@ -253,17 +253,12 @@ def validation_quality_score(item: Dict[str, Any]) -> float:
         return 0.0
     score = 0.50
     main_axis_count = int(validation.get("main_axis_count", 1) or 0)
-    prompt_chars = int(validation.get("estimated_prompt_chars", len(_clean_text(item.get("prompt")))) or 0)
     output_tasks = int(validation.get("output_tasks_count", 1) or 0)
     candidate_options = int(validation.get("candidate_options_count", 0) or 0)
     counterfactuals = int(validation.get("counterfactual_count", 0) or 0)
 
     if main_axis_count == 1:
         score += 0.12
-    if 120 <= prompt_chars <= 900:
-        score += 0.10
-    elif prompt_chars <= 1200:
-        score += 0.04
     if output_tasks <= 1:
         score += 0.08
     if candidate_options <= 2:

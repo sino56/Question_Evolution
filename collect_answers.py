@@ -25,6 +25,7 @@ from pipeline_runtime import (
     stable_record_key,
     validate_published_artifact,
 )
+from semantic_budget import answer_generation_context
 
 QA_MODEL = (
     os.getenv("ANSWER_MODEL")
@@ -372,6 +373,13 @@ class AnswerCollector:
             item["answer_extra"] = []
             item["answer_quality_issues"] = []
             return item
+
+        # Answer-side boundary material is deliberately injected only here,
+        # never into the question-surface generator.
+        meta_info = item.get("meta_info", {})
+        metadata = meta_info.get("question_evolution_metadata", {}) if isinstance(meta_info, dict) else {}
+        ledgers = metadata.get("reference_ledgers") if isinstance(metadata, dict) else None
+        question = answer_generation_context(question, ledgers)
 
         # 如果开启了 script_gt_guide，在原问题前拼接 ground truth 指引
         if self.script_gt_guide:

@@ -32,6 +32,50 @@
       "type": "integer",
       "minimum": 0
     },
+    "prompt_char_delta": {
+      "type": ["integer", "null"]
+    },
+    "prompt_char_growth_ratio": {
+      "type": ["number", "null"]
+    },
+    "semantic_economy_mode": {
+      "enum": ["off", "shadow", "enforce"]
+    },
+    "semantic_economy_evaluated": {
+      "type": "boolean"
+    },
+    "semantic_economy_llm_evaluated": {
+      "type": "boolean"
+    },
+    "semantic_economy_llm_status": {
+      "type": "string"
+    },
+    "semantic_economy_risk": {
+      "enum": ["low", "medium", "high", "not_evaluated", "unassessed"]
+    },
+    "semantic_redundancy_dominant": {
+      "type": ["boolean", "null"]
+    },
+    "shared_context_repeated": {
+      "type": ["boolean", "null"]
+    },
+    "answer_hint_expansion": {
+      "type": ["boolean", "null"]
+    },
+    "surface_leak_risk": {
+      "type": ["boolean", "null"]
+    },
+    "surface_leak_type": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "semantic_economy_evidence": {
+      "type": "array",
+      "items": {"type": "object", "additionalProperties": true}
+    },
+    "suggested_same_operator_retry_reason": {
+      "type": ["string", "null"]
+    },
     "external_knowledge_risk": {
       "enum": ["low", "medium", "high"]
     },

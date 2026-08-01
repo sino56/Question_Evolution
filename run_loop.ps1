@@ -500,7 +500,7 @@ for ($round = 1; $round -le $MaxRounds; $round += 1) {
 
     $effectAnalysis = Join-Path $roundDir "effect_analysis.jsonl"
     $stateUpdated = Join-Path $roundDir "state_updated.jsonl"
-    Invoke-Step $effectAnalysis "analyze_evolution_effect" $roundScored "[Round $round] Step 12/13: analyze_evolution_effect.py" { Invoke-Python "analyze_evolution_effect.py" "--before" $previousScored "--input" $roundScored "--output" $effectAnalysis "--matrix-output" (Join-Path $roundDir "effect_matrix.jsonl") "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
+    Invoke-Step $effectAnalysis "analyze_evolution_effect" $roundScored "[Round $round] Step 12/13: analyze_evolution_effect.py" { Invoke-Python "analyze_evolution_effect.py" "--before" $previousScored "--input" $roundScored "--output" $effectAnalysis "--matrix-output" (Join-Path $roundDir "effect_matrix.jsonl") "--semantic-report-output" (Join-Path $roundDir "semantic_economy_report.json") "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
     Invoke-Step $stateUpdated "update_sample_state" $effectAnalysis "[Round $round] Step 13/13: update_sample_state.py" { Invoke-Python "update_sample_state.py" "--input" $effectAnalysis "--output" $stateUpdated "--memory-dir" $MEMORY_DIR "--preselection-invalid-input" (Join-Path $roundDir "invalid_generation_cases.jsonl") "--report-output" (Join-Path $roundDir "state_update_report.json") "--performance-events" (Join-Path $roundDir "performance_events.jsonl") }
 
     $roundOutputForNext = if (Test-PublishedArtifact $stateUpdated "update_sample_state" $effectAnalysis) { $stateUpdated } else { $roundScored }

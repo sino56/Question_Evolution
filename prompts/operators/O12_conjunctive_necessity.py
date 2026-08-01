@@ -85,9 +85,15 @@ SPEC = OperatorPromptSpec(
         "交换场景名称和呈现位置不改变语义答案",
     ),
     hidden_role_balance_controls=(
-        "仅 X、仅 Y、X+Y 场景使用相近长度和句式",
+        "仅 X、仅 Y、X+Y 场景使用相近语义负载和句式",
         "联合场景不独占权威来源、极端词或完整因果链",
     ),
+    semantic_economy=(
+        "将共享场景、主体、时段和目标命题上提为公共题干一次，版本只呈现 X、Y 或其组合的差异事实。",
+        "保留合取关系所需的最小事实，不复述公共背景或给联合版本补充完整解释。",
+        "不得以事实并集、答案总结或明显更丰富的版本提示正确组合。",
+    ),
+    prompt_recipe_version="semantic_economy_normal_v1",
     allowed_answer_shapes=(
         "对自然业务场景作开放式判断并说明事实组合依据",
         "在回答中自行说明两项事实各自作用及组合关系",

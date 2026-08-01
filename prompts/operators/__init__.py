@@ -48,6 +48,7 @@ def build_operator_prompt(
     overscore_diagnosis: Dict[str, Any],
     evolution_state: Dict[str, Any],
     operator_route: Dict[str, Any],
+    generator_visible_context: Dict[str, Any] | None = None,
 ) -> str:
     return build_prompt(
         get_operator_spec(operator_id),
@@ -59,4 +60,5 @@ def build_operator_prompt(
         overscore_diagnosis=overscore_diagnosis,
         evolution_state=evolution_state,
         operator_route=operator_route,
+        generator_visible_context=generator_visible_context,
     )

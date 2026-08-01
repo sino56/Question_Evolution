@@ -284,7 +284,7 @@ def test_dynamic_candidate_budget_allocates_more_to_priority_samples():
     assert sum(counts.values()) <= 8
 
 
-def test_validation_rejects_overlong_duplicate_multitask_and_accepts_clean_candidate():
+def test_validation_records_overlong_prompt_but_rejects_duplicate_and_multitask_candidates():
     clean = make_candidate(
         "stage04-valid",
         "cand_1",
@@ -306,8 +306,9 @@ def test_validation_rejects_overlong_duplicate_multitask_and_accepts_clean_candi
     assert clean_result["passed"] is True
     assert duplicate_result["passed"] is False
     assert "完全相同" in duplicate_result["reject_reason"]
-    assert overlong_result["passed"] is False
-    assert "题长" in overlong_result["reject_reason"]
+    assert overlong_result["passed"] is True
+    assert overlong_result["estimated_prompt_chars"] > 1200
+    assert overlong_result["prompt_char_delta"] > 0
     assert multitask_result["passed"] is False
     assert "输出任务数" in multitask_result["reject_reason"] or "格式复杂度" in multitask_result["reject_reason"]
 
@@ -417,8 +418,8 @@ def test_formal_validation_reuses_generation_result_only_for_same_rule_version()
     assert reused["local_validation_rule_version"] == local_validation_rule_version()
 
     recomputed = attach_validation_result(item, max_prompt_chars=10)["validation_result"]
-    assert recomputed["local_validation_reused"] is False
-    assert recomputed["local_validation_rule_version"] != cached["local_validation_rule_version"]
+    assert recomputed["local_validation_reused"] is True
+    assert recomputed["local_validation_rule_version"] == cached["local_validation_rule_version"]
 
 
 if __name__ == "__main__":

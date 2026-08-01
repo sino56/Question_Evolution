@@ -22,6 +22,8 @@ def test_operator_prompt_spec_contract_covers_content_definition_template():
         "required_question_shape",
         "avoid",
         "default_evaluation_focus",
+        "semantic_economy",
+        "prompt_recipe_version",
         "reasoning_object",
         "content_transformation",
         "invariants",
@@ -134,6 +136,7 @@ def test_every_generating_operator_has_complete_content_controls():
         "hidden_role_balance_controls",
         "allowed_answer_shapes",
         "forbidden_answer_shapes",
+        "semantic_economy",
     )
     generating_specs = [spec for spec in OPERATOR_SPECS.values() if spec.generates_question]
     assert {spec.operator_id for spec in generating_specs} == (
@@ -158,9 +161,12 @@ def test_prompt_keeps_content_controls_internal_and_preserves_open_reasoning():
         evolution_state={},
         operator_route={"primary_operator": "O16_close_alternative_normalization"},
     )
-    assert "内部内容规格（只用于构造题目" in rendered
-    assert "不得把字段名、角色名、控制说明或预期方向复制到题面" in rendered
-    assert "required_reasoning_tasks 由回答者自行完成" in rendered
+    assert "题面构造契约（仅用于构造" in rendered
+    assert "不得把字段名、控制说明或预期方向复制到题面" in rendered
+    assert '"semantic_economy"' in rendered
+    assert '"required_reasoning_tasks"' not in rendered
+    assert "应基于全部观察控制结论边界" not in rendered
+    assert "替代解释出现，因此没有异常" not in rendered
     assert "只提出一个自然业务判断和开放式依据要求" in rendered
     assert "适用性门控、资格状态和发布校验不属于本内容 Prompt" in rendered
 

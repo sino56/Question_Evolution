@@ -28,6 +28,7 @@ from pipeline_runtime import (
     stable_record_key,
     validate_published_artifact,
 )
+from semantic_budget import build_reference_ledgers, generator_visible_context
 import validate_evolved_question as validation_stage
 
 
@@ -45,6 +46,7 @@ EVOLVE_BASE_URL = (
 REQUEST_TIMEOUT_SECONDS = 180.0
 MAX_OUTPUT_TOKENS = 32768
 DEFAULT_MAX_VALIDATION_RETRIES = 1
+DEFAULT_MAX_SEMANTIC_RETRY_ATTEMPTS = 2
 EVOLUTION_REQUIRED_ACTIONS = {
     EVOLVE_HIGH_SCORE_OVERSCORE,
     RECONSTRUCT_LOW_SCORE_BOUNDARY,
@@ -84,10 +86,22 @@ def parse_api_keys(cli_keys: Optional[List[str]] = None) -> List[str]:
     )
 
 
-def append_validation_retry_instruction(user_prompt: str, reject_reason: Optional[str]) -> str:
+def append_validation_retry_instruction(
+    user_prompt: str,
+    reject_reason: Optional[str],
+    semantic_retry_payload: Optional[Dict[str, Any]] = None,
+) -> str:
     reason = str(reject_reason or "").strip()
-    if not reason:
+    if not reason and not semantic_retry_payload:
         return user_prompt
+    if isinstance(semantic_retry_payload, dict):
+        return (
+            user_prompt.rstrip()
+            + "\n\n# 同一 operator 的语义经济重试反馈\n"
+            + "仅修正以下结构化反馈；不得改变 operator，不得恢复答案边界、评分意图或标准答案到题面生成上下文。\n"
+            + json.dumps(semantic_retry_payload, ensure_ascii=False, indent=2)
+            + "\n请保留 must_keep 中的可观察事实、竞争结构和必要规则，只删除或重写失败片段。\n"
+        )
     return (
         user_prompt.rstrip()
         + "\n\n# 上一轮候选题未通过独立复杂度/可回答性校验\n"
@@ -95,6 +109,52 @@ def append_validation_retry_instruction(user_prompt: str, reject_reason: Optiona
         + "请继续使用同一个 operator，不要更换题型主轴；只修正上述问题后重新生成。"
         + "新题必须可回答、单主轴、不过度依赖格式复杂度，也不得引入题干外知识。\n"
     )
+
+
+def build_semantic_retry_payload(
+    item: Dict[str, Any],
+    validation_result: Dict[str, Any],
+    *,
+    operator_id: str,
+    retry_attempt: int,
+    max_semantic_retry_attempts: int,
+    failure_reasons: List[str],
+) -> Dict[str, Any]:
+    """Return feedback safe to show to the question generator on retry."""
+
+    context = build_generator_context(item)["generator_visible_context"]
+    evidence = validation_result.get("semantic_economy_evidence")
+    evidence = evidence if isinstance(evidence, list) else []
+    evidence_spans = [
+        str(entry.get("text", "")).strip()
+        for entry in evidence
+        if isinstance(entry, dict) and str(entry.get("text", "")).strip()
+    ]
+    must_keep = context.get("observable_fact_ledger", [])
+    must_not_include = list(dict.fromkeys([
+        *evidence_spans,
+        "结论边界",
+        "最高支持",
+        "不能直接推出",
+        "仅凭现有材料",
+        "评分维度",
+        "预期错误",
+    ]))
+    return {
+        "operator_id": operator_id,
+        "retry_attempt": retry_attempt,
+        "max_semantic_retry_attempts": max_semantic_retry_attempts,
+        "failed_validation_types": list(validation_result.get("semantic_economy_failure_types") or []),
+        "failure_reasons": list(dict.fromkeys(reason for reason in failure_reasons if reason)),
+        "evidence_spans": evidence_spans,
+        "suggested_same_operator_retry_reason": str(
+            validation_result.get("suggested_same_operator_retry_reason")
+            or "删除无职责内容并保留事实冲突和竞争结构。"
+        ),
+        "must_keep": must_keep,
+        "must_not_include": must_not_include,
+        "generator_visible_context": context,
+    }
 
 #########################################################
 '''
@@ -999,16 +1059,41 @@ def get_candidate_answer(item: Dict[str, Any]) -> str:
     raise ValueError("缺少有效 scoring_result.candidate_answer")
 
 
+def build_generator_context(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Split source material while exposing only facts to question generation."""
+
+    prompt = str(item.get("prompt", "") or "").strip()
+    ledgers = build_reference_ledgers(
+        original_prompt=prompt,
+        reference_answer=get_reference_answer(item),
+        rubric=item.get("rubric"),
+    )
+    return {
+        "reference_ledgers": ledgers,
+        "generator_visible_context": generator_visible_context(
+            original_prompt=prompt,
+            ledgers=ledgers,
+        ),
+    }
+
+
 def build_evolution_prompt(
     item: Dict[str, Any],
     prompt_version: str = "v1",
     operator_id: Optional[str] = None,
     validation_reject_reason: Optional[str] = None,
+    generation_context: Optional[Dict[str, Any]] = None,
+    semantic_retry_payload: Optional[Dict[str, Any]] = None,
 ) -> str:
     prompt = item.get("prompt")
     rubric = item.get("rubric")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("缺少有效 prompt")
+
+    context = generation_context if isinstance(generation_context, dict) else build_generator_context(item)
+    visible_context = context.get("generator_visible_context")
+    if not isinstance(visible_context, dict):
+        visible_context = {}
 
     if operator_id:
         user_prompt = build_operator_prompt(
@@ -1021,19 +1106,32 @@ def build_evolution_prompt(
             overscore_diagnosis=get_overscore_diagnosis(item),
             evolution_state=get_evolution_state(item),
             operator_route=get_operator_route(item),
+            generator_visible_context=visible_context,
         )
-        return append_validation_retry_instruction(user_prompt, validation_reject_reason)
+        return append_validation_retry_instruction(
+            user_prompt,
+            validation_reject_reason,
+            semantic_retry_payload,
+        )
 
-    replacements = {
-        "{|prompt|}": prompt.strip(),
-        "{|rubrics|}": json.dumps(rubric if isinstance(rubric, list) else [], ensure_ascii=False, indent=2),
-        "{|response1|}": get_reference_answer(item),
-        "{|response2|}": get_candidate_answer(item),
-    }
-    user_prompt = get_evolution_prompt_template(prompt_version)
-    for placeholder, value in replacements.items():
-        user_prompt = user_prompt.replace(placeholder, value)
-    return append_validation_retry_instruction(user_prompt, validation_reject_reason)
+    # Legacy records use the same surface-safe material.  Reference answers,
+    # candidate answers and rubrics remain answer-side data only.
+    user_prompt = (
+        "你是一位 question evolution 题目生成专家。只生成一道完整、可独立作答的新题。\n"
+        "题面以最小语义闭包组织：每个句段必须承担共享背景、可观察事实、决定性关系、竞争关系或自然提问；"
+        "共享背景只出现一次，不按字数、倍数或格式制造难度。\n"
+        "题面只能使用下面的原题和可观察事实。不得呈现答案边界、评分意图、内部推理任务、预期错误、"
+        "完整推理链或“不能直接推出/最高支持/结论边界”等答案方向提示。\n\n"
+        "# 题面生成可见上下文\n"
+        + json.dumps(visible_context, ensure_ascii=False, indent=2)
+        + "\n\n只返回合法 JSON：{\"evolved_prompt\":\"...\",\"evolution_strategy\":\"...\","
+        "\"balanced_semantic_load\":\"...\",\"notes_for_reference\":\"...\"}"
+    )
+    return append_validation_retry_instruction(
+        user_prompt,
+        validation_reject_reason,
+        semantic_retry_payload,
+    )
 
 
 def build_validation_probe_record(item: Dict[str, Any], evolved: Dict[str, Any]) -> Dict[str, Any]:
@@ -1063,6 +1161,11 @@ def build_validation_probe_record(item: Dict[str, Any], evolved: Dict[str, Any])
     operator_used = evolved.get("operator_used")
     if isinstance(operator_used, str) and operator_used.strip():
         metadata["operator_used"] = operator_used.strip()
+
+    for field in ("reference_ledgers", "generator_visible_context"):
+        value = evolved.get(field)
+        if isinstance(value, dict):
+            metadata[field] = value
 
     meta_info["question_evolution_metadata"] = metadata
     result["meta_info"] = meta_info
@@ -1096,6 +1199,7 @@ def enrich_evolution_result_with_operator(
     enriched = dict(evolved)
     enriched["operator_used"] = operator_id
     enriched["ability_axis"] = spec.ability_axis
+    enriched["prompt_recipe_version"] = spec.prompt_recipe_version
     if enriched.get("not_applicable") is True:
         return enriched
 
@@ -1172,6 +1276,7 @@ def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rat
         "target_subclaim",
         "boundary_hypothesis",
         "expected_qwen_failure",
+        "prompt_recipe_version",
     ):
         value = evolved.get(field)
         if isinstance(value, str) and value.strip():
@@ -1181,9 +1286,19 @@ def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rat
     if isinstance(complexity_budget, dict):
         metadata["complexity_budget"] = complexity_budget
 
+    for field in ("reference_ledgers", "generator_visible_context", "balanced_semantic_load"):
+        value = evolved.get(field)
+        if isinstance(value, (dict, list)) or (isinstance(value, str) and value.strip()):
+            metadata[field] = value
+
     validation_retry = evolved.get("validation_retry")
     if isinstance(validation_retry, dict):
         metadata["validation_retry"] = validation_retry
+
+    for field in ("retry_exhausted", "retry_attempts", "final_failure_reasons", "semantic_retry_payload"):
+        value = evolved.get(field)
+        if isinstance(value, (bool, int, list, dict)):
+            metadata[field] = value
 
     local_validation_result = evolved.get("_local_validation_result")
     if isinstance(local_validation_result, dict):
@@ -1278,6 +1393,7 @@ class QuestionEvolutionProcessor:
         prompt_version: str = "v1",
         num_candidates: int = 1,
         max_validation_retries: int = DEFAULT_MAX_VALIDATION_RETRIES,
+        max_semantic_retry_attempts: int = DEFAULT_MAX_SEMANTIC_RETRY_ATTEMPTS,
         max_candidate_budget: int = 0,
     ):
         self.client = client
@@ -1289,6 +1405,7 @@ class QuestionEvolutionProcessor:
         self.prompt_version = prompt_version
         self.num_candidates = num_candidates
         self.max_validation_retries = max(0, max_validation_retries)
+        self.max_semantic_retry_attempts = max(0, max_semantic_retry_attempts)
         self.max_candidate_budget = max_candidate_budget
 
     async def evolve_once(
@@ -1296,16 +1413,20 @@ class QuestionEvolutionProcessor:
         item: Dict[str, Any],
         operator_id: Optional[str] = None,
         validation_reject_reason: Optional[str] = None,
+        semantic_retry_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if operator_id:
             get_operator_spec(operator_id)
         elif uses_stage_action_contract(item):
             operator_id = resolve_operator_id(item)
+        generation_context = build_generator_context(item)
         user_prompt = build_evolution_prompt(
             item,
             self.prompt_version,
             operator_id=operator_id,
             validation_reject_reason=validation_reject_reason,
+            generation_context=generation_context,
+            semantic_retry_payload=semantic_retry_payload,
         )
         response = await self.client.chat_completions_create(
             model=self.model,
@@ -1319,6 +1440,8 @@ class QuestionEvolutionProcessor:
         evolved = parse_evolution_response(content)
         if operator_id:
             evolved = enrich_evolution_result_with_operator(evolved, item, operator_id)
+        evolved["reference_ledgers"] = generation_context["reference_ledgers"]
+        evolved["generator_visible_context"] = generation_context["generator_visible_context"]
         evolved["question_evolution_raw_response"] = content
         return evolved
 
@@ -1327,6 +1450,7 @@ class QuestionEvolutionProcessor:
         item: Dict[str, Any],
         operator_id: Optional[str],
         validation_reject_reason: Optional[str],
+        semantic_retry_payload: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         for attempt in range(self.max_retries + 1):
             try:
@@ -1334,6 +1458,7 @@ class QuestionEvolutionProcessor:
                     item,
                     operator_id=operator_id,
                     validation_reject_reason=validation_reject_reason,
+                    semantic_retry_payload=semantic_retry_payload,
                 )
             except Exception as e:
                 logger.warning(
@@ -1358,19 +1483,30 @@ class QuestionEvolutionProcessor:
             else None
         )
         first_reject_reason: Optional[str] = None
-        for validation_attempt in range(self.max_validation_retries + 1):
+        generic_retry_attempts = 0
+        semantic_retry_attempts = 0
+        semantic_failure_reasons: List[str] = []
+        semantic_retry_payload: Optional[Dict[str, Any]] = None
+        effective_operator_id = operator_id or (
+            resolve_operator_id(item) if uses_stage_action_contract(item) else "legacy_surface_generator"
+        )
+
+        while True:
             evolved = await self._evolve_once_with_model_retry(
                 item,
                 operator_id=operator_id,
                 validation_reject_reason=reject_reason,
+                semantic_retry_payload=semantic_retry_payload,
             )
             validation_result = validate_evolved_result_against_stage_rules(item, evolved)
             if validation_result.get("passed") is True:
                 evolved["_local_validation_result"] = validation_result
-                if validation_attempt:
+                if generic_retry_attempts or semantic_retry_attempts:
                     evolved["validation_retry"] = {
-                        "attempts": validation_attempt,
+                        "attempts": generic_retry_attempts + semantic_retry_attempts,
                         "max_validation_retries": self.max_validation_retries,
+                        "semantic_retry_attempts": semantic_retry_attempts,
+                        "max_semantic_retry_attempts": self.max_semantic_retry_attempts,
                         "first_reject_reason": first_reject_reason,
                         "final_reject_reason": None,
                     }
@@ -1378,17 +1514,61 @@ class QuestionEvolutionProcessor:
 
             reject_reason = str(validation_result.get("reject_reason") or "未通过复杂度/可回答性校验").strip()
             first_reject_reason = first_reject_reason or reject_reason
-            if validation_attempt < self.max_validation_retries:
+            semantic_failures = list(validation_result.get("semantic_economy_failure_types") or [])
+            semantic_enforced = (
+                validation_result.get("semantic_economy_mode") == "enforce"
+                and bool(semantic_failures)
+            )
+            if semantic_enforced:
+                semantic_failure_reasons.append(reject_reason)
+                if semantic_retry_attempts < self.max_semantic_retry_attempts:
+                    semantic_retry_attempts += 1
+                    semantic_retry_payload = build_semantic_retry_payload(
+                        item,
+                        validation_result,
+                        operator_id=effective_operator_id,
+                        retry_attempt=semantic_retry_attempts,
+                        max_semantic_retry_attempts=self.max_semantic_retry_attempts,
+                        failure_reasons=semantic_failure_reasons,
+                    )
+                    logger.warning(
+                        "候选题未通过语义经济校验，将使用同一 operator 和结构化反馈重试 "
+                        f"({semantic_retry_attempts}/{self.max_semantic_retry_attempts}) "
+                        f"index={item.get('index')} reason={reject_reason[:200]}"
+                    )
+                    continue
+                evolved["retry_exhausted"] = True
+                evolved["retry_attempts"] = semantic_retry_attempts
+                evolved["final_failure_reasons"] = list(dict.fromkeys(semantic_failure_reasons))
+                evolved["operator_id"] = effective_operator_id
+                evolved["semantic_retry_payload"] = semantic_retry_payload
+                evolved["validation_retry"] = {
+                    "attempts": generic_retry_attempts + semantic_retry_attempts,
+                    "max_validation_retries": self.max_validation_retries,
+                    "semantic_retry_attempts": semantic_retry_attempts,
+                    "max_semantic_retry_attempts": self.max_semantic_retry_attempts,
+                    "retry_exhausted": True,
+                    "first_reject_reason": first_reject_reason,
+                    "final_reject_reason": reject_reason,
+                }
+                evolved["_local_validation_result"] = validation_result
+                return evolved
+
+            semantic_retry_payload = None
+            if generic_retry_attempts < self.max_validation_retries:
+                generic_retry_attempts += 1
                 logger.warning(
                     "候选题未通过独立校验，将带 reject_reason 使用同一 operator 重试 "
-                    f"({validation_attempt + 1}/{self.max_validation_retries}) "
+                    f"({generic_retry_attempts}/{self.max_validation_retries}) "
                     f"index={item.get('index')} reason={reject_reason[:200]}"
                 )
                 continue
 
             evolved["validation_retry"] = {
-                "attempts": validation_attempt,
+                "attempts": generic_retry_attempts + semantic_retry_attempts,
                 "max_validation_retries": self.max_validation_retries,
+                "semantic_retry_attempts": semantic_retry_attempts,
+                "max_semantic_retry_attempts": self.max_semantic_retry_attempts,
                 "first_reject_reason": first_reject_reason,
                 "final_reject_reason": reject_reason,
             }
@@ -1743,6 +1923,12 @@ async def main():
         default=DEFAULT_MAX_VALIDATION_RETRIES,
         help="候选题未通过 validate_evolved_question 规则校验时，使用同一 operator 带 reject_reason 重试的次数"
     )
+    parser.add_argument(
+        "--max-semantic-retry-attempts",
+        type=int,
+        default=DEFAULT_MAX_SEMANTIC_RETRY_ATTEMPTS,
+        help="enforce 模式下语义经济/题面泄漏失败后的同算子最大重试次数（不含初次生成）",
+    )
     args = parser.parse_args()
 
     if args.min_score_rate < 0 or args.min_score_rate > 1:
@@ -1751,6 +1937,8 @@ async def main():
         raise ValueError("--num-candidates 必须在 [1, 4] 之间")
     if args.validation_retries < 0 or args.validation_retries > 1:
         raise ValueError("--validation-retries 当前只允许 0 或 1，避免无限修正循环")
+    if args.max_semantic_retry_attempts < 0 or args.max_semantic_retry_attempts > 2:
+        raise ValueError("--max-semantic-retry-attempts 当前只允许 0 至 2")
 
     if not args.output:
         base, ext = os.path.splitext(args.input)
@@ -1772,6 +1960,7 @@ async def main():
         prompt_version=args.prompt_version,
         num_candidates=args.num_candidates,
         max_validation_retries=args.validation_retries,
+        max_semantic_retry_attempts=args.max_semantic_retry_attempts,
         max_candidate_budget=args.max_candidate_budget,
     )
 
@@ -1790,6 +1979,7 @@ async def main():
                 "num_candidates": args.num_candidates,
                 "max_candidate_budget": args.max_candidate_budget,
                 "validation_retries": args.validation_retries,
+                "max_semantic_retry_attempts": args.max_semantic_retry_attempts,
             },
         )
     finally:

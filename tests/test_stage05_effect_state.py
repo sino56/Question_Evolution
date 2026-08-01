@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from analyze_evolution_effect import analyze_records, build_effect_matrix
+from analyze_evolution_effect import analyze_records, build_effect_matrix, build_semantic_economy_report
 from update_sample_state import classify_preselection_invalid_cases, update_records
 
 
@@ -174,6 +174,33 @@ def test_effect_matrix_summarizes_sample_type_by_operator():
 
     invalid_row = next(row for row in matrix if row["operator_used"] == "O4_near_level_ranking")
     assert invalid_row["invalid_complexity_count"] == 1
+
+
+def test_semantic_economy_report_keeps_character_metrics_observational_and_old_records_readable():
+    previous = load_jsonl(ROOT / "tests" / "fixtures" / "stage05_previous_scored.jsonl")
+    current = load_jsonl(ROOT / "tests" / "fixtures" / "stage05_scored.jsonl")
+    current[0]["validation_result"].update(
+        {
+            "semantic_economy_mode": "enforce",
+            "semantic_economy_evaluated": True,
+            "semantic_economy_risk": "high",
+            "semantic_redundancy_dominant": False,
+            "shared_context_repeated": False,
+            "answer_hint_expansion": True,
+            "surface_leak_risk": True,
+            "surface_leak_type": ["boundary_language_leak"],
+            "estimated_prompt_chars": 200,
+            "prompt_char_delta": 50,
+        }
+    )
+    analyzed = analyze_records(current, previous_records=previous)
+    report = build_semantic_economy_report(analyzed)
+
+    assert report["character_metrics_policy"] == "record_only"
+    o1 = next(row for row in report["by_operator"] if row["operator_id"] == "O1_gap_choice")
+    assert o1["answer_hint_expansion_count"] == 1
+    assert o1["surface_leak_type_counts"]["boundary_language_leak"] == 1
+    assert o1["character_observation"]["max"] >= 200
 
 
 def test_state_update_and_memory_entries_cover_success_failure_invalid_review():

@@ -56,6 +56,11 @@ SPEC = OperatorPromptSpec(
     adjacent_operator_controls=(),
     surface_swap_controls=(),
     hidden_role_balance_controls=(),
+    semantic_economy=(
+        "O14 不生成独立题面；该契约只声明题面事实必须来自允许的可观察材料。",
+        "信息闭包不承担语义冗余、答案提示或题面泄漏的门禁职责。",
+    ),
+    prompt_recipe_version="semantic_economy_normal_v1",
     allowed_answer_shapes=(),
     forbidden_answer_shapes=(),
     generates_question=False,

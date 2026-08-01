@@ -12,6 +12,7 @@ from local_api_config import get_config_list, get_config_value
 from prompts.validation_prompt import build_validation_prompt
 from schema_validation import validate_records_against_schema
 from pipeline_runtime import StageMetrics, load_json_records, publish_records
+from semantic_budget import detect_surface_leaks, suggested_same_operator_retry_reason
 
 
 FORMAT_DIFFICULTY_TERMS = (
@@ -48,6 +49,15 @@ VALIDATION_BASE_URL = (
     or os.getenv("OPENAI_BASE_URL")
     or get_config_value("VALIDATION_BASE_URL", "EVOLVE_BASE_URL", "BASE_URL", "OPENAI_BASE_URL", default="")
 )
+SEMANTIC_ECONOMY_MODES = {"off", "shadow", "enforce"}
+SEMANTIC_ECONOMY_VALIDATOR_VERSION = "semantic_economy_v1"
+
+
+def resolve_semantic_economy_mode(value: Optional[str] = None) -> str:
+    mode = str(value or os.getenv("SEMANTIC_ECONOMY_MODE", "enforce") or "enforce").strip().lower()
+    if mode not in SEMANTIC_ECONOMY_MODES:
+        raise ValueError("--semantic-economy-mode must be one of: off, shadow, enforce")
+    return mode
 
 
 def local_validation_rule_version(
@@ -56,6 +66,7 @@ def local_validation_rule_version(
     max_output_tasks: int = 2,
     max_candidate_options: int = 3,
     max_counterfactuals: int = 1,
+    semantic_economy_mode: Optional[str] = None,
 ) -> str:
     payload = {
         "format_difficulty_terms": FORMAT_DIFFICULTY_TERMS,
@@ -63,10 +74,14 @@ def local_validation_rule_version(
         "counterfactual_terms": COUNTERFACTUAL_TERMS,
         "task_split_pattern": TASK_SPLIT_PATTERN.pattern,
         "option_pattern": OPTION_PATTERN.pattern,
-        "max_prompt_chars": max_prompt_chars,
+        # Kept in the function signature for compatibility only.  It is
+        # deliberately absent from the hash and has no quality-gate effect.
+        "max_prompt_chars_compatibility": "ignored",
         "max_output_tasks": max_output_tasks,
         "max_candidate_options": max_candidate_options,
         "max_counterfactuals": max_counterfactuals,
+        "semantic_economy_mode": resolve_semantic_economy_mode(semantic_economy_mode),
+        "semantic_economy_validator_version": SEMANTIC_ECONOMY_VALIDATOR_VERSION,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -165,6 +180,10 @@ def normalize_llm_validation(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "external_knowledge_required",
         "repeated_pattern_with_previous_round",
         "format_difficulty_dominant",
+        "semantic_redundancy_dominant",
+        "shared_context_repeated",
+        "answer_hint_expansion",
+        "surface_leak_risk",
     ):
         value = _coerce_bool(raw.get(field))
         if value is not None:
@@ -175,6 +194,22 @@ def normalize_llm_validation(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     why = _clean_text(raw.get("why_passed") or raw.get("reason"))
     if why:
         normalized["llm_validation_reason"] = why
+    risk = _clean_text(raw.get("semantic_economy_risk")).lower()
+    if risk in {"low", "medium", "high"}:
+        normalized["semantic_economy_risk"] = risk
+    leak_type = raw.get("surface_leak_type")
+    if isinstance(leak_type, str) and leak_type.strip():
+        normalized["surface_leak_type"] = [leak_type.strip()]
+    elif isinstance(leak_type, list):
+        normalized["surface_leak_type"] = [
+            _clean_text(value) for value in leak_type if _clean_text(value)
+        ]
+    semantic_reason = _clean_text(raw.get("semantic_economy_reason") or raw.get("surface_leak_reason"))
+    if semantic_reason:
+        normalized["semantic_economy_llm_reason"] = semantic_reason
+    infrastructure_error = _clean_text(raw.get("validation_infrastructure_error"))
+    if infrastructure_error:
+        normalized["validation_infrastructure_error"] = infrastructure_error
     return normalized
 
 
@@ -184,14 +219,32 @@ def merge_llm_validation_result(
 ) -> Dict[str, Any]:
     normalized = normalize_llm_validation(llm_validation)
     result = dict(rule_result)
+    semantic_mode = resolve_semantic_economy_mode(result.get("semantic_economy_mode"))
     result["llm_validation_used"] = bool(normalized)
+    infrastructure_error = _clean_text(normalized.get("validation_infrastructure_error"))
+    if infrastructure_error:
+        result["semantic_economy_llm_evaluated"] = False
+        result["semantic_economy_llm_status"] = "failed"
+        result["semantic_economy_llm_error"] = infrastructure_error
+        if semantic_mode == "shadow":
+            result["semantic_economy_risk"] = "unassessed"
+        if semantic_mode == "enforce":
+            reject_reasons = list(result.get("reject_reasons") or [])
+            reject_reasons.append("语义校验基础设施错误")
+            result["passed"] = False
+            result["reject_reasons"] = list(dict.fromkeys(reject_reasons))
+            result["reject_reason"] = "；".join(result["reject_reasons"])
+            result["invalid_type"] = "validation_infrastructure_error"
+        return _append_semantic_gate(result, mode=semantic_mode)
     if not normalized:
         result.setdefault("main_axis_clear", result.get("main_axis_count", 0) <= 1)
         result.setdefault("answerable", result.get("external_knowledge_risk") != "high")
         result.setdefault("external_knowledge_required", result.get("external_knowledge_risk") == "high")
         result.setdefault("repeated_pattern_with_previous_round", result.get("repeat_pattern_risk") == "high")
         result.setdefault("format_difficulty_dominant", result.get("format_difficulty_risk") == "high")
-        return result
+        result.setdefault("semantic_economy_llm_evaluated", False)
+        result.setdefault("semantic_economy_llm_status", "not_requested")
+        return _append_semantic_gate(result, mode=semantic_mode)
 
     reject_reasons = list(result.get("reject_reasons") or [])
     invalid_type = result.get("invalid_type")
@@ -216,15 +269,34 @@ def merge_llm_validation_result(
     if llm_reject_reason and llm_reject_reason not in reject_reasons:
         reject_reasons.append(llm_reject_reason)
 
+    deterministic_semantic = {
+        field: result.get(field)
+        for field in (
+            "semantic_redundancy_dominant",
+            "shared_context_repeated",
+            "answer_hint_expansion",
+            "surface_leak_risk",
+        )
+    }
+    deterministic_leak_types = list(result.get("surface_leak_type") or [])
     passed = not reject_reasons
     result.update(normalized)
+    for field, value in deterministic_semantic.items():
+        result[field] = bool(value) or bool(normalized.get(field))
+    llm_leak_types = normalized.get("surface_leak_type")
+    if isinstance(llm_leak_types, list):
+        result["surface_leak_type"] = list(dict.fromkeys([*deterministic_leak_types, *llm_leak_types]))
+    if normalized.get("semantic_economy_risk") in {"medium", "high"}:
+        result["semantic_economy_risk"] = normalized["semantic_economy_risk"]
+    result["semantic_economy_llm_evaluated"] = True
+    result["semantic_economy_llm_status"] = "completed"
     result["passed"] = passed
     result["reject_reasons"] = reject_reasons
     result["reject_reason"] = None if passed else "；".join(reject_reasons)
     result["invalid_type"] = None if passed else invalid_type or "llm_validation_failed"
     if passed and normalized.get("llm_validation_reason"):
         result["why_passed"] = normalized["llm_validation_reason"]
-    return result
+    return _append_semantic_gate(result, mode=semantic_mode)
 
 
 class LLMValidationClient:
@@ -391,6 +463,75 @@ def detect_repeat_pattern_risk(item: Dict[str, Any], prompt: str) -> Tuple[str, 
     return "low", None
 
 
+def _semantic_evidence(prompt: str) -> Dict[str, Any]:
+    """Deterministic high-confidence checks; semantic paraphrases remain for the LLM."""
+
+    normalized_sentences = [
+        re.sub(r"\s+", "", sentence)
+        for sentence in re.split(r"[。！？!?；;\n]+", prompt)
+        if len(re.sub(r"\s+", "", sentence)) >= 12
+    ]
+    counts: Dict[str, int] = {}
+    for sentence in normalized_sentences:
+        counts[sentence] = counts.get(sentence, 0) + 1
+    repeated = [sentence for sentence, count in counts.items() if count >= 2]
+
+    # These phrases are answer-side summaries, not ordinary requests for a
+    # reason.  They are intentionally narrow to avoid treating a necessary
+    # long quantitative prompt as redundant.
+    answer_markers = ("正确答案", "答案是", "完整证据链", "充分证据清单", "因此可得", "由此可知")
+    answer_hints = [marker for marker in answer_markers if marker in prompt]
+    surface = detect_surface_leaks(prompt)
+    evidence = list(surface.get("surface_leak_evidence") or [])
+    evidence.extend({"type": "semantic_redundancy", "text": sentence} for sentence in repeated)
+    evidence.extend({"type": "answer_hint_expansion", "text": marker} for marker in answer_hints)
+    return {
+        "semantic_redundancy_dominant": bool(repeated),
+        "shared_context_repeated": bool(repeated),
+        "answer_hint_expansion": bool(answer_hints),
+        "surface_leak_risk": bool(surface.get("surface_leak_risk")),
+        "surface_leak_type": list(surface.get("surface_leak_type") or []),
+        "semantic_economy_evidence": evidence,
+        "suggested_same_operator_retry_reason": suggested_same_operator_retry_reason(surface),
+    }
+
+
+def _semantic_failure_types(result: Dict[str, Any]) -> List[str]:
+    mapping = (
+        ("semantic_redundancy_dominant", "semantic_redundancy"),
+        ("shared_context_repeated", "shared_context_repeated"),
+        ("answer_hint_expansion", "answer_hint_expansion"),
+        ("surface_leak_risk", "surface_leak"),
+    )
+    return [failure_type for field, failure_type in mapping if result.get(field) is True]
+
+
+def _append_semantic_gate(result: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
+    failures = _semantic_failure_types(result)
+    result["semantic_economy_failure_types"] = failures
+    result["semantic_economy_would_fail"] = bool(failures)
+    if mode != "enforce" or not failures:
+        return result
+
+    reject_reasons = list(result.get("reject_reasons") or [])
+    reason_by_failure = {
+        "semantic_redundancy": "存在可删除的重复事实或无职责段落",
+        "shared_context_repeated": "共享背景在多个版本或段落中重复",
+        "answer_hint_expansion": "题面扩写了答案依据或结论总结",
+        "surface_leak": "题面泄漏了答案边界、评分意图或推理路径",
+    }
+    for failure in failures:
+        reason = reason_by_failure[failure]
+        if reason not in reject_reasons:
+            reject_reasons.append(reason)
+    if reject_reasons:
+        result["passed"] = False
+        result["reject_reasons"] = reject_reasons
+        result["reject_reason"] = "；".join(reject_reasons)
+        result["invalid_type"] = result.get("invalid_type") or "semantic_economy_failed"
+    return result
+
+
 def validate_record(
     item: Dict[str, Any],
     *,
@@ -399,12 +540,15 @@ def validate_record(
     max_candidate_options: int = 3,
     max_counterfactuals: int = 1,
     llm_validation: Optional[Dict[str, Any]] = None,
+    semantic_economy_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
+    semantic_mode = resolve_semantic_economy_mode(semantic_economy_mode)
     rule_version = local_validation_rule_version(
         max_prompt_chars=max_prompt_chars,
         max_output_tasks=max_output_tasks,
         max_candidate_options=max_candidate_options,
         max_counterfactuals=max_counterfactuals,
+        semantic_economy_mode=semantic_mode,
     )
     if item.get("question_evolved") is False:
         result = merge_llm_validation_result({
@@ -415,6 +559,20 @@ def validate_record(
             "candidate_options_count": 0,
             "counterfactual_count": 0,
             "estimated_prompt_chars": len(get_current_prompt(item)),
+            "prompt_char_delta": None,
+            "prompt_char_growth_ratio": None,
+            "semantic_economy_mode": semantic_mode,
+            "semantic_economy_evaluated": False,
+            "semantic_economy_llm_evaluated": False,
+            "semantic_economy_llm_status": "not_applicable",
+            "semantic_economy_risk": "not_evaluated",
+            "semantic_redundancy_dominant": None,
+            "shared_context_repeated": None,
+            "answer_hint_expansion": None,
+            "surface_leak_risk": None,
+            "surface_leak_type": [],
+            "semantic_economy_evidence": [],
+            "suggested_same_operator_retry_reason": None,
             "external_knowledge_risk": "low",
             "format_difficulty_risk": "low",
             "repeat_pattern_risk": "low",
@@ -442,6 +600,24 @@ def validate_record(
     external_risk = _risk_from_terms(prompt, EXTERNAL_KNOWLEDGE_TERMS)
     format_risk = _risk_from_terms(prompt, FORMAT_DIFFICULTY_TERMS)
     repeat_risk, repeat_reason = detect_repeat_pattern_risk(item, prompt)
+    semantic = _semantic_evidence(prompt) if semantic_mode != "off" else {
+        "semantic_redundancy_dominant": None,
+        "shared_context_repeated": None,
+        "answer_hint_expansion": None,
+        "surface_leak_risk": None,
+        "surface_leak_type": [],
+        "semantic_economy_evidence": [],
+        "suggested_same_operator_retry_reason": None,
+    }
+    meta_info = item.get("meta_info")
+    parent_prompt = meta_info.get("prompt_old") if isinstance(meta_info, dict) else None
+    parent_prompt = parent_prompt.strip() if isinstance(parent_prompt, str) and parent_prompt.strip() else None
+    prompt_char_delta = prompt_chars - len(parent_prompt) if parent_prompt is not None else None
+    prompt_char_growth_ratio = (
+        round(prompt_char_delta / len(parent_prompt), 6)
+        if parent_prompt and prompt_char_delta is not None
+        else None
+    )
 
     reject_reasons: List[str] = []
     invalid_type = None
@@ -451,9 +627,6 @@ def validate_record(
     if original_prompt and prompt == original_prompt:
         reject_reasons.append("进化题与原题完全相同")
         invalid_type = invalid_type or "repeated_original"
-    if prompt_chars > max_prompt_chars:
-        reject_reasons.append(f"题长 {prompt_chars} 超过上限 {max_prompt_chars}")
-        invalid_type = invalid_type or "invalid_complexity"
     if main_axis_count > 1:
         reject_reasons.append(f"主轴数 {main_axis_count} 超过 1")
         invalid_type = invalid_type or "multi_axis"
@@ -485,14 +658,26 @@ def validate_record(
         "candidate_options_count": candidate_options_count,
         "counterfactual_count": counterfactual_count,
         "estimated_prompt_chars": prompt_chars,
+        "prompt_char_delta": prompt_char_delta,
+        "prompt_char_growth_ratio": prompt_char_growth_ratio,
+        "semantic_economy_mode": semantic_mode,
+        "semantic_economy_evaluated": semantic_mode != "off",
+        "semantic_economy_llm_evaluated": False,
+        "semantic_economy_llm_status": "not_requested" if semantic_mode != "off" else "off",
+        "semantic_economy_risk": (
+            "not_evaluated" if semantic_mode == "off"
+            else ("high" if _semantic_failure_types(semantic) else "low")
+        ),
+        **semantic,
         "external_knowledge_risk": external_risk,
         "format_difficulty_risk": format_risk,
         "repeat_pattern_risk": repeat_risk,
-        "why_passed": "主轴、题长、任务数、候选项、反事实、题外知识和重复题型均在预算内。" if passed else "",
+        "why_passed": "主轴、任务形态、题外知识和重复题型均满足校验；字符数仅作观察。" if passed else "",
         "reject_reason": None if passed else "；".join(reject_reasons),
         "reject_reasons": reject_reasons,
         "invalid_type": None if passed else invalid_type or "invalid_complexity",
     }
+    rule_result = _append_semantic_gate(rule_result, mode=semantic_mode)
     result = merge_llm_validation_result(rule_result, llm_validation)
     result["local_validation_rule_version"] = rule_version
     return result
@@ -519,13 +704,16 @@ def attach_validation_result(
     max_candidate_options: int = 3,
     max_counterfactuals: int = 1,
     llm_validation: Optional[Dict[str, Any]] = None,
+    semantic_economy_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     result = dict(item)
+    semantic_mode = resolve_semantic_economy_mode(semantic_economy_mode)
     expected_rule_version = local_validation_rule_version(
         max_prompt_chars=max_prompt_chars,
         max_output_tasks=max_output_tasks,
         max_candidate_options=max_candidate_options,
         max_counterfactuals=max_counterfactuals,
+        semantic_economy_mode=semantic_mode,
     )
     cached = _cached_local_validation(item, expected_rule_version=expected_rule_version)
     if cached is not None:
@@ -541,6 +729,7 @@ def attach_validation_result(
             max_candidate_options=max_candidate_options,
             max_counterfactuals=max_counterfactuals,
             llm_validation=llm_validation,
+            semantic_economy_mode=semantic_mode,
         )
         result["validation_result"]["local_validation_reused"] = False
     return result
@@ -554,6 +743,7 @@ def validate_records(
     max_candidate_options: int = 3,
     max_counterfactuals: int = 1,
     llm_validations: Optional[Dict[str, Dict[str, Any]]] = None,
+    semantic_economy_mode: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     return [
         attach_validation_result(
@@ -563,6 +753,7 @@ def validate_records(
             max_candidate_options=max_candidate_options,
             max_counterfactuals=max_counterfactuals,
             llm_validation=(llm_validations or {}).get(_record_key(record)),
+            semantic_economy_mode=semantic_economy_mode,
         )
         for record in records
     ]
@@ -595,7 +786,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate evolved question candidates for complexity and answerability.")
     parser.add_argument("--input", required=True, help="Input candidate JSON/JSONL path.")
     parser.add_argument("--output", required=True, help="Output validated JSONL path.")
-    parser.add_argument("--max-prompt-chars", type=int, default=1200, help="Maximum evolved prompt characters.")
+    parser.add_argument("--max-prompt-chars", type=int, default=1200, help="Deprecated compatibility option; accepted and recorded as ignored.")
+    parser.add_argument(
+        "--semantic-economy-mode",
+        choices=sorted(SEMANTIC_ECONOMY_MODES),
+        default=resolve_semantic_economy_mode(),
+        help="off=skip semantic checks; shadow=record only; enforce=block semantic failures.",
+    )
     parser.add_argument("--max-output-tasks", type=int, default=2, help="Maximum output tasks.")
     parser.add_argument("--max-candidate-options", type=int, default=3, help="Maximum candidate options.")
     parser.add_argument("--max-counterfactuals", type=int, default=1, help="Maximum counterfactual groups.")
@@ -611,8 +808,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.max_prompt_chars <= 0:
-        raise ValueError("--max-prompt-chars must be positive")
     stage = "validate_evolved_question"
     metrics = StageMetrics(stage)
     metrics.input_bytes = os.path.getsize(args.input)
@@ -625,16 +820,24 @@ def main() -> None:
         if schema_errors:
             raise ValueError(f"input schema validation failed: {schema_errors[0]}")
     llm_validations = None
-    if args.enable_llm_validation:
-        llm_validations = asyncio.run(
-            collect_llm_validations(
-                records,
-                base_url=args.llm_base_url or VALIDATION_BASE_URL,
-                api_keys=parse_api_keys(args.llm_api_key),
-                model=args.llm_model or VALIDATION_MODEL,
-                concurrency=args.llm_concurrency,
+    should_request_semantic_llm = args.semantic_economy_mode in {"shadow", "enforce"}
+    if args.enable_llm_validation or should_request_semantic_llm:
+        api_keys = parse_api_keys(args.llm_api_key)
+        try:
+            llm_validations = asyncio.run(
+                collect_llm_validations(
+                    records,
+                    base_url=args.llm_base_url or VALIDATION_BASE_URL,
+                    api_keys=api_keys,
+                    model=args.llm_model or VALIDATION_MODEL,
+                    concurrency=args.llm_concurrency,
+                )
             )
-        )
+        except Exception as exc:
+            llm_validations = {
+                _record_key(record): {"validation_infrastructure_error": str(exc)}
+                for record in records
+            }
     validated = validate_records(
         records,
         max_prompt_chars=args.max_prompt_chars,
@@ -642,6 +845,7 @@ def main() -> None:
         max_candidate_options=args.max_candidate_options,
         max_counterfactuals=args.max_counterfactuals,
         llm_validations=llm_validations,
+        semantic_economy_mode=args.semantic_economy_mode,
     )
     if args.validate_schema:
         schema_errors = validate_records_against_schema(validated, Path("schemas") / "pipeline_record.schema.json")
@@ -655,11 +859,13 @@ def main() -> None:
         input_path=args.input,
         config={
             "max_prompt_chars": args.max_prompt_chars,
+            "max_prompt_chars_compatibility": "ignored",
             "max_output_tasks": args.max_output_tasks,
             "max_candidate_options": args.max_candidate_options,
             "max_counterfactuals": args.max_counterfactuals,
-            "enable_llm_validation": args.enable_llm_validation,
-            "llm_model": args.llm_model if args.enable_llm_validation else None,
+            "semantic_economy_mode": args.semantic_economy_mode,
+            "enable_llm_validation": args.enable_llm_validation or should_request_semantic_llm,
+            "llm_model": args.llm_model if (args.enable_llm_validation or should_request_semantic_llm) else None,
             "validate_schema": args.validate_schema,
         },
         performance_path=args.performance_events,

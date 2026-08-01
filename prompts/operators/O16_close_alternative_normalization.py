@@ -87,9 +87,15 @@ SPEC = OperatorPromptSpec(
         "交换共享事实与外围事实的表面位置不改变覆盖关系",
     ),
     hidden_role_balance_controls=(
-        "双方使用相近长度、具体度和因果完整度",
+        "双方使用相近语义负载、具体度和因果完整度",
         "discriminator 与其他同粒度观察自然混合",
     ),
+    semantic_economy=(
+        "共享观察和背景只写一次，两个解释只呈现覆盖或残差上的差异事实。",
+        "保留区分解释的最小可观察关系，不展开覆盖矩阵或完整因果链。",
+        "不得让目标解释独占更完整解释、关键总结或明显更多信息槽位。",
+    ),
+    prompt_recipe_version="semantic_economy_normal_v1",
     allowed_answer_shapes=(
         "自然业务判断加开放式解释依据",
         "在论证中自行说明两个解释的覆盖、残差和关键分歧",

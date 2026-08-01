@@ -77,6 +77,8 @@ def test_each_new_operator_has_complete_content_spec(spec):
     assert spec.hidden_role_balance_controls
     assert spec.allowed_answer_shapes
     assert spec.forbidden_answer_shapes
+    assert spec.semantic_economy
+    assert spec.prompt_recipe_version == "semantic_economy_structural_v1"
     assert spec.generates_question is True
     for axis in spec.semantic_axes:
         assert set(axis) == {
@@ -96,7 +98,7 @@ def test_four_scene_content_seeds_stay_inside_content_specs():
 
 
 @pytest.mark.parametrize("spec", NEW_OPERATOR_SPECS, ids=lambda spec: spec.operator_id)
-def test_new_operators_use_existing_unified_prompt_without_leaking_internal_tasks(spec):
+def test_new_operators_render_surface_contract_without_leaking_internal_tasks(spec):
     rendered = build_operator_prompt(
         spec.operator_id,
         prompt="根据现有材料作出一个业务判断并说明依据。",
@@ -109,11 +111,15 @@ def test_new_operators_use_existing_unified_prompt_without_leaking_internal_task
         operator_route={"primary_operator": spec.operator_id},
     )
     assert spec.operator_id in rendered
-    assert spec.reasoning_object in rendered
-    assert '"semantic_axes"' in rendered
+    assert '"semantic_economy"' in rendered
+    assert "题面生成可见上下文" in rendered
+    for rule in spec.semantic_economy:
+        assert rule in rendered
+    assert '"semantic_axes"' not in rendered
+    assert '"required_reasoning_tasks"' not in rendered
     assert "一个自然业务判断和开放式依据要求" in rendered
     assert "不得使用“逐项说明”“分别列出”“先……再……”" in rendered
-    assert "允许该算子的多个语义轴在同一判断中自然耦合" in rendered
+    assert "共享主体、时段、目标命题与不变背景只出现一次" in rendered
 
 
 def test_first_part_does_not_add_second_part_runtime_contract_fields():

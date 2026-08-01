@@ -149,7 +149,8 @@ def test_every_generation_operator_uses_the_unified_prompt_entrypoint():
         )
         assert spec.operator_id in rendered
         assert spec.ability_axis in rendered
-        assert spec.content_transformation in rendered
+        assert '"semantic_economy"' in rendered
+        assert spec.content_transformation not in rendered
 
 
 def test_question_evolution_uses_route_and_skips_passthrough():
@@ -215,7 +216,10 @@ def test_question_evolution_calls_new_operator_through_existing_entrypoint():
     assert metadata["operator_used"] == "O33_cross_modal_support_boundary"
     assert metadata["ability_axis"] == "cross_modal_support_boundary"
     assert "O33_cross_modal_support_boundary" in fake_client.calls[0]["messages"][0]["content"]
-    assert '"semantic_axes"' in fake_client.calls[0]["messages"][0]["content"]
+    generated_prompt = fake_client.calls[0]["messages"][0]["content"]
+    assert '"semantic_economy"' in generated_prompt
+    assert '"semantic_axes"' not in generated_prompt
+    assert item["reference_answer"] not in generated_prompt
 
 
 def test_question_evolution_file_stage_checkpoints_candidate_group_and_externalizes_trace(tmp_path):

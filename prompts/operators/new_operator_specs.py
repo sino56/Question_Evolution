@@ -10,6 +10,89 @@ from typing import Any, Dict, Optional, Sequence
 from .base import OperatorPromptSpec
 
 
+# Per-operator semantic economy contracts are content rules, not validator
+# gates.  They intentionally name the smallest structure that must remain in
+# the question while banning the characteristic way each operator expands into
+# an answer scaffold.
+SEMANTIC_ECONOMY_BY_OPERATOR = {
+    "O19_multi_entity_role_binding": (
+        "共享实体画像、时段和背景只定义一次；后续只写改变角色绑定的行为差异。",
+        "保留判定所需的实体—角色—时段关系，不展开完整出场表或角色关系矩阵。",
+        "不得用某一实体独占更完整叙述或总结句暗示正确绑定。",
+    ),
+    "O20_multistage_event_breakpoint": (
+        "仅呈现目标结论依赖的阶段状态和必要承接，不枚举完整流程或所有旁支。",
+        "共享起点与终局只写一次，各阶段只保留改变承接关系的差异。",
+        "不得用总结句、阶段编号或更长说明标出实质断点。",
+    ),
+    "O21_object_provenance_identity": (
+        "只保留对象来源、关键转移、遮挡和竞争来源所需的连续线索。",
+        "稳定对象特征在公共题干出现一次，候选来源只写新增转移差异。",
+        "不得把完整来源链或同一性结论作为某个候选的额外解释。",
+    ),
+    "O22_path_topology_reachability": (
+        "只呈现目标可达性判断所需的节点、方向边、端点和时间窗口。",
+        "共享地图背景和通行规则只写一次，不展开完整路网或全部候选路径。",
+        "不得通过路径描述量、顺序或总结暗示可达结果。",
+    ),
+    "O23_observation_reliability_conflict": (
+        "保留影响观测可靠性的可见条件与竞争来源，不重复解释其结论含义。",
+        "题面以事实张力组织材料，不出现最高支持、不能直接推出等边界提示。",
+        "多项观测使用相近的语气和信息负载，避免谨慎项成为唯一安全项。",
+    ),
+    "O24_multi_hypothesis_residual_ranking": (
+        "共同事实只在题干出现一次，各假设只说明各自覆盖差异与残差线索。",
+        "保留决定排序的最小竞争关系，不展示覆盖矩阵、完整解释清单或排名步骤。",
+        "不得让某一假设独占完整事实并集或结论总结。",
+    ),
+    "O25_procedural_invariant_frame": (
+        "共享程序、参照系和不变条件只写一次，版本只写实际改变的步骤或输入。",
+        "保留验证不变量所需的规则和状态，不复制两套完整程序或检查表。",
+        "不得在题面预告哪个步骤破坏不变量。",
+    ),
+    "O26_quantitative_threshold_propagation": (
+        "保留单位换算、误差传播、规则阈值和结论判断实际依赖的全部数值与定义。",
+        "删除不参与计算或阈值关系的装饰数据，但不得因题面较长删去必要输入。",
+        "不得给出中间计算、完整公式推导或预填阈值比较结果。",
+    ),
+    "O27_cross_layer_conclusion_calibration": (
+        "保留跨层判断所需的事实张力和竞争证据，不把层级映射写成题面提示。",
+        "共享观察背景只写一次，候选判断只呈现导致层级差异的事实。",
+        "题面不得询问最高支持、结论边界或哪些内容不能直接推出；这些仅供答案键处理。",
+    ),
+    "O28_multihop_chain_closure": (
+        "只保留目标主张依赖的多跳链子图和必要连接，不展开完整路径集合。",
+        "共同节点和已知事实只出现一次，每跳只补充新的承接关系。",
+        "不得用链路总结或显式闭合提示替回答者完成判断。",
+    ),
+    "O29_entity_identity_conflict_resolution": (
+        "共享实体画像只定义一次，各冲突线索只保留判定身份所需的差异。",
+        "保留互相竞争且局部合理的身份事实，不展示完整排除表。",
+        "不得让正确身份独占谨慎、核查或更完整的解释性语言。",
+    ),
+    "O30_active_discriminative_observation": (
+        "保留当前竞争假设和能改变选择价值的可观测差异，不预填结果分支或更新矩阵。",
+        "共享场景只写一次，候选观测只写新增信息与可行条件。",
+        "不得在题面说明哪项观测最有区分力或如何更新结论。",
+    ),
+    "O31_observation_accumulation_calibration": (
+        "共享画面内容只写一次，各观测只补充来源依赖、视角或新增特征。",
+        "保留判断独立性和累积价值所需的来源关系，不复制观察全文或统计表。",
+        "不得用总结句暗示哪些观测可累计或不能累计。",
+    ),
+    "O32_role_graph_critical_edge": (
+        "只呈现目标角色结论依赖的角色节点和关键关系边，不展开完整关系图。",
+        "共享角色背景只写一次，候选关系只说明方向或必要连接的差异。",
+        "不得以关系描述量、节点编号或结论总结暴露关键边。",
+    ),
+    "O33_cross_modal_support_boundary": (
+        "只呈现目标融合判断需要的各模态事实、时间/实体对齐和竞争关系。",
+        "每个来源只保留新增支持，避免在结尾重复全部来源或写融合总结。",
+        "题面不得提示限定范围、不能推出或答案边界；通过事实冲突让回答者自行校准。",
+    ),
+}
+
+
 def _axis(
     name: str,
     reasoning_task: str,
@@ -87,6 +170,8 @@ def _spec(
             "复述 operator 名称、目标错误标签或预设答案方向",
             "用固定表格、清单或机械步骤替代业务判断",
         ),
+        semantic_economy=SEMANTIC_ECONOMY_BY_OPERATOR[operator_id],
+        prompt_recipe_version="semantic_economy_structural_v1",
     )
 
 

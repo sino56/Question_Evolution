@@ -759,6 +759,7 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
             --input "$ROUND_DIR/scored.jsonl" \
             --output "$ROUND_DIR/effect_analysis.jsonl" \
             --matrix-output "$ROUND_DIR/effect_matrix.jsonl" \
+            --semantic-report-output "$ROUND_DIR/semantic_economy_report.json" \
             --performance-events "$ROUND_DIR/performance_events.jsonl"
 
     run_if_missing "$ROUND_DIR/state_updated.jsonl" "update_sample_state" "$ROUND_DIR/effect_analysis.jsonl" "[Round $ROUND] Step 13/13: update_sample_state.py" \

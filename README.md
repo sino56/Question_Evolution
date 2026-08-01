@@ -38,7 +38,7 @@ Stage 5: collect_answers.py -> gen_rubric.py -> scoring.py
 | 8 | `collect_answers.py` | `with_answers.jsonl` |
 | 9 | `gen_rubric.py` | `rubric.jsonl` |
 | 10 | `scoring.py` | `scored.jsonl` |
-| 11 | `analyze_evolution_effect.py` | `effect_analysis.jsonl`, `effect_matrix.jsonl` |
+| 11 | `analyze_evolution_effect.py` | `effect_analysis.jsonl`, `effect_matrix.jsonl`, `semantic_economy_report.json` |
 | 12 | `update_sample_state.py` | `state_updated.jsonl`, memory bank |
 
 `question_evolution.py` 的 legacy 单脚本路径仍可用于兼容旧数据或局部调试，但不再是推荐主流程。推荐路径必须经过画像、分流、路由、复杂度/可回答性校验、难度收益验证、候选选择、效果统计和状态更新。
@@ -154,12 +154,12 @@ Round N 输入
 | `select_evolution_candidates.py` | 输出 `evolution_action`，区分高分进化、低分重构、中分探测、透传和停止 | `profiled.jsonl` | `profiled_candidates.jsonl` |
 | `operator_router.py` | 根据画像、状态和 memory 选择 operator | `profiled_candidates.jsonl` | `routed.jsonl` |
 | `question_evolution.py` | 按 operator 生成 1-4 个候选题，支持 validate-retry | `routed.jsonl` | `candidates.jsonl` |
-| `validate_evolved_question.py` | 校验复杂度、可回答性、重复题型和格式风险 | `candidates.jsonl` | `validated_candidates.jsonl` |
+| `validate_evolved_question.py` | 校验可回答性、重复题型、格式风险、语义冗余与题面泄漏；字符数仅观察 | `candidates.jsonl` | `validated_candidates.jsonl` |
 | `validate_difficulty_gain.py` | 校验候选题是否有真实难度收益、无线索泄漏且不靠格式变难 | `validated_candidates.jsonl` | `difficulty_validated_candidates.jsonl`, `difficulty_gain_report.json` |
 | `candidate_selection.py` | 从通过复杂度和难度收益验证的候选中选择主链题目 | `difficulty_validated_candidates.jsonl` | `evolved.jsonl` |
 | `collect_answers.py` | 调用强模型为题目生成参考答案 | `*.jsonl` | `*_with_answers.jsonl` |
 | `gen_rubric.py` | 根据题目和参考答案生成 rubric 与 score_prompt | `*_with_answers.jsonl` | `*_rubric.jsonl` |
-| `analyze_evolution_effect.py` | 统计轻量边界命中和 operator 效果矩阵 | `*_scored.jsonl` | `effect_analysis.jsonl` |
+| `analyze_evolution_effect.py` | 统计轻量边界命中、operator 效果矩阵与语义经济/泄漏观察 | `*_scored.jsonl` | `effect_analysis.jsonl`, `semantic_economy_report.json` |
 | `update_sample_state.py` | 更新跨轮状态并写入三类 memory bank | `effect_analysis.jsonl` | `state_updated.jsonl` |
 
 ---
@@ -273,7 +273,7 @@ score_rate = scoring_result.total_awarded / scoring_result.total_possible
 2. `select_evolution_candidates.py`：新增 `evolution_action`。
 3. `operator_router.py`：新增 `operator_route`。
 4. `question_evolution.py`：按 operator 生成候选题，新增 `candidate_group_id`、`candidate_id`、`candidate_operator`、`candidate_generation` 和 `meta_info.question_evolution_metadata`。
-5. `validate_evolved_question.py`：新增 `validation_result`，可包含 LLM/mock 校验字段 `main_axis_clear`、`answerable`、`external_knowledge_required`、`repeated_pattern_with_previous_round`、`format_difficulty_dominant`。
+5. `validate_evolved_question.py`：新增 `validation_result`，可包含 LLM/mock 校验字段 `main_axis_clear`、`answerable`、`external_knowledge_required`、`repeated_pattern_with_previous_round`、`format_difficulty_dominant`，以及语义经济字段 `semantic_economy_mode`、`semantic_economy_risk`、`semantic_redundancy_dominant`、`shared_context_repeated`、`answer_hint_expansion`、`surface_leak_risk`、`surface_leak_type`。字符数、父子差值和增长比例仅用于观察，不参与准入或排序。
 6. `candidate_selection.py`：在选中记录上新增 `candidate_selection`。
 
 `evolution_action` 共有五类：`evolve_high_score_overscore`、
@@ -633,12 +633,14 @@ python question_evolution.py \
   --base-url "$EVOLVE_BASE_URL" \
   --num-candidates 2 \
   --max-candidate-budget 0 \
-  --validation-retries 1
+  --validation-retries 1 \
+  --max-semantic-retry-attempts 2
 
 # Step 5：复杂度/可回答性校验
 python validate_evolved_question.py \
   --input round_1_candidates.jsonl \
   --output round_1_validated_candidates.jsonl \
+  --semantic-economy-mode enforce \
   --validate-schema
 
 # Step 6：难度收益验证
@@ -714,7 +716,8 @@ python analyze_evolution_effect.py \
   --before round_0_scored.jsonl \
   --input round_1_scored.jsonl \
   --output round_1_effect_analysis.jsonl \
-  --matrix-output round_1_effect_matrix.jsonl
+  --matrix-output round_1_effect_matrix.jsonl \
+  --semantic-report-output round_1_semantic_economy_report.json
 
 # Step 12：状态更新和 memory bank 写入
 python update_sample_state.py \
@@ -857,13 +860,14 @@ python question_evolution.py \
   --prompt-version {v1,v2} \
   --num-candidates 2 \
   --max-candidate-budget 0 \
-  --validation-retries 1
+  --validation-retries 1 \
+  --max-semantic-retry-attempts 2
 ```
 
 ### validate / select
 
 ```bash
-python validate_evolved_question.py --input candidates.jsonl --output validated_candidates.jsonl --validate-schema
+python validate_evolved_question.py --input candidates.jsonl --output validated_candidates.jsonl --semantic-economy-mode enforce --validate-schema
 python validate_difficulty_gain.py --input validated_candidates.jsonl --output difficulty_validated_candidates.jsonl --report-output difficulty_gain_report.json
 python candidate_selection.py --input difficulty_validated_candidates.jsonl --output evolved.jsonl --invalid-output invalid_generation_cases.jsonl
 ```
@@ -897,7 +901,7 @@ python gen_rubric.py \
 ### effect / state
 
 ```bash
-python analyze_evolution_effect.py --before previous_scored.jsonl --input scored.jsonl --output effect_analysis.jsonl --matrix-output effect_matrix.jsonl
+python analyze_evolution_effect.py --before previous_scored.jsonl --input scored.jsonl --output effect_analysis.jsonl --matrix-output effect_matrix.jsonl --semantic-report-output semantic_economy_report.json
 python update_sample_state.py --input effect_analysis.jsonl --output state_updated.jsonl --memory-dir memory
 ```
 

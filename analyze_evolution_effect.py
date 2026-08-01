@@ -3,7 +3,7 @@ import json
 import os
 import time
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from pipeline_runtime import StageMetrics, load_json_records, publish_records, sha256_file
@@ -289,6 +289,42 @@ def is_repeated_pattern(item: Dict[str, Any]) -> bool:
     )
 
 
+def semantic_economy_observation(item: Dict[str, Any]) -> Dict[str, Any]:
+    validation = get_validation_result(item)
+    if not validation:
+        return {
+            "mode": None,
+            "evaluated": None,
+            "llm_status": "unknown",
+            "risk": "not_evaluated",
+            "semantic_redundancy_dominant": None,
+            "shared_context_repeated": None,
+            "answer_hint_expansion": None,
+            "surface_leak_risk": None,
+            "surface_leak_type": [],
+            "manual_review_status": "not_reviewed",
+            "estimated_prompt_chars": len(_clean_text(item.get("prompt"))),
+            "prompt_char_delta": None,
+            "prompt_char_growth_ratio": None,
+        }
+    leak_types = validation.get("surface_leak_type")
+    return {
+        "mode": validation.get("semantic_economy_mode"),
+        "evaluated": validation.get("semantic_economy_evaluated"),
+        "llm_status": validation.get("semantic_economy_llm_status", "unknown"),
+        "risk": validation.get("semantic_economy_risk", "not_evaluated"),
+        "semantic_redundancy_dominant": validation.get("semantic_redundancy_dominant"),
+        "shared_context_repeated": validation.get("shared_context_repeated"),
+        "answer_hint_expansion": validation.get("answer_hint_expansion"),
+        "surface_leak_risk": validation.get("surface_leak_risk"),
+        "surface_leak_type": list(leak_types) if isinstance(leak_types, list) else [],
+        "manual_review_status": validation.get("semantic_economy_manual_review_status", "not_reviewed"),
+        "estimated_prompt_chars": validation.get("estimated_prompt_chars", len(_clean_text(item.get("prompt")))),
+        "prompt_char_delta": validation.get("prompt_char_delta"),
+        "prompt_char_growth_ratio": validation.get("prompt_char_growth_ratio"),
+    }
+
+
 def _hit_confidence(
     score_drop: float,
     *,
@@ -396,6 +432,7 @@ def build_effect_analysis(
         effect_label = "no_clear_effect"
         reason = "未观察到足够清晰的得分变化。"
 
+    semantic_observation = semantic_economy_observation(item)
     return {
         "score_rate_before": score_rate_before,
         "score_rate_after": score_rate_after,
@@ -404,6 +441,7 @@ def build_effect_analysis(
         "delta_score_rate": delta_score_rate,
         "operator_used": get_operator_used(item),
         "question_length": len(_clean_text(item.get("prompt"))),
+        "semantic_economy_observation": semantic_observation,
         "is_full_score": is_full_score,
         "score_increased_after_evolution": score_increased_after_evolution,
         "complexity_passed": complexity_passed,
@@ -464,6 +502,14 @@ def build_effect_matrix(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
             "full_score_count": 0,
             "invalid_complexity_count": 0,
             "repeated_pattern_count": 0,
+            "semantic_risk_count": 0,
+            "semantic_redundancy_count": 0,
+            "shared_context_repeated_count": 0,
+            "answer_hint_expansion_count": 0,
+            "surface_leak_count": 0,
+            "surface_leak_types": Counter(),
+            "manual_review_statuses": Counter(),
+            "prompt_char_deltas": [],
         }
     )
     for record in records:
@@ -491,6 +537,23 @@ def build_effect_matrix(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
             bucket["invalid_complexity_count"] += 1
         if effect.get("repeated_pattern_with_previous_round"):
             bucket["repeated_pattern_count"] += 1
+        semantic = effect.get("semantic_economy_observation")
+        if isinstance(semantic, dict):
+            if semantic.get("risk") in {"medium", "high"}:
+                bucket["semantic_risk_count"] += 1
+            for field, counter_name in (
+                ("semantic_redundancy_dominant", "semantic_redundancy_count"),
+                ("shared_context_repeated", "shared_context_repeated_count"),
+                ("answer_hint_expansion", "answer_hint_expansion_count"),
+                ("surface_leak_risk", "surface_leak_count"),
+            ):
+                if semantic.get(field) is True:
+                    bucket[counter_name] += 1
+            bucket["surface_leak_types"].update(semantic.get("surface_leak_type") or [])
+            bucket["manual_review_statuses"].update([_clean_text(semantic.get("manual_review_status")) or "not_reviewed"])
+            delta = semantic.get("prompt_char_delta")
+            if isinstance(delta, (int, float)):
+                bucket["prompt_char_deltas"].append(delta)
 
     matrix: List[Dict[str, Any]] = []
     for (
@@ -516,9 +579,83 @@ def build_effect_matrix(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
                 "full_score_count": bucket["full_score_count"],
                 "invalid_complexity_count": bucket["invalid_complexity_count"],
                 "repeated_pattern_count": bucket["repeated_pattern_count"],
+                "semantic_risk_count": bucket["semantic_risk_count"],
+                "semantic_redundancy_count": bucket["semantic_redundancy_count"],
+                "shared_context_repeated_count": bucket["shared_context_repeated_count"],
+                "answer_hint_expansion_count": bucket["answer_hint_expansion_count"],
+                "surface_leak_count": bucket["surface_leak_count"],
+                "surface_leak_type_counts": dict(sorted(bucket["surface_leak_types"].items())),
+                "semantic_manual_review_status_counts": dict(sorted(bucket["manual_review_statuses"].items())),
+                "avg_prompt_char_delta_observation": (
+                    sum(bucket["prompt_char_deltas"]) / len(bucket["prompt_char_deltas"])
+                    if bucket["prompt_char_deltas"] else None
+                ),
             }
         )
     return matrix
+
+
+def build_semantic_economy_report(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Summarize semantic risks by operator; character fields stay observational."""
+
+    by_operator: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        effect = record.get("effect_analysis")
+        if not isinstance(effect, dict):
+            continue
+        observation = effect.get("semantic_economy_observation")
+        if isinstance(observation, dict):
+            by_operator[_clean_text(effect.get("operator_used")) or "unknown"].append(observation)
+
+    operator_rows = []
+    for operator_id, observations in sorted(by_operator.items()):
+        leak_types = Counter(
+            leak_type
+            for observation in observations
+            for leak_type in observation.get("surface_leak_type", [])
+            if _clean_text(leak_type)
+        )
+        risks = Counter(_clean_text(observation.get("risk")) or "not_evaluated" for observation in observations)
+        reviews = Counter(
+            _clean_text(observation.get("manual_review_status")) or "not_reviewed"
+            for observation in observations
+        )
+        chars = [
+            value for value in (observation.get("estimated_prompt_chars") for observation in observations)
+            if isinstance(value, (int, float))
+        ]
+        operator_rows.append({
+            "operator_id": operator_id,
+            "sample_count": len(observations),
+            "semantic_economy_risk_counts": dict(sorted(risks.items())),
+            "semantic_redundancy_count": sum(observation.get("semantic_redundancy_dominant") is True for observation in observations),
+            "shared_context_repeated_count": sum(observation.get("shared_context_repeated") is True for observation in observations),
+            "answer_hint_expansion_count": sum(observation.get("answer_hint_expansion") is True for observation in observations),
+            "surface_leak_count": sum(observation.get("surface_leak_risk") is True for observation in observations),
+            "surface_leak_type_counts": dict(sorted(leak_types.items())),
+            "semantic_manual_review_status_counts": dict(sorted(reviews.items())),
+            "character_observation": {
+                "count": len(chars),
+                "min": min(chars) if chars else None,
+                "max": max(chars) if chars else None,
+                "mean": sum(chars) / len(chars) if chars else None,
+                "decision_use": "record_only",
+            },
+        })
+    return {
+        "report_version": "semantic_economy_report_v1",
+        "character_metrics_policy": "record_only",
+        "by_operator": operator_rows,
+    }
+
+
+def write_json(value: Dict[str, Any], output_path: str) -> None:
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as target:
+        json.dump(value, target, ensure_ascii=False, indent=2)
+        target.write("\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -527,6 +664,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Output analyzed JSONL path.")
     parser.add_argument("--before", default=None, help="Optional previous scored JSON/JSONL path for score_rate_before.")
     parser.add_argument("--matrix-output", default=None, help="Optional Sample Type x Operator matrix JSONL path.")
+    parser.add_argument("--semantic-report-output", default=None, help="Optional semantic economy JSON report path.")
     parser.add_argument("--full-score-threshold", type=float, default=DEFAULT_FULL_SCORE_THRESHOLD)
     parser.add_argument("--score-drop-threshold", type=float, default=DEFAULT_SCORE_DROP_THRESHOLD)
     parser.add_argument("--review-drop-threshold", type=float, default=DEFAULT_REVIEW_DROP_THRESHOLD)
@@ -573,6 +711,8 @@ def main() -> None:
     )
     if args.matrix_output:
         write_jsonl(build_effect_matrix(analyzed), args.matrix_output)
+    if args.semantic_report_output:
+        write_json(build_semantic_economy_report(analyzed), args.semantic_report_output)
 
 
 if __name__ == "__main__":
