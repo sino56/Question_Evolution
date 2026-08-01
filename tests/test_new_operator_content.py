@@ -1,3 +1,5 @@
+import importlib
+import inspect
 import sys
 from dataclasses import fields
 from pathlib import Path
@@ -36,6 +38,25 @@ EXPECTED_NEW_OPERATOR_IDS = (
 )
 
 
+SEMANTIC_ECONOMY_EXPECTATIONS = {
+    "O19_multi_entity_role_binding": ("实体—角色—时段关系", "完整出场表"),
+    "O20_multistage_event_breakpoint": ("阶段状态和必要承接", "完整流程"),
+    "O21_object_provenance_identity": ("对象来源、关键转移、遮挡和竞争来源", "完整来源链"),
+    "O22_path_topology_reachability": ("节点、方向边、端点和时间窗口", "完整路网"),
+    "O23_observation_reliability_conflict": ("可见条件与竞争来源", "最高支持"),
+    "O24_multi_hypothesis_residual_ranking": ("共同事实只在题干出现一次", "覆盖矩阵"),
+    "O25_procedural_invariant_frame": ("共享程序、参照系和不变条件只写一次", "两套完整程序"),
+    "O26_quantitative_threshold_propagation": ("全部数值与定义", "中间计算"),
+    "O27_cross_layer_conclusion_calibration": ("跨层判断所需的事实张力和竞争证据", "最高支持"),
+    "O28_multihop_chain_closure": ("多跳链子图和必要连接", "完整路径集合"),
+    "O29_entity_identity_conflict_resolution": ("共享实体画像只定义一次", "完整排除表"),
+    "O30_active_discriminative_observation": ("当前竞争假设和能改变选择价值的可观测差异", "结果分支或更新矩阵"),
+    "O31_observation_accumulation_calibration": ("共享画面内容只写一次", "观察全文或统计表"),
+    "O32_role_graph_critical_edge": ("角色节点和关键关系边", "完整关系图"),
+    "O33_cross_modal_support_boundary": ("各模态事实、时间/实体对齐和竞争关系", "融合总结"),
+}
+
+
 def test_new_operator_ids_are_stable_unique_and_registered():
     actual_ids = tuple(spec.operator_id for spec in NEW_OPERATOR_SPECS)
     assert actual_ids == EXPECTED_NEW_OPERATOR_IDS
@@ -55,6 +76,23 @@ def test_new_operator_ids_are_stable_unique_and_registered():
             (18, "baseline_scope_mismatch"),
         )
     )
+
+
+def test_each_new_operator_has_an_individual_module_used_by_the_registry():
+    for spec in NEW_OPERATOR_SPECS:
+        module = importlib.import_module(f"prompts.operators.{spec.operator_id}")
+        assert module.SPEC is spec
+        assert OPERATOR_SPECS[spec.operator_id] is module.SPEC
+
+
+@pytest.mark.parametrize("operator_id", EXPECTED_NEW_OPERATOR_IDS)
+def test_each_individual_new_operator_owns_its_semantic_budget_contract(operator_id):
+    module = importlib.import_module(f"prompts.operators.{operator_id}")
+    required_content, forbidden_expansion = SEMANTIC_ECONOMY_EXPECTATIONS[operator_id]
+
+    assert "semantic_economy=" in inspect.getsource(module)
+    assert any(required_content in rule for rule in module.SPEC.semantic_economy)
+    assert any(forbidden_expansion in rule for rule in module.SPEC.semantic_economy)
 
 
 @pytest.mark.parametrize("spec", NEW_OPERATOR_SPECS, ids=lambda spec: spec.operator_id)
