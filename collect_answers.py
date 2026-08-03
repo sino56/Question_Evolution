@@ -20,6 +20,7 @@ from pipeline_runtime import (
     StageMetrics,
     append_performance_event,
     bounded_async_map,
+    consume_model_request_budget,
     ensure_passthrough_reusable,
     iter_json_records,
     stable_record_key,
@@ -316,6 +317,7 @@ class AnswerCollector:
     async def call_llm_raw(self, question: str, sample_key: str = "unknown") -> str:
         """原生调用 LLM，没有任何额外的 instruction"""
         async with self.request_pool.request(sample_key):
+            consume_model_request_budget()
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[

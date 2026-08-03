@@ -16,6 +16,7 @@ from operator_routing_cards import routing_card_gate
 from pipeline_runtime import (
     StageMetrics,
     TraceStore,
+    consume_model_request_budget,
     load_json_records,
     publish_records,
     sha256_file,
@@ -1202,6 +1203,7 @@ class HybridRouterClient:
     async def route(self, prompt: str) -> RouterCallResult:
         started = time.monotonic()
         client = await self._client_or_create()
+        consume_model_request_budget()
         response = await client.chat.completions.create(
             model=self.settings.model,
             messages=[{"role": "user", "content": prompt}],

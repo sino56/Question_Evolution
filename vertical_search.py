@@ -9,6 +9,7 @@ records remain the source of truth for generated questions and evaluations.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -170,6 +171,24 @@ def sample_identity(record: Mapping[str, Any]) -> str:
     return f"prompt-{prompt_hash[:16]}" if prompt_hash else "unknown-sample"
 
 
+def input_record_sha256(record: Mapping[str, Any]) -> str:
+    """Fingerprint the complete vertical-search input used by a checkpoint.
+
+    A sample id is an execution label, not proof that its prompt, baseline
+    score, or evaluation evidence is unchanged.  Reusing a checkpoint for a
+    different input would silently mix two search trees.
+    """
+
+    payload = json.dumps(
+        dict(record),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def make_root_node_id(record: Mapping[str, Any]) -> str:
     return f"{sample_identity(record)}::root"
 
@@ -261,6 +280,7 @@ def initialize_vertical_search_state(
         "vertical_search_state_version": VERTICAL_SEARCH_STATE_VERSION,
         "search_mode": VERTICAL_SEARCH_MODE,
         "root_node_id": root["node_id"],
+        "input_record_sha256": input_record_sha256(record),
         "status": "running",
         "current_depth": 1,
         "max_depth": resolved_max_depth,

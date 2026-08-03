@@ -21,6 +21,7 @@ from pipeline_runtime import (
     StageMetrics,
     append_performance_event,
     bounded_async_map,
+    consume_model_request_budget,
     ensure_passthrough_reusable,
     iter_json_records,
     validate_published_artifact,
@@ -271,6 +272,7 @@ class RotatingAPIClient:
         max_key_switches = len(self.api_keys)
         for _ in range(max_key_switches):
             try:
+                consume_model_request_budget()
                 return await self.client.chat.completions.create(**kwargs)
             except Exception as e:
                 if self._is_token_exhausted_error(e):
@@ -322,6 +324,7 @@ class AnswerLLMClient:
             request["temperature"] = self.temperature
         if self.top_p is not None:
             request["top_p"] = self.top_p
+        consume_model_request_budget()
         response = await self.client.chat.completions.create(
             **request
         )
@@ -407,6 +410,56 @@ def _canonical_title_for_matching(title: str) -> str:
     return re.sub(r"\s+", " ", normalized).strip()
 
 
+def _quote_relaxed_title_for_matching(canonical_title: str) -> str:
+    """Return a fallback key for one-sided quote drift only.
+
+    Some historical rubric titles contain an unmatched quote, while a Judge may
+    harmlessly render the same title with a balanced quote pair.  Quote removal
+    is deliberately *not* the normal matching rule: it is used only after
+    strict canonical matching fails and only when it produces a unique
+    unmatched expected/actual pair.
+    """
+
+    return canonical_title.replace('"', "")
+
+
+def _repair_unambiguous_quote_title_drift(
+    *,
+    expected_title_keys: set[str],
+    score_by_title: Dict[str, Dict[str, Any]],
+    raw_score_title_by_key: Dict[str, str],
+) -> None:
+    """Map a uniquely identifiable unmatched Judge title to its rubric title.
+
+    The fallback cannot resolve titles that differ only by quote placement when
+    more than one rubric title (or Judge title) collapses to the same
+    quote-stripped value.  Those cases remain strict failures instead of being
+    guessed into a potentially wrong rubric item.
+    """
+
+    actual_title_keys = set(score_by_title)
+    missing_keys = expected_title_keys - actual_title_keys
+    extra_keys = actual_title_keys - expected_title_keys
+    if not missing_keys or not extra_keys:
+        return
+
+    expected_by_relaxed: Dict[str, List[str]] = {}
+    actual_by_relaxed: Dict[str, List[str]] = {}
+    for title_key in missing_keys:
+        expected_by_relaxed.setdefault(_quote_relaxed_title_for_matching(title_key), []).append(title_key)
+    for title_key in extra_keys:
+        actual_by_relaxed.setdefault(_quote_relaxed_title_for_matching(title_key), []).append(title_key)
+
+    for relaxed_key, expected_keys in expected_by_relaxed.items():
+        actual_keys = actual_by_relaxed.get(relaxed_key, [])
+        if len(expected_keys) != 1 or len(actual_keys) != 1:
+            continue
+        expected_key = expected_keys[0]
+        actual_key = actual_keys[0]
+        score_by_title[expected_key] = score_by_title.pop(actual_key)
+        raw_score_title_by_key[expected_key] = raw_score_title_by_key.pop(actual_key)
+
+
 def _parse_awarded_score(awarded_raw: Any) -> int:
     try:
         if isinstance(awarded_raw, bool):
@@ -460,6 +513,11 @@ def normalize_item_scores(item_scores: Any, rubric: List[Dict[str, Any]]) -> Tup
         raw_score_title_by_key[canonical_title] = title
 
     expected_title_keys = {_canonical_title_for_matching(title) for title in rubric_titles}
+    _repair_unambiguous_quote_title_drift(
+        expected_title_keys=expected_title_keys,
+        score_by_title=score_by_title,
+        raw_score_title_by_key=raw_score_title_by_key,
+    )
     actual_title_keys = set(score_by_title)
     missing_titles = [
         title

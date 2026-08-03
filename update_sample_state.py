@@ -13,6 +13,7 @@ from analyze_evolution_effect import (
     is_question_evolved,
     load_json_or_jsonl,
 )
+from prompts.operators import OPERATOR_SPECS
 
 
 FAILURE_EFFECT_LABELS = {
@@ -63,6 +64,17 @@ OPERATOR_SURFACE_FORM_FAMILY = {
     "O8_double_threshold_claim": "conclusion_strength_boundary",
     "O9_abnormal_clue_mainline_switch": "abnormal_mainline_switch",
 }
+# Runtime operators are now defined by OPERATOR_SPECS (O10+).  Keep legacy
+# aliases above, but derive modern families from the same registry used by the
+# router so failure memory cannot silently collapse to ``unknown`` when a new
+# operator is added.
+OPERATOR_SURFACE_FORM_FAMILY.update(
+    {
+        operator_id: spec.ability_axis
+        for operator_id, spec in OPERATOR_SPECS.items()
+        if operator_id not in OPERATOR_SURFACE_FORM_FAMILY
+    }
+)
 
 
 def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str, *, append: bool = False) -> None:
@@ -262,6 +274,17 @@ def _recommended_next_methods(operator_used: str, label: str, full_score_count: 
     if label == "effective_boundary_probe":
         return []
     hints = list(NEXT_OPERATOR_HINTS.get(operator_used, []))
+    if not hints and operator_used in OPERATOR_SPECS:
+        spec = OPERATOR_SPECS[operator_used]
+        for boundary in spec.adjacent_operator_boundaries:
+            for candidate in OPERATOR_SPECS:
+                candidate_prefix = candidate.split("_", 1)[0]
+                if (
+                    candidate != operator_used
+                    and candidate_prefix in boundary
+                    and candidate not in hints
+                ):
+                    hints.append(candidate)
     if full_score_count >= 2 and "O10_evidence_sufficiency_ladder" not in hints:
         hints.append("O10_evidence_sufficiency_ladder")
     return hints
@@ -281,7 +304,10 @@ def build_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
 
     avoid_methods = list(previous_state.get("avoid_methods") or [])
     if label in FAILURE_EFFECT_LABELS or label == "needs_manual_review":
-        _append_unique(avoid_methods, OPERATOR_AVOID_METHODS.get(operator_used, []))
+        avoid_notes = OPERATOR_AVOID_METHODS.get(operator_used)
+        if not avoid_notes and operator_used in OPERATOR_SPECS:
+            avoid_notes = [f"继续复用 {operator_used} 的同一表层结构"]
+        _append_unique(avoid_methods, avoid_notes or [])
 
     recommended = _recommended_next_methods(operator_used, label, full_score_count)
     if not recommended and label != "effective_boundary_probe":

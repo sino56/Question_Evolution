@@ -12,6 +12,7 @@ import gzip
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import time
 from collections import deque
@@ -37,6 +38,75 @@ class StageJsonError(ValueError):
 
 class ArtifactConflictError(RuntimeError):
     """Raised when existing output/recovery files do not belong to this run."""
+
+
+class RequestBudgetExceeded(RuntimeError):
+    """Raised before a model request would exceed a configured search budget."""
+
+
+REQUEST_BUDGET_PATH_ENV = "SEARCH_REQUEST_BUDGET_PATH"
+
+
+def initialize_request_budget(path: str | os.PathLike[str], limit: int) -> None:
+    """Create or validate a durable, cross-process request-budget ledger."""
+
+    if limit < 1:
+        raise ValueError("request budget limit must be >= 1")
+    ledger = Path(path)
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(ledger, timeout=30) as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS request_budget (id INTEGER PRIMARY KEY CHECK(id = 1), used INTEGER NOT NULL, limit_value INTEGER NOT NULL)"
+        )
+        row = connection.execute(
+            "SELECT used, limit_value FROM request_budget WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                "INSERT INTO request_budget(id, used, limit_value) VALUES (1, 0, ?)",
+                (limit,),
+            )
+        elif int(row[1]) != limit:
+            raise ArtifactConflictError(
+                "request budget limit differs from the existing vertical-search ledger"
+            )
+
+
+def request_budget_usage(path: str | os.PathLike[str]) -> int:
+    ledger = Path(path)
+    if not ledger.is_file():
+        return 0
+    with sqlite3.connect(ledger, timeout=30) as connection:
+        row = connection.execute(
+            "SELECT used FROM request_budget WHERE id = 1"
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def consume_model_request_budget() -> None:
+    """Atomically reserve one actual model request when a search ledger is active."""
+
+    raw_path = os.getenv(REQUEST_BUDGET_PATH_ENV, "").strip()
+    if not raw_path:
+        return
+    with sqlite3.connect(raw_path, timeout=30, isolation_level=None) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT used, limit_value FROM request_budget WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            connection.execute("ROLLBACK")
+            raise RuntimeError("request budget ledger is not initialized")
+        used, limit = int(row[0]), int(row[1])
+        if used >= limit:
+            connection.execute("ROLLBACK")
+            raise RequestBudgetExceeded(
+                f"model request budget exhausted ({used}/{limit})"
+            )
+        connection.execute(
+            "UPDATE request_budget SET used = ? WHERE id = 1", (used + 1,)
+        )
+        connection.execute("COMMIT")
 
 
 def utc_now() -> str:

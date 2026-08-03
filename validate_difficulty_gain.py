@@ -11,7 +11,7 @@ from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, T
 from local_api_config import get_config_list, get_config_value
 from prompts.difficulty_gain_validation import build_difficulty_gain_prompt, build_weak_probe_judgment_prompt
 from schema_validation import validate_records_against_schema
-from pipeline_runtime import StageMetrics, load_json_records, publish_records
+from pipeline_runtime import StageMetrics, consume_model_request_budget, load_json_records, publish_records
 
 
 DEFAULT_VALIDATOR_MODEL = (
@@ -704,6 +704,7 @@ class DifficultyGainValidationClient:
         for offset in range(len(self.clients)):
             index = (self.current + offset) % len(self.clients)
             try:
+                consume_model_request_budget()
                 response = await self.clients[index].chat.completions.create(
                     model=self.model,
                     messages=[
@@ -725,6 +726,7 @@ class DifficultyGainValidationClient:
         for offset in range(len(self.clients)):
             index = (self.current + offset) % len(self.clients)
             try:
+                consume_model_request_budget()
                 response = await self.clients[index].chat.completions.create(
                     model=self.model,
                     messages=[
@@ -768,6 +770,7 @@ class WeakProbeAnswerClient:
         for offset in range(len(self.clients)):
             index = (self.current + offset) % len(self.clients)
             try:
+                consume_model_request_budget()
                 response = await self.clients[index].chat.completions.create(
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],

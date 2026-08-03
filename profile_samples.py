@@ -13,6 +13,7 @@ from pipeline_runtime import (
     TraceStore,
     append_performance_event,
     bounded_async_map,
+    consume_model_request_budget,
     iter_json_records,
     load_json_records,
     stable_record_key,
@@ -173,6 +174,7 @@ class RotatingAPIClient:
     async def chat_completions_create(self, **kwargs):
         if self.client is None:
             self._init_client()
+        consume_model_request_budget()
         return await self.client.chat.completions.create(**kwargs)
 
 

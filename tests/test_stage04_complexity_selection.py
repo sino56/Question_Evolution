@@ -422,12 +422,30 @@ def test_formal_validation_reuses_generation_result_only_for_same_rule_version()
     assert recomputed["local_validation_rule_version"] == cached["local_validation_rule_version"]
 
 
+def test_formal_validation_cache_is_invalidated_when_candidate_prompt_changes():
+    item = {
+        "sample_id": "cache-prompt",
+        "prompt": "根据题干事实判断当前结论。",
+        "question_evolved": True,
+        "meta_info": {"prompt_old": "原题", "question_evolution_metadata": {}},
+    }
+    cached = validate_record(item)
+    item["meta_info"]["question_evolution_metadata"]["local_validation_result"] = cached
+    item["prompt"] = "请分别判断甲、乙、丙三项结论并给出排序。"
+
+    validated = attach_validation_result(item)["validation_result"]
+
+    assert validated["local_validation_reused"] is False
+    assert validated["local_validation_prompt_sha256"] != cached["local_validation_prompt_sha256"]
+
+
 if __name__ == "__main__":
     test_question_evolution_can_emit_primary_and_backup_candidates()
     test_validate_retry_reuses_operator_and_includes_reject_reason()
     test_llm_validation_result_can_reject_unanswerable_candidate()
     test_dynamic_candidate_budget_allocates_more_to_priority_samples()
-    test_validation_rejects_overlong_duplicate_multitask_and_accepts_clean_candidate()
+    test_validation_records_overlong_prompt_but_rejects_duplicate_and_multitask_candidates()
     test_candidate_selection_selects_valid_candidate_and_records_rejections()
     test_all_invalid_candidates_restore_parent_snapshot_for_passthrough()
+    test_formal_validation_cache_is_invalidated_when_candidate_prompt_changes()
     print("stage04 complexity validation and candidate selection checks passed")

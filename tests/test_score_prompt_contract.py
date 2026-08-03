@@ -68,7 +68,68 @@ def test_item_score_title_matching_tolerates_quote_style_drift():
     assert normalized_scores[0]["title"] == "法律研判深度与“排除合理怀疑”原则"
 
 
+def test_item_score_title_matching_tolerates_unpaired_source_quote_drift():
+    install_dependency_stubs()
+    from scoring import normalize_item_scores
+
+    rubric = [
+        {
+            "title": '破坏进入"的动态特征深度',
+            "description": "历史数据中缺少左引号。",
+            "weight": 10,
+        },
+        {
+            "title": '溜门"盗窃的操控自然度判定',
+            "description": "历史数据中缺少左引号。",
+            "weight": 10,
+        },
+    ]
+    item_scores = [
+        {
+            "title": "“破坏进入”的动态特征深度",
+            "awarded": 8,
+            "brief_reason": "Judge 补全了成对引号。",
+        },
+        {
+            "title": "“溜门”盗窃的操控自然度判定",
+            "awarded": 7,
+            "brief_reason": "Judge 补全了成对引号。",
+        },
+    ]
+
+    normalized_scores, total_awarded = normalize_item_scores(item_scores, rubric)
+
+    assert total_awarded == 15
+    assert [item["title"] for item in normalized_scores] == [
+        '破坏进入"的动态特征深度',
+        '溜门"盗窃的操控自然度判定',
+    ]
+
+
+def test_item_score_title_matching_keeps_ambiguous_quote_drift_strict():
+    install_dependency_stubs()
+    from scoring import normalize_item_scores
+
+    rubric = [
+        {"title": '甲"', "description": "标题一。", "weight": 10},
+        {"title": "甲", "description": "标题二。", "weight": 10},
+    ]
+    item_scores = [
+        {"title": "“甲”", "awarded": 8, "brief_reason": "不应猜测对应项。"},
+        {"title": "乙", "awarded": 8, "brief_reason": "不应猜测对应项。"},
+    ]
+
+    try:
+        normalize_item_scores(item_scores, rubric)
+    except ValueError as exc:
+        assert "title 与 rubric 不一致" in str(exc)
+    else:
+        raise AssertionError("ambiguous quote-only title drift must remain a strict failure")
+
+
 if __name__ == "__main__":
     test_score_prompt_placeholder_contract_is_shared()
     test_item_score_title_matching_tolerates_quote_style_drift()
+    test_item_score_title_matching_tolerates_unpaired_source_quote_drift()
+    test_item_score_title_matching_keeps_ambiguous_quote_drift_strict()
     print("score prompt placeholder contract checks passed")

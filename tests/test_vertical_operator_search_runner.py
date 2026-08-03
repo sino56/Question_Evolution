@@ -3,12 +3,16 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from update_sample_state import build_failure_memory_entry
+from pipeline_runtime import consume_model_request_budget
+from multi_operator_search import _run
 from schema_validation import validate_records_against_schema
 import vertical_operator_search as vertical_operator_search_module
 from vertical_operator_search import VerticalOperatorSearchRunner
@@ -40,6 +44,7 @@ class FakeVerticalRunner(VerticalOperatorSearchRunner):
         return routed, plan, {"operator_memory_sha256": "memory-v1"}
 
     def _execute_parent(self, prepared, parent_node, *, local_boundary_target):
+        consume_model_request_budget()
         self.execute_calls.append(parent_node["node_id"])
         state = deepcopy(prepared["search_state"])
         self.seen_hash_snapshots.append(list(state["seen_prompt_hashes"]))
@@ -199,7 +204,7 @@ def test_request_budget_is_reported_as_system_protection_not_business_completion
     resumed_result = resumed.run([sample()])
     assert resumed_result[0]["vertical_search_state"]["status"] == "completed"
     assert "runner-sample::root" not in resumed.route_calls
-    assert resumed.execute_calls[0] == "runner-sample::root"
+    assert resumed.execute_calls[0] == "runner-sample::root::O10_evidence_sufficiency_ladder"
 
 
 def test_non_evolution_record_is_passed_through_without_vertical_state(tmp_path):
@@ -209,6 +214,34 @@ def test_non_evolution_record_is_passed_through_without_vertical_state(tmp_path)
     result = runner.run([record])
     assert "vertical_search_state" not in result[0]
     assert runner.execute_calls == []
+
+
+def test_duplicate_sample_identity_is_rejected_before_artifacts_can_mix(tmp_path):
+    runner = make_runner(tmp_path)
+    second = sample()
+    second["prompt"] = "different prompt with the same sample id"
+
+    with pytest.raises(ValueError, match="unique sample_id/index identities"):
+        runner.run([sample(), second])
+
+
+def test_changed_input_cannot_reuse_a_vertical_checkpoint(tmp_path):
+    first = make_runner(tmp_path)
+    first.run([sample()])
+    changed = sample()
+    changed["prompt"] = "changed root prompt"
+
+    with pytest.raises(ValueError, match="input fingerprint mismatch"):
+        make_runner(tmp_path).run([changed])
+
+
+def test_search_stage_subprocess_honors_its_remaining_deadline():
+    with pytest.raises(TimeoutError, match="exceeded remaining sample deadline"):
+        _run(
+            [sys.executable, "-c", "import time; time.sleep(1)"],
+            cwd=ROOT,
+            timeout_seconds=0.01,
+        )
 
 
 def test_vertical_node_id_is_the_existing_memory_idempotency_scope(tmp_path):

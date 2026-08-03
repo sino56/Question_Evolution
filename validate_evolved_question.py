@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from local_api_config import get_config_list, get_config_value
 from prompts.validation_prompt import build_validation_prompt
 from schema_validation import validate_records_against_schema
-from pipeline_runtime import StageMetrics, load_json_records, publish_records
+from pipeline_runtime import StageMetrics, consume_model_request_budget, load_json_records, publish_records
 from semantic_budget import detect_surface_leaks, suggested_same_operator_retry_reason
 
 
@@ -85,6 +85,18 @@ def local_validation_rule_version(
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def local_validation_prompt_sha256(item: Dict[str, Any]) -> str:
+    """Return the exact candidate-text identity for a reusable local result.
+
+    Validation counts characters and applies text patterns, so whitespace is
+    significant here.  A rule-version match alone cannot establish that the
+    cached verdict belongs to the current candidate.
+    """
+
+    prompt = get_current_prompt(item)
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
@@ -331,6 +343,7 @@ class LLMValidationClient:
         for offset in range(len(self.clients)):
             idx = (self.current + offset) % len(self.clients)
             try:
+                consume_model_request_budget()
                 response = await self.clients[idx].chat.completions.create(
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
@@ -581,6 +594,7 @@ def validate_record(
             "invalid_type": None,
         }, llm_validation)
         result["local_validation_rule_version"] = rule_version
+        result["local_validation_prompt_sha256"] = local_validation_prompt_sha256(item)
         return result
 
     original_prompt = get_original_prompt(item)
@@ -680,6 +694,7 @@ def validate_record(
     rule_result = _append_semantic_gate(rule_result, mode=semantic_mode)
     result = merge_llm_validation_result(rule_result, llm_validation)
     result["local_validation_rule_version"] = rule_version
+    result["local_validation_prompt_sha256"] = local_validation_prompt_sha256(item)
     return result
 
 
@@ -687,11 +702,14 @@ def _cached_local_validation(
     item: Dict[str, Any],
     *,
     expected_rule_version: str,
+    expected_prompt_sha256: str,
 ) -> Optional[Dict[str, Any]]:
     cached = _metadata(item).get("local_validation_result")
     if not isinstance(cached, dict):
         return None
     if cached.get("local_validation_rule_version") != expected_rule_version:
+        return None
+    if cached.get("local_validation_prompt_sha256") != expected_prompt_sha256:
         return None
     return dict(cached)
 
@@ -715,7 +733,12 @@ def attach_validation_result(
         max_counterfactuals=max_counterfactuals,
         semantic_economy_mode=semantic_mode,
     )
-    cached = _cached_local_validation(item, expected_rule_version=expected_rule_version)
+    expected_prompt_sha256 = local_validation_prompt_sha256(item)
+    cached = _cached_local_validation(
+        item,
+        expected_rule_version=expected_rule_version,
+        expected_prompt_sha256=expected_prompt_sha256,
+    )
     if cached is not None:
         cached["local_validation_reused"] = True
         result["validation_result"] = merge_llm_validation_result(cached, llm_validation)

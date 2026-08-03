@@ -25,7 +25,6 @@ from prompts.operators import OPERATOR_SPECS
 from route_integrity import (
     ROUTE_INTEGRITY_VERSION,
     RouteIntegrityError,
-    live_route_identity,
     route_fingerprint,
     validate_live_route_integrity,
 )

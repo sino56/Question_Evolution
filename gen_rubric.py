@@ -18,6 +18,7 @@ from pipeline_runtime import (
     StageMetrics,
     append_performance_event,
     bounded_async_map,
+    consume_model_request_budget,
     ensure_passthrough_reusable,
     iter_json_records,
     stable_record_key,
@@ -123,6 +124,7 @@ class RotatingAPIClient:
         
         for attempt in range(max_key_switches):
             try:
+                consume_model_request_budget()
                 return await self.client.chat.completions.create(**kwargs)
             except Exception as e:
                 if self._is_token_exhausted_error(e):

@@ -59,3 +59,22 @@ def test_memory_failure_prevents_formal_state_publish(tmp_path: Path, monkeypatc
         update_sample_state.main()
     assert not output.exists()
     assert not Path(f"{output}.manifest.json").exists()
+
+
+def test_registered_new_operator_has_non_unknown_failure_memory_family_and_next_hint():
+    operator_id = "O19_multi_entity_role_binding"
+    item = {
+        "sample_id": "new-operator-feedback",
+        "question_evolved": True,
+        "effect_analysis": {
+            "effect_label": "score_increased",
+            "operator_used": operator_id,
+            "score_rate_before": 0.8,
+            "score_rate_after": 0.9,
+        },
+    }
+
+    assert update_sample_state.surface_form_family(item, operator_id) != "unknown"
+    next_state = update_sample_state.build_next_state(item)
+    assert next_state["recommended_next_methods"]
+    assert next_state["avoid_methods"]

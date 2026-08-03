@@ -13,6 +13,7 @@ import json
 import os
 import statistics
 import time
+from contextlib import contextmanager
 from collections import Counter, defaultdict
 from copy import deepcopy
 from pathlib import Path
@@ -21,7 +22,14 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from branch_artifacts import BranchArtifactStore
 from multi_operator_search import MultiOperatorSearchRunner, _python_stage, _run
 from operator_router import load_jsonl_if_exists, route_records
-from pipeline_runtime import load_json_records, publish_records, sha256_file
+from pipeline_runtime import (
+    REQUEST_BUDGET_PATH_ENV,
+    initialize_request_budget,
+    load_json_records,
+    publish_records,
+    request_budget_usage,
+    sha256_file,
+)
 from search_coordinator import (
     _write_jsonl_atomic,
     initialize_search_state,
@@ -42,6 +50,7 @@ from vertical_search import (
     claim_next_frontier,
     complete_frontier,
     initialize_vertical_search_state,
+    input_record_sha256,
     mark_system_termination,
     normalized_prompt_hash,
     reconcile_vertical_boundary_counts,
@@ -176,6 +185,65 @@ class VerticalOperatorSearchRunner:
             self.memory_dir / "failure_memory_bank.jsonl",
         )
 
+    def _request_budget_path(self, sample_key: str) -> Path:
+        import hashlib
+
+        digest = hashlib.sha256(sample_key.encode("utf-8")).hexdigest()[:16]
+        return self.work_dir / "request_budgets" / f"{digest}.sqlite"
+
+    @contextmanager
+    def _sample_request_budget(self, sample_key: str):
+        if not self.max_request_attempts_per_sample:
+            yield
+            return
+        ledger = self._request_budget_path(sample_key)
+        initialize_request_budget(ledger, self.max_request_attempts_per_sample)
+        previous = os.environ.get(REQUEST_BUDGET_PATH_ENV)
+        os.environ[REQUEST_BUDGET_PATH_ENV] = str(ledger)
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop(REQUEST_BUDGET_PATH_ENV, None)
+            else:
+                os.environ[REQUEST_BUDGET_PATH_ENV] = previous
+
+    def _request_budget_exhausted(self, sample_key: str) -> bool:
+        return bool(
+            self.max_request_attempts_per_sample
+            and request_budget_usage(self._request_budget_path(sample_key))
+            >= self.max_request_attempts_per_sample
+        )
+
+    def _remaining_sample_seconds(self, sample_key: str) -> Optional[float]:
+        if not self.sample_timeout_seconds:
+            return None
+        started_at = self.started_at_by_sample.setdefault(sample_key, time.monotonic())
+        elapsed = time.monotonic() - started_at
+        remaining = self.sample_timeout_seconds - elapsed
+        if remaining <= 0:
+            raise TimeoutError("vertical search sample timeout exceeded")
+        return remaining
+
+    @contextmanager
+    def _sample_stage_deadline(self, sample_key: str):
+        """Expose a per-sample deadline to every subprocess in one closure."""
+
+        remaining = self._remaining_sample_seconds(sample_key)
+        if remaining is None:
+            yield
+            return
+        key = "SEARCH_STAGE_DEADLINE_EPOCH"
+        previous = os.environ.get(key)
+        os.environ[key] = str(time.time() + remaining)
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
     def _memory_snapshot(self) -> Dict[str, Any]:
         operator_path, failure_path = self._memory_paths()
         return {
@@ -272,7 +340,13 @@ class VerticalOperatorSearchRunner:
                 "--concurrency",
                 str(self.profile_concurrency),
             )
-            _run(command, cwd=self.project_dir)
+            _run(
+                command,
+                cwd=self.project_dir,
+                timeout_seconds=self._remaining_sample_seconds(
+                    _clean(parent_node["sample_id"])
+                ),
+            )
         rows = load_json_records(
             str(profile_output_path), stage="vertical_frontier_profile_recovery"
         )
@@ -344,6 +418,7 @@ class VerticalOperatorSearchRunner:
         else:
             operator_path, failure_path = self._memory_paths()
             profile_input = self._profile_frontier(parent_record, parent_node)
+            remaining = self._remaining_sample_seconds(_clean(parent_node["sample_id"]))
             routed = route_records(
                 [profile_input],
                 operator_memory=load_jsonl_if_exists(str(operator_path)),
@@ -352,7 +427,11 @@ class VerticalOperatorSearchRunner:
                 assignment_mode=("live" if self.routing_mode == "hybrid" else "natural"),
                 router_model=self.router_model,
                 router_base_url=self.router_base_url,
-                router_timeout_seconds=self.router_timeout_seconds,
+                router_timeout_seconds=(
+                    min(self.router_timeout_seconds, remaining)
+                    if remaining is not None
+                    else self.router_timeout_seconds
+                ),
                 router_retries=self.router_retries,
                 router_concurrency=self.router_concurrency,
                 router_cache=str(self.router_cache),
@@ -574,13 +653,15 @@ class VerticalOperatorSearchRunner:
             defer_gpt_experimental_evaluation=self.defer_gpt_experimental_evaluation,
             artifact_retention=self.artifact_retention,
         )
-        rows = (
-            runner.run_stream([prepared])
-            if self.pipeline_mode == "stream"
-            else runner.run(
-                [prepared], output_path=parent_dir / "parent_search_state.jsonl"
+        sample_key = _clean(parent_node["sample_id"])
+        with self._sample_request_budget(sample_key), self._sample_stage_deadline(sample_key):
+            rows = (
+                runner.run_stream([prepared])
+                if self.pipeline_mode == "stream"
+                else runner.run(
+                    [prepared], output_path=parent_dir / "parent_search_state.jsonl"
+                )
             )
-        )
         if len(rows) != 1:
             raise RuntimeError("vertical parent execution must return exactly one state")
         _write_jsonl_atomic(rows, str(parent_dir / "parent_search_state.jsonl"))
@@ -740,6 +821,15 @@ class VerticalOperatorSearchRunner:
                 recovered_state = recovered_record.get("vertical_search_state")
                 if isinstance(recovered_state, Mapping):
                     recovered_state = upgrade_vertical_search_state(recovered_state)
+                    expected_input_sha256 = input_record_sha256(input_record)
+                    recovered_input_sha256 = _clean(
+                        recovered_state.get("input_record_sha256")
+                    )
+                    if recovered_input_sha256 != expected_input_sha256:
+                        raise ValueError(
+                            "vertical checkpoint input fingerprint mismatch for "
+                            f"{identity}; use a new work directory for changed input"
+                        )
                     if (
                         recovered_state.get("status") == "partial"
                         and recovered_state.get("termination_reason")
@@ -770,13 +860,33 @@ class VerticalOperatorSearchRunner:
         self._checkpoint(initialized)
         return initialized
 
+    @staticmethod
+    def _assert_unique_input_identities(
+        records: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Reject inputs that would otherwise share a checkpoint/artifact tree."""
+
+        first_positions: Dict[str, int] = {}
+        duplicates: List[str] = []
+        for position, record in enumerate(records, start=1):
+            identity = sample_identity(record)
+            if identity in first_positions:
+                duplicates.append(
+                    f"{identity} (rows {first_positions[identity]} and {position})"
+                )
+            else:
+                first_positions[identity] = position
+        if duplicates:
+            raise ValueError(
+                "vertical search requires unique sample_id/index identities; "
+                "duplicate inputs would share artifacts: " + "; ".join(duplicates)
+            )
+
     def _budget_reason(
         self, state: Mapping[str, Any], sample_key: str
     ) -> Optional[str]:
         if (
-            self.max_request_attempts_per_sample
-            and int(state.get("completed_operator_attempt_count") or 0)
-            >= self.max_request_attempts_per_sample
+            self._request_budget_exhausted(sample_key)
         ):
             return "request_budget_exhausted"
         if self.max_evaluations_per_sample:
@@ -798,6 +908,7 @@ class VerticalOperatorSearchRunner:
         self.run_started_at = time.monotonic()
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
+        self._assert_unique_input_identities(records)
         output_records = self._initial_records(records)
         for output_record in output_records:
             raw_state = output_record.get("vertical_search_state")
@@ -842,11 +953,12 @@ class VerticalOperatorSearchRunner:
                 )
                 try:
                     if saved_plan and isinstance(saved_route, Mapping):
-                        routed = (
-                            self._profile_frontier(parent_record, parent_node)
-                            if int(parent_node.get("depth") or 0) > 1
-                            else deepcopy(dict(parent_record))
-                        )
+                        with self._sample_request_budget(sample_key):
+                            routed = (
+                                self._profile_frontier(parent_record, parent_node)
+                                if int(parent_node.get("depth") or 0) > 1
+                                else deepcopy(dict(parent_record))
+                            )
                         routed["operator_route"] = deepcopy(dict(saved_route))
                         plan = saved_plan
                         saved_memory = active_execution.get("memory_version")
@@ -856,9 +968,10 @@ class VerticalOperatorSearchRunner:
                             else {}
                         )
                     else:
-                        routed, plan, memory_version = self._route_frontier(
-                            parent_record, parent_node, state
-                        )
+                        with self._sample_request_budget(sample_key):
+                            routed, plan, memory_version = self._route_frontier(
+                                parent_record, parent_node, state
+                            )
                         state = self._record_active_plan(
                             state,
                             parent_id,
@@ -873,7 +986,19 @@ class VerticalOperatorSearchRunner:
                         )
                         output_record["vertical_search_state"] = state
                         self._checkpoint(output_records)
+                except TimeoutError:
+                    state = mark_system_termination(state, "timeout")
+                    output_record["vertical_search_state"] = state
+                    self._checkpoint(output_records)
+                    break
                 except Exception:
+                    if self._request_budget_exhausted(sample_key):
+                        state = mark_system_termination(
+                            state, "request_budget_exhausted"
+                        )
+                        output_record["vertical_search_state"] = state
+                        self._checkpoint(output_records)
+                        break
                     state = mark_system_termination(state, "fatal_error")
                     output_record["vertical_search_state"] = state
                     self._checkpoint(output_records)
@@ -904,17 +1029,6 @@ class VerticalOperatorSearchRunner:
                     output_record["vertical_search_state"] = state
                     self._checkpoint(output_records)
                     continue
-                if self.max_request_attempts_per_sample:
-                    remaining_attempts = max(
-                        0,
-                        self.max_request_attempts_per_sample
-                        - int(state.get("completed_operator_attempt_count") or 0),
-                    )
-                    if remaining_attempts < len(plan):
-                        state = mark_system_termination(
-                            state, "request_budget_exhausted"
-                        )
-                        break
                 if self.max_evaluations_per_sample:
                     scored_count = sum(
                         1
@@ -943,11 +1057,12 @@ class VerticalOperatorSearchRunner:
                     local_boundary_target=remaining_target,
                 )
                 try:
-                    horizontal_state, artifacts = self._execute_parent(
-                        prepared,
-                        parent_node,
-                        local_boundary_target=remaining_target,
-                    )
+                    with self._sample_request_budget(sample_key), self._sample_stage_deadline(sample_key):
+                        horizontal_state, artifacts = self._execute_parent(
+                            prepared,
+                            parent_node,
+                            local_boundary_target=remaining_target,
+                        )
                     state, _children = self._merge_parent_artifacts(
                         state,
                         parent_node,
@@ -956,7 +1071,19 @@ class VerticalOperatorSearchRunner:
                         plan,
                         memory_version,
                     )
+                except TimeoutError:
+                    state = mark_system_termination(state, "timeout")
+                    output_record["vertical_search_state"] = state
+                    self._checkpoint(output_records)
+                    break
                 except Exception:
+                    if self._request_budget_exhausted(sample_key):
+                        state = mark_system_termination(
+                            state, "request_budget_exhausted"
+                        )
+                        output_record["vertical_search_state"] = state
+                        self._checkpoint(output_records)
+                        break
                     state = mark_system_termination(state, "fatal_error")
                     output_record["vertical_search_state"] = state
                     self._checkpoint(output_records)

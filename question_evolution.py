@@ -23,6 +23,7 @@ from pipeline_runtime import (
     TraceStore,
     append_performance_event,
     bounded_async_map,
+    consume_model_request_budget,
     iter_json_records,
     load_json_records,
     stable_record_key,
@@ -591,6 +592,7 @@ class RotatingAPIClient:
     async def chat_completions_create(self, **kwargs):
         for _ in range(len(self.api_keys)):
             try:
+                consume_model_request_budget()
                 return await self.client.chat.completions.create(**kwargs)
             except Exception as e:
                 if self._is_token_exhausted_error(e):

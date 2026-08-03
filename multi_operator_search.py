@@ -73,8 +73,36 @@ def _clean(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _run(command: Sequence[str], *, cwd: Path) -> None:
-    subprocess.run(list(command), cwd=str(cwd), check=True)
+def _run(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    timeout_seconds: Optional[float] = None,
+) -> None:
+    """Run one stage without allowing a vertical sample deadline to be ignored."""
+
+    timeout = timeout_seconds
+    if timeout is None:
+        raw_deadline = os.getenv("SEARCH_STAGE_DEADLINE_EPOCH", "").strip()
+        if raw_deadline:
+            try:
+                timeout = float(raw_deadline) - time.time()
+            except ValueError:
+                timeout = None
+    if timeout is not None:
+        if timeout <= 0:
+            raise TimeoutError("search sample deadline expired before stage launch")
+    try:
+        subprocess.run(
+            list(command),
+            cwd=str(cwd),
+            check=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"search stage exceeded remaining sample deadline: {command[1] if len(command) > 1 else command[0]}"
+        ) from exc
 
 
 def _records_by_branch(records: Iterable[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
