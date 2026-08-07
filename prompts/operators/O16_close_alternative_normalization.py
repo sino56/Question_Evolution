@@ -23,6 +23,7 @@ SPEC = OperatorPromptSpec(
         "是否依据可观察 discriminator 判断替代解释能否覆盖核心异常",
     ),
     reasoning_object="一个目标解释、一个相近替代解释、双方事实覆盖与残差以及一个可观察 discriminator",
+    question_construction="自然呈现两个均可解释部分事实的相近解释和混合观察，不写覆盖矩阵、残差清单或淘汰语句。",
     content_transformation=(
         "在保留目标解释和核心观察的同时加入一个能覆盖多项共享事实的相近解释；"
         "让双方的决定性分歧集中在一个可观察事实，并在内部执行 discriminator 消融。"

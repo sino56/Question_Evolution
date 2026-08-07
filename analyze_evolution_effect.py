@@ -283,6 +283,19 @@ def validation_passed_for_effect(item: Dict[str, Any]) -> bool:
     return validation.get("passed") is True
 
 
+def completed_score_summary(summary: Any, *, minimum_successes: int = 1) -> bool:
+    """Require actual completed trials before an effect can be confirmed."""
+
+    if not isinstance(summary, dict):
+        return False
+    try:
+        successful = int(summary.get("successful_count", 0) or 0)
+        failed = int(summary.get("failed_count", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return summary.get("status", "completed") == "completed" and successful >= minimum_successes and failed == 0
+
+
 def is_repeated_pattern(item: Dict[str, Any]) -> bool:
     validation = get_validation_result(item)
     return validation.get("repeat_pattern_risk") == "high" or bool(
@@ -439,8 +452,11 @@ def build_effect_analysis(
     reference_verification = reference_rebuild.get("verification") if isinstance(reference_rebuild, dict) else {}
     reference_verified = bool(isinstance(reference_verification, dict) and reference_verification.get("verified") is True)
     scoring_result = item.get("scoring_result") if isinstance(item.get("scoring_result"), dict) else {}
-    scoring_stable = bool(scoring_result.get("qwen_score_summary") or scoring_result.get("item_scores"))
-    strong_answer_checked = bool(scoring_result.get("gpt_answer_score_summary") or scoring_result.get("gpt_score_summary"))
+    # Qwen must have repeatable completed judgement observations.  A single
+    # representative score is useful for routing, but not enough to confirm a
+    # boundary effect.  The strong-answer negative-control also has to finish.
+    scoring_stable = completed_score_summary(scoring_result.get("qwen_score_summary"), minimum_successes=2)
+    strong_answer_checked = completed_score_summary(scoring_result.get("gpt_answer_score_summary"), minimum_successes=1)
     effect_scope_allowed = scope_allows(item, "effect_claim")
     validation_disposition = get_validation_result(item).get("validation_disposition")
     validation_disposition = validation_disposition if isinstance(validation_disposition, dict) else {}

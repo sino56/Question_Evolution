@@ -153,6 +153,24 @@ ANSWER_REQUEST_CONCURRENCY=${ANSWER_REQUEST_CONCURRENCY:-20}
 RUBRIC_CONCURRENCY=${RUBRIC_CONCURRENCY:-10}
 # ======================================================
 
+# A changed question must complete the formal rebuild -> rubric -> answer ->
+# multi-trial scoring chain.  Fail before producing a partial experiment when
+# any required model identity or confirmation repeat budget is absent.
+validate_full_iteration_configuration() {
+    local required_name
+    for required_name in EVOLVE_MODEL GPT_MODEL QWEN_MODEL GPT_JUDGE_MODEL GPT_ANSWER_MODEL; do
+        if [ -z "${!required_name}" ]; then
+            echo "full_iteration 缺少必需配置: $required_name" >&2
+            exit 2
+        fi
+    done
+    if [ "$SCORING_ANSWER_TRIALS" -lt 2 ] || [ "$GPT_ANSWER_TRIALS" -lt 1 ]; then
+        echo "full_iteration 至少需要 2 次弱模型评分和 1 次强模型负对照回答" >&2
+        exit 2
+    fi
+}
+validate_full_iteration_configuration
+
 if [ ! -f "$INPUT_FILE" ] && [ "$INPUT_FILE" = "$DEFAULT_INPUT_FILE" ] && [ -f "$LEGACY_INPUT_FILE" ]; then
     INPUT_FILE="$LEGACY_INPUT_FILE"
 fi

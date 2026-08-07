@@ -22,6 +22,7 @@ SPEC = OperatorPromptSpec(
         "是否把经验常识当作题面已发生事实",
     ),
     reasoning_object="生成题面的事实闭包",
+    question_construction="不生成自然题面；只检查公开事实能否追溯到来源事实、受控假设事实或题内规则。",
     content_transformation="不执行题目内容变换；仅定义所有生成算子共同遵守的信息闭包原则",
     invariants=(
         "题面事实只能来自输入材料",

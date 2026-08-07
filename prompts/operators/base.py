@@ -18,6 +18,7 @@ class OperatorPromptSpec:
     semantic_economy: Sequence[str] = field(kw_only=True)
     prompt_recipe_version: str = "semantic_economy_surface_v1"
     reasoning_object: str = ""
+    question_construction: str = ""
     content_transformation: str = ""
     invariants: Sequence[str] = ()
     competition_structure: str = ""
@@ -49,16 +50,23 @@ class OperatorPromptSpec:
         Materialise the unified read-only view here so old modules remain
         compatible while every spec exposes the same governance contract.
         """
+        if not self.question_construction:
+            object.__setattr__(self, "question_construction", self.content_transformation)
         if not self.content_controls:
             object.__setattr__(
                 self,
                 "content_controls",
                 {
+                    "positive_case": tuple(self.positive_controls),
+                    "slot_shortage_or_negative_case": tuple(
+                        self.conclusion_invariant_negative_controls
+                    ),
                     "decisive_fact_ablation": tuple(self.positive_controls),
                     "irrelevant_fact_ablation": tuple(
                         self.conclusion_invariant_negative_controls
                     ),
                     "name_or_order_swap": tuple(self.surface_swap_controls),
+                    "information_balance": tuple(self.hidden_role_balance_controls),
                 },
             )
 
@@ -87,6 +95,7 @@ def build_prompt(
     visible_context = dict(generator_visible_context or {})
     surface_contract = {
         "neutral_task_intent": spec.required_question_shape,
+        "question_construction": spec.question_construction,
         "avoid": spec.avoid,
         "semantic_economy": list(spec.semantic_economy),
         "prompt_recipe_version": spec.prompt_recipe_version,

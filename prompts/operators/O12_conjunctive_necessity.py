@@ -23,6 +23,7 @@ SPEC = OperatorPromptSpec(
         "是否避免把信息增加或单条强线索误当共同必要关系",
     ),
     reasoning_object="预先确定的两个独立事实条件及其仅 X、仅 Y、X+Y 语义组合",
+    question_construction="将两个条件及其组合效果自然混入可比观察材料，不公开 X/Y/X+Y 标签或共同满足提示。",
     content_transformation=(
         "保持目标命题不变，构造仅含 X、仅含 Y 和同时含 X+Y 的可比场景；"
         "同时准备联合闭合成立与不成立的内容控制，避免形成 X+Y 固定增强策略。"

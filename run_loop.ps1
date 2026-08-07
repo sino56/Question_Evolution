@@ -328,6 +328,24 @@ $ANSWER_CONCURRENCY = Get-EnvOrDefault "ANSWER_CONCURRENCY" "10"
 $ANSWER_REQUEST_CONCURRENCY = Get-EnvOrDefault "ANSWER_REQUEST_CONCURRENCY" "20"
 $RUBRIC_CONCURRENCY = Get-EnvOrDefault "RUBRIC_CONCURRENCY" "10"
 
+function Assert-FullIterationConfiguration {
+    foreach ($entry in @{
+        "EVOLVE_MODEL" = $EVOLVE_MODEL
+        "GPT_MODEL" = $GPT_MODEL
+        "QWEN_MODEL" = $QWEN_MODEL
+        "GPT_JUDGE_MODEL" = $GPT_JUDGE_MODEL
+        "GPT_ANSWER_MODEL" = $GPT_ANSWER_MODEL
+    }.GetEnumerator()) {
+        if ([string]::IsNullOrWhiteSpace($entry.Value)) {
+            throw "full_iteration 缺少必需配置: $($entry.Key)"
+        }
+    }
+    if ([int]$SCORING_ANSWER_TRIALS -lt 2 -or [int]$GPT_ANSWER_TRIALS -lt 1) {
+        throw "full_iteration 至少需要 2 次弱模型评分和 1 次强模型负对照回答"
+    }
+}
+Assert-FullIterationConfiguration
+
 $InputFile = Resolve-ProjectPath $InputFile
 if (-not (Test-Path -LiteralPath $InputFile -PathType Leaf)) {
     throw "输入文件不存在: $InputFile。请用 -InputFile 指定有效 JSONL。"

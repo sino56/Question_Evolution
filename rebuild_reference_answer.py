@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Mapping
 
@@ -61,10 +62,27 @@ def verify_rebuilt_reference(record: Mapping[str, Any], answer: Any) -> Dict[str
         issues.append("empty_reference_answer")
     if any(token in text for token in forbidden):
         issues.append("restricted_material_disclosure")
+    material = public_material(record)
+    facts = material.get("public_fact_ledger") if isinstance(material.get("public_fact_ledger"), list) else []
+    rules = material.get("public_rule_ledger") if isinstance(material.get("public_rule_ledger"), list) else []
+    allowed_ids = {
+        _clean(row.get("fact_id")) for row in facts if isinstance(row, Mapping) and _clean(row.get("fact_id"))
+    } | {
+        _clean(row.get("rule_id")) for row in rules if isinstance(row, Mapping) and _clean(row.get("rule_id"))
+    }
+    cited_ids = sorted(set(re.findall(r"\b(?:SRC_[FR]\d{3}|HYP_[FR]\d{3}|RULE_[A-Za-z0-9_-]+)\b", text)))
+    unknown_citations = sorted(set(cited_ids) - allowed_ids)
+    if allowed_ids and not cited_ids:
+        issues.append("missing_public_material_citation")
+    if unknown_citations:
+        issues.append("unknown_public_material_citation")
     return {
         "verified": not issues,
         "verification_method": "independent_reference_isolation_check_v1",
         "issues": issues,
+        "allowed_material_ids": sorted(allowed_ids),
+        "cited_material_ids": cited_ids,
+        "unknown_citation_ids": unknown_citations,
         "question_version": question_version(record.get("prompt")),
     }
 

@@ -378,6 +378,11 @@ def normalize_difficulty_gain_result(
         "recommended_action": _clean_text(raw.get("recommended_action")) or "reject_candidate",
         "validator_model": validator_model,
         "raw_response": raw_response,
+        # This stage predicts structure only.  It is never evidence that the
+        # candidate improved difficulty; that claim belongs to post-score
+        # effect analysis after reference/rubric/answer/scoring verification.
+        "assessment_scope": "structural_predicted_gain_only",
+        "is_effect_confirmation": False,
     }
     for field, value in dimension_scores.items():
         result[field] = value
@@ -446,6 +451,8 @@ def build_not_applicable_validation(validator_model: str = "") -> Dict[str, Any]
         "recommended_action": "pass_through_original",
         "validator_model": validator_model,
         "raw_response": "",
+        "assessment_scope": "structural_predicted_gain_only",
+        "is_effect_confirmation": False,
     }
     for field in DIMENSION_FIELDS:
         result[field] = 1.0

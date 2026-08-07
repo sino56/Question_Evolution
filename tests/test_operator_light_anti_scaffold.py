@@ -25,6 +25,7 @@ def test_operator_prompt_spec_contract_covers_content_definition_template():
         "semantic_economy",
         "prompt_recipe_version",
         "reasoning_object",
+        "question_construction",
         "content_transformation",
         "invariants",
         "competition_structure",
@@ -117,6 +118,7 @@ def test_every_generating_operator_has_complete_content_controls():
         "ability_axis",
         "goal",
         "reasoning_object",
+        "question_construction",
         "required_question_shape",
         "content_transformation",
         "competition_structure",
@@ -149,9 +151,12 @@ def test_every_generating_operator_has_complete_content_controls():
         for field_name in required_sequence_fields:
             assert getattr(spec, field_name), f"{spec.operator_id}.{field_name}"
         assert set(spec.content_controls) == {
+            "positive_case",
+            "slot_shortage_or_negative_case",
             "decisive_fact_ablation",
             "irrelevant_fact_ablation",
             "name_or_order_swap",
+            "information_balance",
         }
 
 

@@ -13,7 +13,7 @@ from prompts.validation_prompt import build_validation_prompt
 from schema_validation import validate_records_against_schema
 from pipeline_runtime import StageMetrics, consume_model_request_budget, load_json_records, publish_records
 from semantic_budget import detect_surface_leaks, suggested_same_operator_retry_reason
-from governance import validation_disposition
+from governance import governance_material_diagnostics, validation_disposition
 
 
 FORMAT_DIFFICULTY_TERMS = (
@@ -711,14 +711,25 @@ def validate_record(
         *semantic_findings,
         *( [str(result.get("invalid_type"))] if result.get("invalid_type") else []),
     ]))
+    governance_diagnostics = governance_material_diagnostics(item)
+    governance_findings = list(governance_diagnostics.get("findings") or [])
+    control_results = item.get("control_results") if isinstance(item.get("control_results"), dict) else {}
+    control_findings = list(control_results.get("failures") or [])
+    gain_validation = item.get("difficulty_gain_validation") if isinstance(item.get("difficulty_gain_validation"), dict) else {}
+    structural_findings = list(gain_validation.get("risk_tags") or [])
+    result["diagnostic_evidence"].extend(governance_findings)
+    result["risk_tags"] = list(dict.fromkeys([
+        *result["risk_tags"],
+        *list(governance_diagnostics.get("risk_tags") or []),
+    ]))
     result["validation_layers"] = [
         {"level": "L0", "status": "fail" if result.get("invalid_type") in {"empty_prompt", "schema_error"} else "pass", "findings": reject_reasons[:1]},
-        {"level": "L1", "status": "record_only", "findings": []},
+        {"level": "L1", "status": "record_only" if governance_findings else "pass", "findings": governance_findings},
         {"level": "L2", "status": "record_only" if result.get("external_knowledge_risk") == "high" else "pass", "findings": reject_reasons if result.get("external_knowledge_risk") == "high" else []},
         {"level": "L3", "status": "record_only" if result.get("surface_leak_risk") else "pass", "findings": semantic_findings},
         {"level": "L4", "status": "record_only" if result.get("semantic_economy_risk") == "high" else "pass", "findings": semantic_findings},
-        {"level": "L5", "status": "not_applicable", "findings": []},
-        {"level": "L6", "status": "record_only", "findings": []},
+        {"level": "L5", "status": "record_only" if control_findings else ("pass" if control_results else "not_applicable"), "findings": control_findings},
+        {"level": "L6", "status": "record_only" if structural_findings else "not_applicable", "findings": structural_findings},
     ]
     result["validation_disposition"] = validation_disposition(result)
     result["local_validation_rule_version"] = rule_version

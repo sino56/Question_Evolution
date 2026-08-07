@@ -27,6 +27,23 @@ RISK_PATTERNS = {
     "format_pseudo_difficulty": (r"(?:逐项说明|分别列出|固定标签|表格矩阵)",),
 }
 
+# These checks are collected only from offline fixture replay or reviewer
+# annotations.  They are deliberately optional so historical JSONL records
+# remain readable; an absent annotation is not an online failure.
+ADVISORY_CHECK_ALIASES = {
+    "slot_shortage_or_negative_case": ("slot_shortage_or_negative_case", "slot_sufficiency"),
+    "illegal_synthesis": ("illegal_synthesis", "fact_source_trace", "world_consistency", "illegal_rule_check"),
+    "adjacent_operator_drift": ("adjacent_operator_drift",),
+    "decisive_fact_ablation": ("decisive_fact_ablation",),
+    "irrelevant_fact_ablation": ("irrelevant_fact_ablation",),
+    "name_or_order_swap": ("name_or_order_swap",),
+    "information_balance": ("information_balance",),
+}
+
+_PASS_STATUSES = {"passed", "pass", "ok", "true"}
+_FAIL_STATUSES = {"failed", "fail", "false"}
+_UNRESOLVED_STATUSES = {"unresolved", "needs_review", "not_applicable"}
+
 
 def detect_surface_risks(prompt: str) -> List[str]:
     """Return observable wording risks; no candidate disposition is produced."""
@@ -36,6 +53,54 @@ def detect_surface_risks(prompt: str) -> List[str]:
         for label, patterns in RISK_PATTERNS.items()
         if any(re.search(pattern, text) for pattern in patterns)
     ]
+
+
+def _content_check_annotations(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Read optional offline annotations without relying on a new top-level field."""
+    metadata = record.get("meta_info", {}).get("question_evolution_metadata", {})
+    annotations: Dict[str, Any] = {}
+    for source in (
+        metadata.get("operator_content_checks"),
+        record.get("operator_content_checks"),
+        record.get("content_audit"),
+    ):
+        if isinstance(source, dict):
+            annotations.update(source)
+    return annotations
+
+
+def _normalise_status(value: Any) -> str:
+    if value is True:
+        return "passed"
+    if value is False:
+        return "failed"
+    normalized = str(value or "").strip().lower()
+    if normalized in _PASS_STATUSES:
+        return "passed"
+    if normalized in _FAIL_STATUSES:
+        return "failed"
+    if normalized in _UNRESOLVED_STATUSES:
+        return "unresolved"
+    return "not_reported"
+
+
+def _advisory_check_statuses(record: Dict[str, Any]) -> Dict[str, str]:
+    annotations = _content_check_annotations(record)
+    statuses = {}
+    for check_name, aliases in ADVISORY_CHECK_ALIASES.items():
+        values = [annotations[alias] for alias in aliases if alias in annotations]
+        # A failed sub-check remains failed even if another alias passed.  This
+        # is important for O14's three source-closure sub-checks.
+        normalized = [_normalise_status(value) for value in values]
+        if "failed" in normalized:
+            statuses[check_name] = "failed"
+        elif "unresolved" in normalized:
+            statuses[check_name] = "unresolved"
+        elif "passed" in normalized:
+            statuses[check_name] = "passed"
+        else:
+            statuses[check_name] = "not_reported"
+    return statuses
 
 
 def build_risk_report(records: Iterable[Dict[str, Any]], *, minimum_samples: int = 20) -> Dict[str, Any]:
@@ -52,8 +117,15 @@ def build_risk_report(records: Iterable[Dict[str, Any]], *, minimum_samples: int
     by_operator = {}
     for operator_id, operator_records in sorted(grouped.items()):
         risks = Counter()
+        check_status_counts = {
+            check_name: Counter() for check_name in ADVISORY_CHECK_ALIASES
+        }
         for record in operator_records:
             risks.update(detect_surface_risks(str(record.get("prompt", ""))))
+            for check_name, status in _advisory_check_statuses(record).items():
+                check_status_counts[check_name][status] += 1
+                if status in {"failed", "unresolved"}:
+                    risks[f"{check_name}_{status}"] += 1
         sample_count = len(operator_records)
         if sample_count < minimum_samples:
             recommendation = "continue_forced_qualification"
@@ -65,6 +137,10 @@ def build_risk_report(records: Iterable[Dict[str, Any]], *, minimum_samples: int
             "sample_count": sample_count,
             "risk_counts": dict(sorted(risks.items())),
             "risk_rate": round(sum(risks.values()) / sample_count, 4) if sample_count else 0.0,
+            "check_status_counts": {
+                check_name: dict(sorted(counts.items()))
+                for check_name, counts in sorted(check_status_counts.items())
+            },
             "gray_release_recommendation": recommendation,
         }
 

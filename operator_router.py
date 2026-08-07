@@ -36,7 +36,12 @@ from router_contract import (
     parse_router_response,
 )
 from route_integrity import attach_live_route_integrity, validate_live_route_integrity
-from governance import analyze_source, resolve_evolution_authorization, resolve_evolution_mode
+from governance import (
+    analyze_source,
+    operator_slot_assessment,
+    resolve_evolution_authorization,
+    resolve_evolution_mode,
+)
 from operator_execution_contracts import get_execution_contract
 
 from select_evolution_candidates import (
@@ -1012,12 +1017,22 @@ def build_operator_route(
     mode_decision = resolve_evolution_mode(item, source_analysis)
     candidates = [operator for operator in [primary, *backups] if operator]
     mode_exclusions: Dict[str, str] = {}
+    slot_assessments: Dict[str, Dict[str, Any]] = {}
     compatible_candidates: List[str] = []
     for operator in candidates:
         contract = get_execution_contract(operator)
         if mode_decision["evolution_mode"] not in contract.supported_modes:
             mode_exclusions[operator] = "mode_not_supported"
         else:
+            assessment = operator_slot_assessment({
+                **item,
+                "source_analysis": source_analysis,
+                "mode_decision": mode_decision,
+            }, operator)
+            slot_assessments[operator] = assessment
+            if assessment["has_hard_missing_slot"]:
+                mode_exclusions[operator] = "authoritative_slot_missing"
+                continue
             compatible_candidates.append(operator)
     primary = compatible_candidates[0] if compatible_candidates else None
     backups = compatible_candidates[1:]
@@ -1043,6 +1058,7 @@ def build_operator_route(
         "evolution_authorization": authorization,
         "mode_decision": mode_decision,
         "mode_excluded_operator_reasons": mode_exclusions,
+        "operator_slot_assessments": slot_assessments,
         "no_safe_operator": no_safe_operator,
         "no_safe_operator_reason": " ".join(reason_parts) if no_safe_operator else None,
     }
