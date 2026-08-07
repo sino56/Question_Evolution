@@ -670,34 +670,42 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --report-output "$ROUND_DIR/candidate_selection_report.json" \
                 --performance-events "$ROUND_DIR/performance_events.jsonl"
 
-        run_if_missing "$ROUND_DIR/with_answers.jsonl" "collect_answers" "$ROUND_DIR/evolved.jsonl" "[Round $ROUND] Step 9/13: collect_answers.py" \
-            python collect_answers.py \
+        run_if_missing "$ROUND_DIR/rebuilt_reference.jsonl" "rebuild_reference_answer" "$ROUND_DIR/evolved.jsonl" "[Round $ROUND] Step 9/14: rebuild_reference_answer.py" \
+            python rebuild_reference_answer.py \
                 --input "$ROUND_DIR/evolved.jsonl" \
-                --output "$ROUND_DIR/with_answers.jsonl" \
-                --concurrency "$ANSWER_CONCURRENCY" \
-                --request-concurrency "$ANSWER_REQUEST_CONCURRENCY" \
-                --samples 1 \
+                --output "$ROUND_DIR/rebuilt_reference.jsonl" \
                 --model "$GPT_MODEL" \
                 --base-url "$ANSWER_BASE_URL" \
-                --performance-events "$ROUND_DIR/performance_events.jsonl"
+                --execution-scope full_iteration
 
-        run_if_missing "$ROUND_DIR/rubric.jsonl" "gen_rubric" "$ROUND_DIR/with_answers.jsonl" "[Round $ROUND] Step 10/13: gen_rubric.py" \
+        run_if_missing "$ROUND_DIR/rubric.jsonl" "gen_rubric" "$ROUND_DIR/rebuilt_reference.jsonl" "[Round $ROUND] Step 10/14: gen_rubric.py" \
             python gen_rubric.py \
-                --input "$ROUND_DIR/with_answers.jsonl" \
+                --input "$ROUND_DIR/rebuilt_reference.jsonl" \
                 --output "$ROUND_DIR/rubric.jsonl" \
                 --concurrency "$RUBRIC_CONCURRENCY" \
                 --model "$GPT_MODEL" \
                 --base-url "$RUBRIC_BASE_URL" \
                 --performance-events "$ROUND_DIR/performance_events.jsonl"
 
-        SCORING_INPUT="$ROUND_DIR/rubric.jsonl"
+        run_if_missing "$ROUND_DIR/with_answers.jsonl" "collect_answers" "$ROUND_DIR/rubric.jsonl" "[Round $ROUND] Step 11/14: collect_answers.py (weak model; final prompt only)" \
+            python collect_answers.py \
+                --input "$ROUND_DIR/rubric.jsonl" \
+                --output "$ROUND_DIR/with_answers.jsonl" \
+                --concurrency "$ANSWER_CONCURRENCY" \
+                --request-concurrency "$ANSWER_REQUEST_CONCURRENCY" \
+                --samples 1 \
+                --model "$QWEN_MODEL" \
+                --base-url "$QWEN_BASE_URL" \
+                --performance-events "$ROUND_DIR/performance_events.jsonl"
+
+        SCORING_INPUT="$ROUND_DIR/with_answers.jsonl"
         SCORING_OUTPUT="$ROUND_DIR/scored.jsonl"
         SCORING_STAGE="scoring"
         SCORING_EVALUATION_MODE="complete"
         if [ "$DEFER_GPT_EXPERIMENTAL_EVALUATION" = "true" ]; then
-            run_if_missing "$ROUND_DIR/decision_scored.jsonl" "scoring_decision" "$ROUND_DIR/rubric.jsonl" "[Round $ROUND] Step 11a/13: Qwen decision checkpoint" \
+            run_if_missing "$ROUND_DIR/decision_scored.jsonl" "scoring_decision" "$ROUND_DIR/with_answers.jsonl" "[Round $ROUND] Step 12a/14: Qwen decision checkpoint" \
                 python scoring.py \
-                    --input "$ROUND_DIR/rubric.jsonl" \
+                    --input "$ROUND_DIR/with_answers.jsonl" \
                     --output "$ROUND_DIR/decision_scored.jsonl" \
                     --evaluation-mode decision \
                     --answer-mode llm \
@@ -725,7 +733,7 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
             SCORING_EVALUATION_MODE="experimental"
         fi
 
-        run_if_missing "$SCORING_OUTPUT" "$SCORING_STAGE" "$SCORING_INPUT" "[Round $ROUND] Step 11/13: scoring.py complete scored artifact" \
+        run_if_missing "$SCORING_OUTPUT" "$SCORING_STAGE" "$SCORING_INPUT" "[Round $ROUND] Step 12/14: scoring.py complete scored artifact" \
             python scoring.py \
                 --input "$SCORING_INPUT" \
                 --output "$SCORING_OUTPUT" \

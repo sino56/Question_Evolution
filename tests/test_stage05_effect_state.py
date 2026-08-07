@@ -217,7 +217,9 @@ def test_state_update_and_memory_entries_cover_success_failure_invalid_review():
     assert states["stage05-review"]["stop_status"] == "continue_with_new_operator"
     assert states["stage05-drop"]["round"] == 3
 
-    assert {entry["sample_id"] for entry in operator_memory} == {"stage05-drop"}
+    # Historical fixture has no verified rebuilt reference or full execution
+    # scope, so it remains a provisional effect and cannot seed success memory.
+    assert operator_memory == []
 
     assert {entry["sample_id"] for entry in failure_memory} == {"stage05-full"}
     assert failure_memory[0]["failure_type"] == "full_score_no_drop"

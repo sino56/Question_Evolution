@@ -11,6 +11,7 @@ from pipeline_runtime import (
     publish_records,
     validate_published_artifact,
 )
+from governance import technical_execution_block
 
 
 RISK_SCORE = {"low": 0, "medium": -5, "high": -25}
@@ -394,14 +395,26 @@ def candidate_flow_info(
             "risk_tags": [],
             "score_cap": None,
         }
-    if validation.get("passed") is not True:
+    disposition = validation.get("validation_disposition")
+    disposition = disposition if isinstance(disposition, dict) else {}
+    disposition_status = _clean_text(disposition.get("status") or validation.get("disposition_status"))
+    if technical_execution_block(validation):
         return {
             "candidate_flow": "hard_reject",
             "selection_status": "failed_complexity_validation",
-            "reason": _clean_text(validation.get("reject_reason")) or "failed complexity validation",
+            "reason": _clean_text(validation.get("reject_reason")) or "technical execution block",
             "difficulty_gain_label": "",
             "risk_tags": [],
             "score_cap": None,
+        }
+    if validation.get("passed") is not True:
+        return {
+            "candidate_flow": "exploration_candidate",
+            "selection_status": disposition_status or "retry_same_operator",
+            "reason": _clean_text(validation.get("reject_reason")) or "recorded validation risk; retain for retry/exploration",
+            "difficulty_gain_label": "needs_manual_review",
+            "risk_tags": list(validation.get("risk_tags") or []),
+            "score_cap": EXPLORATION_SCORE_CAPS["needs_manual_review"],
         }
 
     factual_errors = light_factual_fatal_errors(item)

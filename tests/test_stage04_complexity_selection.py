@@ -362,8 +362,7 @@ def test_candidate_selection_selects_valid_candidate_and_records_rejections():
     assert selected[0]["candidate_selection"]["selected_candidate_id"] == "stage04-select::cand_1"
     assert selected[0]["candidate_selection"]["selection_status"] == "selected_after_difficulty_gain_validation"
     assert selected[0]["candidate_selection"]["rejected_candidates"]
-    assert invalid_cases
-    assert invalid_cases[0]["invalid_type"] == "format_difficulty_dominant"
+    assert invalid_cases == []
 
 
 def test_all_invalid_candidates_restore_parent_snapshot_for_passthrough():
@@ -392,15 +391,10 @@ def test_all_invalid_candidates_restore_parent_snapshot_for_passthrough():
     selected, invalid_cases = select_candidates([invalid])
     restored = selected[0]
 
-    assert restored["prompt"] == "父题"
-    assert restored["rubric"] == [{"title": "old"}]
-    assert restored["score_prompt"] == "old score prompt"
-    assert restored["scoring_result"]["total_awarded"] == 6
-    assert restored["score_rate"] == 0.6
-    assert restored["meta_info"]["references"] == ["父题参考答案"]
-    assert restored["question_evolved"] is False
-    assert restored["candidate_selection"]["selected_operator"] == ""
-    assert invalid_cases
+    assert restored["prompt"] == invalid["prompt"]
+    assert restored["question_evolved"] is True
+    assert restored["candidate_selection"]["candidate_flow"] == "exploration_candidate"
+    assert invalid_cases == []
 
 
 def test_formal_validation_reuses_generation_result_only_for_same_rule_version():

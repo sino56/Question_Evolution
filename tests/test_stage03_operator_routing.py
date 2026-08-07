@@ -100,7 +100,7 @@ def test_router_covers_representative_stage03_paths():
         ("可见端点与时间窗的时序一致", "O11_unobserved_state_attribution"),
         ("仅 X、仅 Y 与 X+Y 的共同闭合", "O12_conjunctive_necessity"),
         ("必要连接失效及整体命题后果", "O13_minimal_disqualifier"),
-        ("题干外中间状态导致信息闭包问题", "O14_information_closure"),
+        ("题干外中间状态导致信息闭包问题", None),
         ("单一比较量距离固定门槛的裕量", "O15_counterfactual_threshold_shift"),
         ("竞争解释的覆盖关系与残差", "O16_close_alternative_normalization"),
         ("两套规则的适用对象与范围", "O17_action_vs_fact_threshold"),
@@ -130,6 +130,8 @@ def test_router_recognizes_each_operator_primary_reasoning_object(
     }
     route = route_records([item])[0]["operator_route"]
     assert route["primary_operator"] == expected_operator
+    if expected_operator is None:
+        assert route["no_safe_operator"] is True
 
 
 def test_every_generation_operator_uses_the_unified_prompt_entrypoint():
@@ -147,8 +149,8 @@ def test_every_generation_operator_uses_the_unified_prompt_entrypoint():
             evolution_state={},
             operator_route={"primary_operator": spec.operator_id},
         )
-        assert spec.operator_id in rendered
-        assert spec.ability_axis in rendered
+        assert spec.operator_id not in rendered
+        assert spec.ability_axis not in rendered
         assert '"semantic_economy"' in rendered
         assert spec.content_transformation not in rendered
 
@@ -173,7 +175,7 @@ def test_question_evolution_uses_route_and_skips_passthrough():
     assert metadata["expected_qwen_failure"] == "选错最关键缺口"
     assert metadata["expected_evaluation_focus"]
     assert len(fake_client.calls) == 1
-    assert "O13_minimal_disqualifier" in fake_client.calls[0]["messages"][0]["content"]
+    assert "O13_minimal_disqualifier" not in fake_client.calls[0]["messages"][0]["content"]
 
     passed = asyncio.run(processor.process_item(by_id["stage03-pass"]))
     assert passed["question_evolved"] is False
@@ -215,7 +217,7 @@ def test_question_evolution_calls_new_operator_through_existing_entrypoint():
     assert evolved["question_evolved"] is True
     assert metadata["operator_used"] == "O33_cross_modal_support_boundary"
     assert metadata["ability_axis"] == "cross_modal_support_boundary"
-    assert "O33_cross_modal_support_boundary" in fake_client.calls[0]["messages"][0]["content"]
+    assert "O33_cross_modal_support_boundary" not in fake_client.calls[0]["messages"][0]["content"]
     generated_prompt = fake_client.calls[0]["messages"][0]["content"]
     assert '"semantic_economy"' in generated_prompt
     assert '"semantic_axes"' not in generated_prompt

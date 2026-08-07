@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReferenceRebuild",
+  "type": "object",
+  "required": ["reference_answer", "reference_answer_version", "verification"],
+  "properties": {
+    "reference_answer": {"type": "string"},
+    "reference_answer_version": {"type": "string"},
+    "verification": {"type": "object", "required": ["verified", "question_version"], "properties": {"verified": {"type": "boolean"}, "question_version": {"type": "string"}}}
+  }
+}

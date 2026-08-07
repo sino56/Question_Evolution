@@ -36,6 +36,8 @@ from router_contract import (
     parse_router_response,
 )
 from route_integrity import attach_live_route_integrity, validate_live_route_integrity
+from governance import analyze_source, resolve_evolution_authorization, resolve_evolution_mode
+from operator_execution_contracts import get_execution_contract
 
 from select_evolution_candidates import (
     EVOLVE_HIGH_SCORE_OVERSCORE,
@@ -77,6 +79,9 @@ LEGACY_OPERATOR_ORDER = (
     O11_UNOBSERVED_STATE_ATTRIBUTION,
     O12_CONJUNCTIVE_NECESSITY,
     O13_MINIMAL_DISQUALIFIER,
+    # Retain the stable historical ID in registry ordering for replay and
+    # reporting.  eligible_operator_ids still excludes it because its spec is
+    # validation-only, so it can never become a generation candidate.
     O14_INFORMATION_CLOSURE,
     O15_COUNTERFACTUAL_THRESHOLD_SHIFT,
     O16_CLOSE_ALTERNATIVE_NORMALIZATION,
@@ -747,11 +752,7 @@ def _base_rule_route(item: Dict[str, Any]) -> Tuple[Optional[str], List[str], st
         )
 
     if _has_any(combined, ("题外补设", "题干外", "隐藏前提", "信息闭包", "泛化罗列", "事实绑定")):
-        return (
-            O14_INFORMATION_CLOSURE,
-            [O10_EVIDENCE_SUFFICIENCY_LADDER],
-            "diagnosis indicates an information-closure violation.",
-        )
+        return (None, [], "diagnosis is an information-closure risk; O14 is validation-only, so no generator is selected.")
 
     if _has_any(
         combined,
@@ -819,11 +820,7 @@ def _base_rule_route(item: Dict[str, Any]) -> Tuple[Optional[str], List[str], st
             "diagnosis calls for close business-judgment competition.",
         )
 
-    return (
-        O10_EVIDENCE_SUFFICIENCY_LADDER,
-        [O17_ACTION_VS_FACT_THRESHOLD, O14_INFORMATION_CLOSURE],
-        "fallback to close business-judgment competition for an evolvable sample.",
-    )
+    return (None, [], "no target failure mechanism maps safely to a generation operator.")
 
 
 def _previous_operator(item: Dict[str, Any]) -> Optional[str]:
@@ -994,7 +991,7 @@ def build_operator_route(
             primary = replacement
             backups = _remove_values(backups, [primary])
         else:
-            primary = next((operator for operator in LEGACY_OPERATOR_ORDER if operator not in avoid), None)
+            primary = None
 
     primary, backups, memory_action_reasons = _apply_surface_form_memory_actions(
         primary,
@@ -1010,6 +1007,23 @@ def build_operator_route(
         or consecutive_full >= 2
     )
 
+    source_analysis = analyze_source(item)
+    authorization = resolve_evolution_authorization(item)
+    mode_decision = resolve_evolution_mode(item, source_analysis)
+    candidates = [operator for operator in [primary, *backups] if operator]
+    mode_exclusions: Dict[str, str] = {}
+    compatible_candidates: List[str] = []
+    for operator in candidates:
+        contract = get_execution_contract(operator)
+        if mode_decision["evolution_mode"] not in contract.supported_modes:
+            mode_exclusions[operator] = "mode_not_supported"
+        else:
+            compatible_candidates.append(operator)
+    primary = compatible_candidates[0] if compatible_candidates else None
+    backups = compatible_candidates[1:]
+    no_safe_operator = primary is None
+    if no_safe_operator:
+        reason_parts.append("no safe generation operator after authorization, mode, slot, adjacency, and memory review.")
     return {
         "primary_operator": primary,
         "backup_operators": backups,
@@ -1025,6 +1039,12 @@ def build_operator_route(
             "failure": failure_matches[:3],
         },
         "is_frontier_route": frontier_route,
+        "source_analysis": source_analysis,
+        "evolution_authorization": authorization,
+        "mode_decision": mode_decision,
+        "mode_excluded_operator_reasons": mode_exclusions,
+        "no_safe_operator": no_safe_operator,
+        "no_safe_operator_reason": " ".join(reason_parts) if no_safe_operator else None,
     }
 
 
@@ -1422,6 +1442,9 @@ def eligible_operator_ids(
     avoid = {_clean_text(operator_id) for operator_id in avoid_operators if _clean_text(operator_id)}
     completed = _terminal_operator_ids(item)
     ledger_exclusions = _fact_ledger_exclusions(item)
+    source_analysis = analyze_source(item)
+    mode_decision = resolve_evolution_mode(item, source_analysis)
+    evolution_mode = mode_decision["evolution_mode"]
     eligible: List[str] = []
     excluded: Dict[str, str] = {}
     for operator_id, spec in OPERATOR_SPECS.items():
@@ -1438,6 +1461,8 @@ def eligible_operator_ids(
             excluded[operator_id] = "parent_terminal"
         elif operator_id in ledger_exclusions:
             excluded[operator_id] = ledger_exclusions[operator_id]
+        elif evolution_mode not in get_execution_contract(operator_id).supported_modes:
+            excluded[operator_id] = "mode_not_supported"
         else:
             eligible.append(operator_id)
     return eligible, excluded
@@ -1783,6 +1808,20 @@ async def route_records_hybrid_async(
         if action in NON_EVOLUTION_ACTIONS and not is_frontier_route(record):
             route = _base_hybrid_route(rule_route, settings=settings, eligible_ids=[], excluded={})
             route.update({"route_source": "not_requested", "router_status": "not_requested"})
+            updated = dict(record)
+            updated["operator_route"] = attach_live_route_integrity(route)
+            results[index] = updated
+            continue
+        if rule_route.get("no_safe_operator") is True:
+            route = _base_hybrid_route(rule_route, settings=settings, eligible_ids=[], excluded={})
+            route.update({
+                "route_source": "no_safe_operator",
+                "router_status": "excluded",
+                "router_error_classification": "no_safe_operator",
+                "selected_operator_ids": [],
+                "primary_operator": None,
+                "backup_operators": [],
+            })
             updated = dict(record)
             updated["operator_route"] = attach_live_route_integrity(route)
             results[index] = updated

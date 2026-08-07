@@ -13,6 +13,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from local_api_config import get_config_list, get_config_value
+from governance import question_version
+from rebuild_reference_answer import active_verified_reference
 from pipeline_runtime import (
     AtomicJsonlStageWriter,
     StageMetrics,
@@ -445,6 +447,10 @@ def collect_reference_answers(item: Dict[str, Any]) -> List[str]:
 
     仅支持 `meta_info.references`，不再兼容任何历史字段。
     """
+    if item.get("question_evolved") is True:
+        # A changed question may use only its new, independently verified
+        # reference.  Never silently fall back to stale_references.
+        return [active_verified_reference(item)]
     meta_info = item.get("meta_info", {})
     if not isinstance(meta_info, dict):
         raise ValueError("缺少 meta_info，无法读取 references")
@@ -744,6 +750,12 @@ async def process_item(item, client: RotatingAPIClient, model, writer_queue, fai
 
         # 组装 score_prompt（待评答案处使用占位符，便于 judger 阶段动态替换）
         item["score_prompt"] = build_score_prompt(item, rubric)
+        meta_info = item.get("meta_info")
+        meta_info = dict(meta_info) if isinstance(meta_info, dict) else {}
+        version = question_version(question)
+        meta_info["rubric_version"] = version
+        meta_info["score_prompt_version"] = version
+        item["meta_info"] = meta_info
 
         # 放入成功写入队列
         await writer_queue.put(item)

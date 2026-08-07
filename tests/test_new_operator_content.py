@@ -148,14 +148,17 @@ def test_new_operators_render_surface_contract_without_leaking_internal_tasks(sp
         evolution_state={},
         operator_route={"primary_operator": spec.operator_id},
     )
-    assert spec.operator_id in rendered
+    assert spec.operator_id not in rendered
+    assert spec.ability_axis not in rendered
     assert '"semantic_economy"' in rendered
     assert "题面生成可见上下文" in rendered
     for rule in spec.semantic_economy:
         assert rule in rendered
     assert '"semantic_axes"' not in rendered
     assert '"required_reasoning_tasks"' not in rendered
-    assert "一个自然业务判断和开放式依据要求" in rendered
+    assert '"used_fact_ids"' in rendered
+    assert '"surface_notes"' in rendered
+    assert '"expected_qwen_failure"' not in rendered
     assert "不得使用“逐项说明”“分别列出”“先……再……”" in rendered
     assert "共享主体、时段、目标命题与不变背景只出现一次" in rendered
 

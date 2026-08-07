@@ -34,9 +34,33 @@ class OperatorPromptSpec:
     adjacent_operator_controls: Sequence[str] = ()
     surface_swap_controls: Sequence[str] = ()
     hidden_role_balance_controls: Sequence[str] = ()
+    # These controls are design- and test-side metadata.  They are deliberately
+    # not rendered into the surface writer prompt: exposing them would disclose
+    # which facts are decisive, irrelevant, or merely present for a control.
+    content_controls: Dict[str, Sequence[str]] = field(default_factory=dict)
     allowed_answer_shapes: Sequence[str] = ()
     forbidden_answer_shapes: Sequence[str] = ()
     generates_question: bool = True
+
+    def __post_init__(self) -> None:
+        """Keep the content-control contract complete for historical specs.
+
+        Earlier specs stored the three required controls in separate fields.
+        Materialise the unified read-only view here so old modules remain
+        compatible while every spec exposes the same governance contract.
+        """
+        if not self.content_controls:
+            object.__setattr__(
+                self,
+                "content_controls",
+                {
+                    "decisive_fact_ablation": tuple(self.positive_controls),
+                    "irrelevant_fact_ablation": tuple(
+                        self.conclusion_invariant_negative_controls
+                    ),
+                    "name_or_order_swap": tuple(self.surface_swap_controls),
+                },
+            )
 
 
 def _json_block(value: Any) -> str:
@@ -61,28 +85,17 @@ def build_prompt(
     # rationales and internal reasoning tasks are not rendered here: each can
     # accidentally turn an answer boundary into a question-side hint.
     visible_context = dict(generator_visible_context or {})
-    visible_context.setdefault("original_question", prompt)
     surface_contract = {
-        "operator_id": spec.operator_id,
-        "question_shape": spec.required_question_shape,
+        "neutral_task_intent": spec.required_question_shape,
         "avoid": spec.avoid,
         "semantic_economy": list(spec.semantic_economy),
         "prompt_recipe_version": spec.prompt_recipe_version,
     }
     return f"""
 角色
-你是一位 question evolution 题目生成专家。本轮只能执行指定 operator：{spec.operator_id}（{spec.name}）。
+你是一位 question evolution 题面编写器。只根据公开事实和中性业务任务，写出一道完整、可独立作答的新题。
 
-Operator 目标
-{spec.goal}
-
-要求题型
-{spec.required_question_shape}
-
-避免
-{spec.avoid}
-
-题面构造契约（仅用于构造，不得把字段名、控制说明或预期方向复制到题面）
+题面写作规则（仅用于构造，不得把字段名或控制说明复制到题面）
 {_json_block(surface_contract)}
 
 必守边界
@@ -102,16 +115,10 @@ Operator 目标
 {_json_block(visible_context)}
 
 输出
-返回合法 JSON 对象，不要输出 Markdown 或额外解释：
+返回合法 JSON 对象，不要输出 Markdown 或额外解释。只能包含以下三个字段：
 {{
   "evolved_prompt": "升级后的新题目，必须完整、可独立作答，并严格符合当前 operator。",
-  "evolution_strategy": "说明本 operator 压测的核心推理对象、耦合了哪些同族语义轴、制造了哪些接近但不等价的竞争判断，以及如何避免提示答案。",
-  "ability_axis": "{spec.ability_axis}",
-  "target_subclaim": "本题压测的最小子判断或关键层级",
-  "boundary_hypothesis": "一句话说明预期能力边界",
-  "expected_qwen_failure": "一句话说明弱模型最可能犯的错",
-  "expected_evaluation_focus": {_json_block(list(spec.default_evaluation_focus))},
-  "balanced_semantic_load": "说明候选场景或选项如何保持相近的语义槽位、表面完整度与信息显著性；不比较字符数",
-  "notes_for_reference": "参考答案是否需要轻量补充；如基本适用则写基本适用"
+  "used_fact_ids": ["本次实际写入题面的公开事实 ID；没有可用 ID 时为空数组"],
+  "surface_notes": "仅说明公开事实如何组织；不得解释答案、评分标准、目标错误或事实角色"
 }}
 """.strip()

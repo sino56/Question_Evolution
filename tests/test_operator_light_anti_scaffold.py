@@ -41,6 +41,7 @@ def test_operator_prompt_spec_contract_covers_content_definition_template():
         "adjacent_operator_controls",
         "surface_swap_controls",
         "hidden_role_balance_controls",
+        "content_controls",
         "allowed_answer_shapes",
         "forbidden_answer_shapes",
         "generates_question",
@@ -147,6 +148,11 @@ def test_every_generating_operator_has_complete_content_controls():
             assert getattr(spec, field_name), f"{spec.operator_id}.{field_name}"
         for field_name in required_sequence_fields:
             assert getattr(spec, field_name), f"{spec.operator_id}.{field_name}"
+        assert set(spec.content_controls) == {
+            "decisive_fact_ablation",
+            "irrelevant_fact_ablation",
+            "name_or_order_swap",
+        }
 
 
 def test_prompt_keeps_content_controls_internal_and_preserves_open_reasoning():
@@ -161,14 +167,17 @@ def test_prompt_keeps_content_controls_internal_and_preserves_open_reasoning():
         evolution_state={},
         operator_route={"primary_operator": "O16_close_alternative_normalization"},
     )
-    assert "题面构造契约（仅用于构造" in rendered
-    assert "不得把字段名、控制说明或预期方向复制到题面" in rendered
+    assert "题面写作规则（仅用于构造" in rendered
+    assert "不得把字段名或控制说明复制到题面" in rendered
     assert '"semantic_economy"' in rendered
     assert '"required_reasoning_tasks"' not in rendered
+    assert "O16_close_alternative_normalization" not in rendered
+    assert "competing_explanation_coverage_and_residual" not in rendered
     assert "应基于全部观察控制结论边界" not in rendered
     assert "替代解释出现，因此没有异常" not in rendered
-    assert "只提出一个自然业务判断和开放式依据要求" in rendered
-    assert "适用性门控、资格状态和发布校验不属于本内容 Prompt" in rendered
+    assert '"used_fact_ids"' in rendered
+    assert '"surface_notes"' in rendered
+    assert '"expected_qwen_failure"' not in rendered
 
 
 if __name__ == "__main__":

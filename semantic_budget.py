@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List
 
+from governance import analyze_source, clean_text as governance_clean_text, public_fact_projection, resolve_evolution_mode
+
 
 LEDGER_VERSION = "semantic_ledger_v1"
 BOUNDARY_MARKERS = (
@@ -135,7 +137,22 @@ def build_reference_ledgers(
     """
 
     prompt_text = clean_text(original_prompt)
-    observable = _ledger_entries([prompt_text], prefix="prompt", source="original_prompt")
+    # Do not collapse the whole parent question into a single "fact".  This
+    # used to smuggle source claims and answer direction through the same
+    # channel as observations.  The deterministic source analyzer gives every
+    # sentence its own provenance and keeps claims outside the public ledger.
+    source_analysis = analyze_source({"prompt": prompt_text})
+    observable = []
+    for entry in source_analysis["source_observation_ledger"]:
+        observable.append({
+            "fact_id": entry["fact_id"],
+            "text": entry["text"],
+            "source": "source_observation",
+            "world_id": entry["world_id"],
+            "global_fact_key": entry["global_fact_key"],
+            "origin_type": entry["origin_type"],
+            "source_locator": entry["source_locator"],
+        })
     boundary_values: List[str] = []
     rubric_values: List[str] = []
     observable_reference_values: List[str] = []
@@ -167,9 +184,14 @@ def build_reference_ledgers(
             else:
                 rubric_values.append(clean_text(item))
 
+    mode_decision = resolve_evolution_mode({"prompt": prompt_text}, source_analysis)
+    projection = public_fact_projection(source_analysis, mode_decision)
     return {
         "ledger_version": LEDGER_VERSION,
-        "classification_method": "deterministic_boundary_and_observation_split",
+        "classification_method": "deterministic_source_and_answer_material_split",
+        "source_analysis": source_analysis,
+        "mode_decision": mode_decision,
+        "public_fact_projection": projection,
         "observable_fact_ledger": observable,
         "answer_boundary_ledger": _ledger_entries(boundary_values, prefix="boundary", source="answer_or_boundary"),
         "rubric_intent_ledger": _ledger_entries(rubric_values, prefix="rubric", source="rubric_or_intent"),
@@ -180,10 +202,15 @@ def generator_visible_context(*, original_prompt: Any, ledgers: Dict[str, Any]) 
     """Return exactly the context permitted to question-surface generation."""
 
     observable = ledgers.get("observable_fact_ledger", []) if isinstance(ledgers, dict) else []
+    projection = ledgers.get("public_fact_projection") if isinstance(ledgers, dict) else None
     return {
+        # original_question remains only for legacy compatibility.  New writer
+        # prompts consume the projection and never receive answer-side fields.
         "original_question": clean_text(original_prompt),
         "observable_fact_ledger": list(observable) if isinstance(observable, list) else [],
-        "context_policy": "题面只能使用 original_question 与 observable_fact_ledger 中的可观察事实；答案边界和评分意图不可见。",
+        "public_fact_projection": dict(projection) if isinstance(projection, dict) else {},
+        "evolution_mode": clean_text((ledgers.get("mode_decision") or {}).get("evolution_mode")) if isinstance(ledgers, dict) else "",
+        "context_policy": "题面编写器只接收公开事实投影和中性任务；答案边界、评分意图、目标错误与隐藏规划不可见。",
     }
 
 

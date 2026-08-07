@@ -177,14 +177,14 @@ def test_semantic_failure_retries_same_operator_with_redacted_structured_feedbac
     assert evolved["validation_retry"]["semantic_retry_attempts"] == 1
 
 
-def test_semantic_retry_stops_after_two_retries_and_records_exhaustion():
+def test_semantic_retry_stops_after_one_same_label_retry_and_records_exhaustion():
     client = _SemanticRetryClient(always_leak=True)
     processor = QuestionEvolutionProcessor(client, model="test", max_concurrent=1, max_retries=0, max_validation_retries=0)
     evolved = asyncio.run(processor.evolve_with_retry(_retry_item(), operator_id="O27_cross_layer_conclusion_calibration"))
 
-    assert len(client.calls) == 3
+    assert len(client.calls) == 2
     assert evolved["retry_exhausted"] is True
-    assert evolved["retry_attempts"] == 2
+    assert evolved["retry_attempts"] == 1
     assert evolved["operator_id"] == "O27_cross_layer_conclusion_calibration"
     assert evolved["_local_validation_result"]["passed"] is False
 

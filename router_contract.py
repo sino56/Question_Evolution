@@ -11,11 +11,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Set
 
 
-ROUTING_SCHEMA_VERSION = "hybrid-router-v2"
-ROUTER_PROMPT_VERSION = "hybrid-router-prompt-v2"
+ROUTING_SCHEMA_VERSION = "hybrid-router-v3"
+ROUTER_PROMPT_VERSION = "hybrid-router-prompt-v3"
 ROUTER_TRANSPORT_POLICY_VERSION = "router-transport-v1"
-ROUTER_REGISTRY_POLICY_VERSION = "eligible-operators-v1"
-ROUTE_REVISION = "hybrid-hard-slot-route-v2"
+ROUTER_REGISTRY_POLICY_VERSION = "eligible-operators-v2-mode-aware"
+ROUTE_REVISION = "hybrid-mode-aware-no-default-fallback-v3"
 
 TOP_LEVEL_FIELDS = frozenset(
     {

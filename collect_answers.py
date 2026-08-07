@@ -26,7 +26,7 @@ from pipeline_runtime import (
     stable_record_key,
     validate_published_artifact,
 )
-from semantic_budget import answer_generation_context
+from governance import scope_allows
 
 QA_MODEL = (
     os.getenv("ANSWER_MODEL")
@@ -375,34 +375,24 @@ class AnswerCollector:
             item["answer_extra"] = []
             item["answer_quality_issues"] = []
             return item
+        meta_info = item.get("meta_info")
+        # A declared scope is an enforceable gate.  Legacy records without a
+        # scope remain replay-compatible; the formal loop always declares one
+        # during reference rebuild before reaching this stage.
+        if isinstance(meta_info, dict) and isinstance(meta_info.get("execution_scope"), dict) and not scope_allows(item, "model_answering"):
+            raise ValueError("execution_scope does not authorize weak-model answering")
 
-        # Answer-side boundary material is deliberately injected only here,
-        # never into the question-surface generator.
-        meta_info = item.get("meta_info", {})
-        metadata = meta_info.get("question_evolution_metadata", {}) if isinstance(meta_info, dict) else {}
-        ledgers = metadata.get("reference_ledgers") if isinstance(metadata, dict) else None
-        question = answer_generation_context(question, ledgers)
-
-        # 如果开启了 script_gt_guide，在原问题前拼接 ground truth 指引
-        if self.script_gt_guide:
-            meta_info = item.get("meta_info", {})
-            ground_truth = meta_info.get("ground_truth", "")
-            annotation = meta_info.get("annotation", "")
-            guide_prefix = (
-                "你将为下面这道题生成标准答案，为了校准标答的正确性，以下将告知你标答提示：\n"
-                f"监控日志异常属性：{ground_truth}\n"
-                f"监控日志标注：{annotation}\n\n"
-                "你在生成标答时不允许提及“已知指引”“标答提示”“标准答案方向”“提前知道”等"
-                "暴露你提前知道了标准答案方向的字眼，要假装不知道指引。\n\n"
-                f"{question}"
-            )
-            question = guide_prefix
+        # This is the weak-model request boundary.  It must be exactly the
+        # final question: no reference answer, rubric, stale score, hidden
+        # plan, expected failure, or answer-side hint can be injected here.
+        question = str(question).strip()
 
         sample_key = stable_record_key(item)
         tasks = [self.call_llm_with_retry(question, sample_key) for _ in range(num_samples)]
         answers = await asyncio.gather(*tasks)
 
         item["answer_extra"] = answers
+        item["weak_model_request_snapshot"] = {"messages": [{"role": "user", "content": question}]}
         item["answer_quality_issues"] = []
         for sample_index, answer in enumerate(answers):
             is_valid, reason = self.validate_answer_quality(answer)

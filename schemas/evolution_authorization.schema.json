@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvolutionAuthorization",
+  "type": "object",
+  "required": ["allowed_evolution_modes", "authorization_source", "authorization_id"],
+  "properties": {
+    "allowed_evolution_modes": {"type": "array", "items": {"enum": ["source_faithful", "controlled_hypothetical_case", "controlled_synthesis", "hypothetical_adaptation_from_source"]}},
+    "controlled_hypothetical_case_authorized": {"type": "boolean"},
+    "controlled_synthesis_authorized": {"type": "boolean"},
+    "hypothetical_adaptation_authorized": {"type": "boolean"},
+    "authorization_source": {"type": "string"},
+    "authorization_id": {"type": "string"}
+  },
+  "additionalProperties": true
+}

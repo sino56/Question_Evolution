@@ -301,6 +301,8 @@ def build_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
     full_score_count = previous_full_count + 1 if current_full else 0
     same_operator_count = previous_same_count + 1 if operator_used and operator_used == previous_operator else (1 if operator_used else 0)
     label = _clean_text(effect.get("effect_label"))
+    requested_decision = effect.get("next_round_decision")
+    requested_decision = requested_decision if isinstance(requested_decision, list) else []
 
     avoid_methods = list(previous_state.get("avoid_methods") or [])
     if label in FAILURE_EFFECT_LABELS or label == "needs_manual_review":
@@ -337,6 +339,7 @@ def build_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
         "recommended_next_methods": recommended,
         "stop_status": stop_status,
         "rollback_applied": label == "score_increased",
+        "next_round_decision": requested_decision or (["backtrack_to_parent", "switch_operator"] if label == "score_increased" else ["pass_through"]),
     }
 
 
@@ -559,7 +562,13 @@ def classify_memory_entries(
     for record in records:
         effect = _effect(record)
         label = _clean_text(effect.get("effect_label"))
-        if label == "effective_boundary_probe" and effect.get("complexity_passed") and is_question_evolved(record):
+        confirmation = effect.get("effect_confirmation") if isinstance(effect.get("effect_confirmation"), dict) else {}
+        if (
+            label == "effective_boundary_probe"
+            and confirmation.get("status") == "confirmed"
+            and effect.get("complexity_passed")
+            and is_question_evolved(record)
+        ):
             operator_entries.append(build_operator_memory_entry(record))
         if label in FAILURE_EFFECT_LABELS and effect.get("complexity_passed") and is_question_evolved(record):
             failure_entries.append(build_failure_memory_entry(record))

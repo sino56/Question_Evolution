@@ -13,6 +13,7 @@ from prompts.validation_prompt import build_validation_prompt
 from schema_validation import validate_records_against_schema
 from pipeline_runtime import StageMetrics, consume_model_request_budget, load_json_records, publish_records
 from semantic_budget import detect_surface_leaks, suggested_same_operator_retry_reason
+from governance import validation_disposition
 
 
 FORMAT_DIFFICULTY_TERMS = (
@@ -593,6 +594,16 @@ def validate_record(
             "reject_reason": None,
             "invalid_type": None,
         }, llm_validation)
+        result["validation_layers"] = [
+            {"level": "L0", "status": "not_applicable", "findings": []},
+            {"level": "L1", "status": "not_applicable", "findings": []},
+            {"level": "L2", "status": "not_applicable", "findings": []},
+            {"level": "L3", "status": "not_applicable", "findings": []},
+            {"level": "L4", "status": "not_applicable", "findings": []},
+            {"level": "L5", "status": "not_applicable", "findings": []},
+            {"level": "L6", "status": "not_applicable", "findings": []},
+        ]
+        result["validation_disposition"] = validation_disposition(result)
         result["local_validation_rule_version"] = rule_version
         result["local_validation_prompt_sha256"] = local_validation_prompt_sha256(item)
         return result
@@ -693,6 +704,23 @@ def validate_record(
     }
     rule_result = _append_semantic_gate(rule_result, mode=semantic_mode)
     result = merge_llm_validation_result(rule_result, llm_validation)
+    reject_reasons = list(result.get("reject_reasons") or [])
+    semantic_findings = list(result.get("semantic_economy_failure_types") or [])
+    result["diagnostic_evidence"] = list(result.get("semantic_economy_evidence") or [])
+    result["risk_tags"] = list(dict.fromkeys([
+        *semantic_findings,
+        *( [str(result.get("invalid_type"))] if result.get("invalid_type") else []),
+    ]))
+    result["validation_layers"] = [
+        {"level": "L0", "status": "fail" if result.get("invalid_type") in {"empty_prompt", "schema_error"} else "pass", "findings": reject_reasons[:1]},
+        {"level": "L1", "status": "record_only", "findings": []},
+        {"level": "L2", "status": "record_only" if result.get("external_knowledge_risk") == "high" else "pass", "findings": reject_reasons if result.get("external_knowledge_risk") == "high" else []},
+        {"level": "L3", "status": "record_only" if result.get("surface_leak_risk") else "pass", "findings": semantic_findings},
+        {"level": "L4", "status": "record_only" if result.get("semantic_economy_risk") == "high" else "pass", "findings": semantic_findings},
+        {"level": "L5", "status": "not_applicable", "findings": []},
+        {"level": "L6", "status": "record_only", "findings": []},
+    ]
+    result["validation_disposition"] = validation_disposition(result)
     result["local_validation_rule_version"] = rule_version
     result["local_validation_prompt_sha256"] = local_validation_prompt_sha256(item)
     return result

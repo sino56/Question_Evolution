@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SourceAnalysis",
+  "type": "object",
+  "required": ["source_world_id", "source_observation_ledger", "source_claim_ledger", "rule_ledger"],
+  "properties": {
+    "source_world_id": {"type": "string"},
+    "source_observation_ledger": {"type": "array", "items": {"$ref": "#/$defs/fact"}},
+    "source_claim_ledger": {"type": "array", "items": {"$ref": "#/$defs/fact"}},
+    "rule_ledger": {"type": "array", "items": {"type": "object"}}
+  },
+  "$defs": {
+    "fact": {
+      "type": "object",
+      "required": ["fact_id", "world_id", "global_fact_key", "origin_type", "source_locator"],
+      "properties": {"fact_id": {"type": "string"}, "world_id": {"type": "string"}, "global_fact_key": {"type": "string"}, "origin_type": {"type": "string"}, "source_locator": {"type": "object"}}
+    }
+  }
+}

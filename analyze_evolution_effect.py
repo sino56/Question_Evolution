@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from pipeline_runtime import StageMetrics, load_json_records, publish_records, sha256_file
+from governance import scope_allows
 
 
 DEFAULT_FULL_SCORE_THRESHOLD = 0.99
@@ -433,6 +434,28 @@ def build_effect_analysis(
         reason = "未观察到足够清晰的得分变化。"
 
     semantic_observation = semantic_economy_observation(item)
+    metadata = get_metadata(item)
+    reference_rebuild = metadata.get("reference_rebuild") if isinstance(metadata, dict) else {}
+    reference_verification = reference_rebuild.get("verification") if isinstance(reference_rebuild, dict) else {}
+    reference_verified = bool(isinstance(reference_verification, dict) and reference_verification.get("verified") is True)
+    scoring_result = item.get("scoring_result") if isinstance(item.get("scoring_result"), dict) else {}
+    scoring_stable = bool(scoring_result.get("qwen_score_summary") or scoring_result.get("item_scores"))
+    strong_answer_checked = bool(scoring_result.get("gpt_answer_score_summary") or scoring_result.get("gpt_score_summary"))
+    effect_scope_allowed = scope_allows(item, "effect_claim")
+    validation_disposition = get_validation_result(item).get("validation_disposition")
+    validation_disposition = validation_disposition if isinstance(validation_disposition, dict) else {}
+    invalidating_risk = validation_disposition.get("status") == "technical_block"
+    confirmed_effect = bool(lightweight_boundary_hit and reference_verified and scoring_stable and strong_answer_checked and not invalidating_risk and effect_scope_allowed)
+    if confirmed_effect:
+        next_round_decision = ["retain_as_boundary", "stop_branch_success"]
+    elif score_increased_after_evolution:
+        next_round_decision = ["backtrack_to_parent", "switch_operator"]
+    elif effect_label == "needs_manual_review":
+        next_round_decision = ["manual_review", "retry_generation_strategy"]
+    elif effect_label in {"pass_through", "invalid_complexity"}:
+        next_round_decision = ["pass_through"]
+    else:
+        next_round_decision = ["switch_operator", "retry_generation_strategy"]
     return {
         "score_rate_before": score_rate_before,
         "score_rate_after": score_rate_after,
@@ -452,6 +475,15 @@ def build_effect_analysis(
         "focus_answer_alignment": focus_alignment,
         "lightweight_hit_reason": reason,
         "effect_label": effect_label,
+        "effect_confirmation": {
+            "status": "confirmed" if confirmed_effect else ("provisional" if lightweight_boundary_hit else "not_confirmed"),
+            "reference_answer_verified": reference_verified,
+            "strong_answer_checked": strong_answer_checked,
+            "scoring_stable": scoring_stable,
+            "execution_scope_allows_effect_claim": effect_scope_allowed,
+            "invalidating_validation_risk": invalidating_risk,
+        },
+        "next_round_decision": next_round_decision,
     }
 
 

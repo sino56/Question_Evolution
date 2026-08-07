@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from openai import AsyncOpenAI
 
 from local_api_config import get_config_list, get_config_value
+from governance import question_version
 from pipeline_runtime import (
     AtomicJsonlStageWriter,
     FairRequestPool,
@@ -597,6 +598,25 @@ def ensure_sample_identity(item: Dict[str, Any]) -> None:
         if value is not None and str(value).strip():
             item["sample_id"] = str(value).strip()
             return
+
+
+def assert_active_scoring_material_versions(item: Dict[str, Any]) -> None:
+    """Prevent a changed prompt from being scored with inherited materials."""
+    if item.get("question_evolved") is not True:
+        return
+    info = item.get("meta_info")
+    info = info if isinstance(info, dict) else {}
+    if info.get("active_scoring_state") != "not_evaluated":
+        return  # Legacy replay record; preserve backwards-compatible replay.
+    version = question_version(item.get("prompt"))
+    if info.get("active_reference_answer_version") != version:
+        raise ValueError("reference-answer version does not match the evolved question")
+    if info.get("rubric_version") != version or info.get("score_prompt_version") != version:
+        raise ValueError("rubric/score-prompt version does not match the evolved question")
+    if isinstance(info.get("execution_scope"), dict):
+        from governance import scope_allows
+        if not scope_allows(item, "judge_scoring"):
+            raise ValueError("execution_scope does not authorize judge scoring")
 
 
 def attach_score_rate(item: Dict[str, Any]) -> None:
@@ -1245,6 +1265,7 @@ class ScoringProcessor:
     async def process_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         async with self.semaphore:
             ensure_sample_identity(item)
+            assert_active_scoring_material_versions(item)
 
             # question evolution 循环中，未进化样本应完全复用上一轮评分结果，
             # 避免重复答题/重评带来的随机波动污染本轮进化效果。
@@ -1264,6 +1285,11 @@ class ScoringProcessor:
                 if isinstance(raw_existing_answer, str) and raw_existing_answer.strip():
                     existing_answer = raw_existing_answer.strip()
                     logger.info(f"首个 trial 读取已有 candidate_answer (index={item.get('index')})")
+                if existing_answer is None:
+                    collected = item.get("answer_extra")
+                    if isinstance(collected, list) and collected and isinstance(collected[0], str) and collected[0].strip():
+                        existing_answer = collected[0].strip()
+                        logger.info(f"首个 trial 读取 collect_answers 的弱模型答案 (index={item.get('index')})")
 
             async def run_qwen_trial(trial_index: int) -> Dict[str, Any]:
                 if self.answer_mode == "reference":

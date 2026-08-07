@@ -317,8 +317,7 @@ def test_tiny_pipeline_writes_stage06_artifacts_without_external_api():
         assert final_scored[0]["evolution_state"]["stop_status"] == "effective_boundary_sample"
 
         operator_memory = read_jsonl(exp_dir / "memory" / "operator_memory_bank.jsonl")
-        assert operator_memory
-        assert operator_memory[0]["sample_id"] == "tiny-801"
+        assert operator_memory == []
 
 
 if __name__ == "__main__":

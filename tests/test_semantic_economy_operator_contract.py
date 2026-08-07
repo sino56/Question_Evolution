@@ -30,7 +30,9 @@ def test_all_operators_define_and_render_semantic_economy(spec):
     )
     assert "题面每个独立句段必须承担" in rendered
     assert "共享主体、时段、目标命题与不变背景只出现一次" in rendered
-    assert "balanced_semantic_load" in rendered
+    assert '"used_fact_ids"' in rendered
+    assert '"surface_notes"' in rendered
+    assert "balanced_semantic_load" not in rendered
     assert "similar_length" not in rendered
     assert "1200" not in rendered
     assert "字符区间" not in rendered

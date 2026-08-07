@@ -30,6 +30,14 @@ from pipeline_runtime import (
     validate_published_artifact,
 )
 from semantic_budget import build_reference_ledgers, generator_visible_context
+from governance import (
+    analyze_source,
+    mark_stale_scoring_material,
+    public_fact_projection,
+    resolve_evolution_authorization,
+    resolve_evolution_mode,
+    writer_context,
+)
 import validate_evolved_question as validation_stage
 
 
@@ -47,7 +55,9 @@ EVOLVE_BASE_URL = (
 REQUEST_TIMEOUT_SECONDS = 180.0
 MAX_OUTPUT_TOKENS = 32768
 DEFAULT_MAX_VALIDATION_RETRIES = 1
-DEFAULT_MAX_SEMANTIC_RETRY_ATTEMPTS = 2
+# At most one retry for a given diagnostic label; together with the generic
+# retry this caps a candidate at two directed retries as required by governance.
+DEFAULT_MAX_SEMANTIC_RETRY_ATTEMPTS = 1
 EVOLUTION_REQUIRED_ACTIONS = {
     EVOLVE_HIGH_SCORE_OVERSCORE,
     RECONSTRUCT_LOW_SCORE_BOUNDARY,
@@ -132,6 +142,11 @@ def build_semantic_retry_payload(
         if isinstance(entry, dict) and str(entry.get("text", "")).strip()
     ]
     must_keep = context.get("observable_fact_ledger", [])
+    if not must_keep:
+        # A source can be an abstract task with no direct observation facts.
+        # Keep a neutral task marker for retry mechanics without re-injecting
+        # the parent question, an answer boundary, or rubric intent.
+        must_keep = [{"fact_id": "TASK_NEUTRAL", "text": "保留当前中性业务任务", "origin_type": "source_task"}]
     must_not_include = list(dict.fromkeys([
         *evidence_spans,
         "结论边界",
@@ -680,10 +695,22 @@ def parse_evolution_response(response_text: str) -> Dict[str, Any]:
             evolved_prompt = str(parsed["evolved_prompt"]).strip()
             if not evolved_prompt:
                 raise ValueError("evolved_prompt 不能为空")
-            parsed["evolved_prompt"] = evolved_prompt
-            parsed["evolution_strategy"] = str(parsed.get("evolution_strategy", "")).strip()
-            parsed["notes_for_reference"] = str(parsed.get("notes_for_reference", "")).strip()
-            return parsed
+            used_fact_ids = parsed.get("used_fact_ids", [])
+            if not isinstance(used_fact_ids, list):
+                raise ValueError("used_fact_ids 必须是数组")
+            normalized_fact_ids = [
+                str(fact_id).strip()
+                for fact_id in used_fact_ids
+                if str(fact_id).strip()
+            ]
+            # The surface writer is intentionally a narrow boundary.  Ignore
+            # legacy answer-side fields if an older model/template emits them;
+            # routing-derived metadata is attached later by trusted code.
+            return {
+                "evolved_prompt": evolved_prompt,
+                "used_fact_ids": normalized_fact_ids,
+                "surface_notes": str(parsed.get("surface_notes", "")).strip(),
+            }
         except Exception as e:
             last_error = e
     raise ValueError(f"无法解析有效 question evolution JSON: {last_error}")
@@ -835,6 +862,8 @@ def resolve_operator_id(item: Dict[str, Any]) -> str:
     route = get_operator_route(item)
     if not route:
         raise ValueError("缺少 operator_route；请先运行 operator_router.py")
+    if route.get("no_safe_operator") is True:
+        raise ValueError("no_safe_operator: " + str(route.get("no_safe_operator_reason") or "no eligible generation operator"))
 
     operator_id = str(route.get("primary_operator") or "").strip()
     if not operator_id:
@@ -865,6 +894,8 @@ def resolve_candidate_operator_ids(item: Dict[str, Any], max_candidates: int) ->
     route = get_operator_route(item)
     if not route:
         raise ValueError("缺少 operator_route；请先运行 operator_router.py")
+    if route.get("no_safe_operator") is True:
+        return []
 
     avoid = {
         str(operator).strip()
@@ -902,6 +933,7 @@ def classify_generation_failure(error: Exception) -> str:
     no_operator_markers = (
         "operator_route",
         "primary_operator",
+        "no_safe_operator",
         "可用候选算子",
         "does not require operator evolution",
     )
@@ -1062,7 +1094,7 @@ def get_candidate_answer(item: Dict[str, Any]) -> str:
 
 
 def build_generator_context(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Split source material while exposing only facts to question generation."""
+    """Build the public-only writer input and restricted planning sidecar."""
 
     prompt = str(item.get("prompt", "") or "").strip()
     ledgers = build_reference_ledgers(
@@ -1070,12 +1102,36 @@ def build_generator_context(item: Dict[str, Any]) -> Dict[str, Any]:
         reference_answer=get_reference_answer(item),
         rubric=item.get("rubric"),
     )
+    source_analysis = analyze_source(item)
+    authorization = resolve_evolution_authorization(item)
+    mode_decision = resolve_evolution_mode(item, source_analysis)
+    projection = public_fact_projection(source_analysis, mode_decision)
+    public_context = writer_context({
+        **item,
+        "source_analysis": source_analysis,
+        "mode_decision": mode_decision,
+        "public_fact_projection": projection,
+    })
+    # Restricted plan is data-only and never rendered into the writer prompt.
+    # The LLM planner may replace it in a future stage without changing this
+    # isolation boundary.
+    restricted_plan = {
+        "plan_version": "restricted-planner-v1",
+        "fact_ledger": source_analysis.get("source_observation_ledger", []),
+        "competition_explanations": [],
+        "answer_outline": "restricted; generated after the public surface is fixed",
+        "conclusion_contract": "answer must follow only public facts and valid rules",
+        "control_plan": [],
+        "expected_weak_model_error": "restricted",
+    }
     return {
         "reference_ledgers": ledgers,
-        "generator_visible_context": generator_visible_context(
-            original_prompt=prompt,
-            ledgers=ledgers,
-        ),
+        "source_analysis": source_analysis,
+        "evolution_authorization": authorization,
+        "mode_decision": mode_decision,
+        "public_fact_projection": projection,
+        "restricted_evolution_plan": restricted_plan,
+        "generator_visible_context": public_context,
     }
 
 
@@ -1100,7 +1156,7 @@ def build_evolution_prompt(
     if operator_id:
         user_prompt = build_operator_prompt(
             operator_id,
-            prompt=prompt.strip(),
+            prompt="",
             reference_answer=get_reference_answer(item),
             candidate_answer=get_candidate_answer(item),
             rubric=rubric if isinstance(rubric, list) else [],
@@ -1126,8 +1182,8 @@ def build_evolution_prompt(
         "完整推理链或“不能直接推出/最高支持/结论边界”等答案方向提示。\n\n"
         "# 题面生成可见上下文\n"
         + json.dumps(visible_context, ensure_ascii=False, indent=2)
-        + "\n\n只返回合法 JSON：{\"evolved_prompt\":\"...\",\"evolution_strategy\":\"...\","
-        "\"balanced_semantic_load\":\"...\",\"notes_for_reference\":\"...\"}"
+        + "\n\n只返回合法 JSON：{\"evolved_prompt\":\"...\",\"used_fact_ids\":[],"
+        "\"surface_notes\":\"仅说明公开事实如何组织，不解释答案\"}"
     )
     return append_validation_retry_instruction(
         user_prompt,
@@ -1164,7 +1220,11 @@ def build_validation_probe_record(item: Dict[str, Any], evolved: Dict[str, Any])
     if isinstance(operator_used, str) and operator_used.strip():
         metadata["operator_used"] = operator_used.strip()
 
-    for field in ("reference_ledgers", "generator_visible_context"):
+    for field in (
+        "reference_ledgers", "generator_visible_context", "source_analysis",
+        "evolution_authorization", "mode_decision", "public_fact_projection",
+        "restricted_evolution_plan",
+    ):
         value = evolved.get(field)
         if isinstance(value, dict):
             metadata[field] = value
@@ -1288,7 +1348,17 @@ def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rat
     if isinstance(complexity_budget, dict):
         metadata["complexity_budget"] = complexity_budget
 
-    for field in ("reference_ledgers", "generator_visible_context", "balanced_semantic_load"):
+    for field in (
+        "reference_ledgers",
+        "generator_visible_context",
+        "source_analysis",
+        "evolution_authorization",
+        "mode_decision",
+        "public_fact_projection",
+        "balanced_semantic_load",
+        "used_fact_ids",
+        "surface_notes",
+    ):
         value = evolved.get(field)
         if isinstance(value, (dict, list)) or (isinstance(value, str) and value.strip()):
             metadata[field] = value
@@ -1296,6 +1366,11 @@ def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rat
     validation_retry = evolved.get("validation_retry")
     if isinstance(validation_retry, dict):
         metadata["validation_retry"] = validation_retry
+    # Keep only an audit flag in the normal record.  The actual planner payload
+    # is intentionally transient/restricted and is never handed to ordinary
+    # downstream stages or the surface writer.
+    if isinstance(evolved.get("restricted_evolution_plan"), dict):
+        metadata["restricted_plan_status"] = "withheld_from_standard_context"
 
     for field in ("retry_exhausted", "retry_attempts", "final_failure_reasons", "semantic_retry_payload"):
         value = evolved.get(field)
@@ -1311,7 +1386,10 @@ def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rat
     result["prompt"] = evolved_prompt
     result["meta_info"] = meta_info
     result["question_evolved"] = True
-    return result
+    # The changed question may never inherit an active old score.  Preserve
+    # old material in the stale audit fields above, then explicitly reset its
+    # active scoring state and version identity.
+    return mark_stale_scoring_material(result)
 
 
 def make_evolved_candidate_record(
@@ -1406,8 +1484,8 @@ class QuestionEvolutionProcessor:
         self.min_score_rate = min_score_rate
         self.prompt_version = prompt_version
         self.num_candidates = num_candidates
-        self.max_validation_retries = max(0, max_validation_retries)
-        self.max_semantic_retry_attempts = max(0, max_semantic_retry_attempts)
+        self.max_validation_retries = min(1, max(0, max_validation_retries))
+        self.max_semantic_retry_attempts = min(1, max(0, max_semantic_retry_attempts))
         self.max_candidate_budget = max_candidate_budget
 
     async def evolve_once(
@@ -1442,8 +1520,12 @@ class QuestionEvolutionProcessor:
         evolved = parse_evolution_response(content)
         if operator_id:
             evolved = enrich_evolution_result_with_operator(evolved, item, operator_id)
-        evolved["reference_ledgers"] = generation_context["reference_ledgers"]
-        evolved["generator_visible_context"] = generation_context["generator_visible_context"]
+        for field in (
+            "reference_ledgers", "generator_visible_context", "source_analysis",
+            "evolution_authorization", "mode_decision", "public_fact_projection",
+            "restricted_evolution_plan",
+        ):
+            evolved[field] = generation_context[field]
         evolved["question_evolution_raw_response"] = content
         return evolved
 
@@ -1616,6 +1698,15 @@ class QuestionEvolutionProcessor:
                     f"prompt={str(item.get('prompt', ''))[:80]} error={e}"
                 )
                 return [make_generation_failure_passthrough_candidate_record(item, candidate_count, e)]
+
+            if not operator_ids:
+                route = get_operator_route(item)
+                return [make_passthrough_candidate_record(
+                    item,
+                    candidate_count,
+                    generation_status="no_safe_operator",
+                    failure_reason=str(route.get("no_safe_operator_reason") or "no eligible generation operator"),
+                )]
 
             candidates: List[Dict[str, Any]] = []
             generation_errors: List[str] = []

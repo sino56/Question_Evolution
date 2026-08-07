@@ -31,9 +31,10 @@ def test_run_loop_uses_stage06_full_pipeline_order():
             "Step 6/13: light_factual_check.py",
             "Step 7/13: validate_difficulty_gain.py",
             "Step 8/13: candidate_selection.py",
-            "Step 9/13: collect_answers.py",
-            "Step 10/13: gen_rubric.py",
-            "Step 11/13: scoring.py",
+            "Step 9/14: rebuild_reference_answer.py",
+            "Step 10/14: gen_rubric.py",
+            "Step 11/14: collect_answers.py",
+            "Step 12/14: scoring.py",
             "Step 12/13: analyze_evolution_effect.py",
             "Step 13/13: update_sample_state.py",
         ],
@@ -135,7 +136,7 @@ def test_run_loop_defaults_to_exact_three_answer_trials_per_model():
 
 def test_run_loop_keeps_rubric_and_scoring_as_closed_loop_steps_only():
     rubric_call_start = RUN_LOOP.find("python gen_rubric.py")
-    scoring_call_start = RUN_LOOP.find("Step 11/13: scoring.py")
+    scoring_call_start = RUN_LOOP.find("Step 12/14: scoring.py")
     assert rubric_call_start != -1
     assert scoring_call_start != -1
     assert rubric_call_start < scoring_call_start
