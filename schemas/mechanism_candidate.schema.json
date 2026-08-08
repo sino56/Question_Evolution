@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Behavior Mechanism Candidate",
+  "type": "object",
+  "required": ["record_type", "mechanism_candidate_version", "mechanism_id", "status", "card_type", "taxonomy", "root_sample_ids", "evidence_refs", "counterexamples", "applicability_conditions", "exclusion_conditions", "action_limit"],
+  "properties": {
+    "record_type": {"const": "mechanism_candidate"},
+    "mechanism_candidate_version": {"const": "question-mechanism-v1"},
+    "status": {"const": "proposed"},
+    "card_type": {"enum": ["capability_mechanism", "risk_pattern"]},
+    "root_sample_ids": {"type": "array", "items": {"type": "string"}},
+    "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+    "counterexamples": {"type": "array", "items": {"type": "object"}},
+    "taxonomy": {"type": "object", "required": ["scene_family", "question_form", "reasoning_mechanism", "overscore_pattern", "version_compatibility_group"]},
+    "action_limit": {"type": "string", "minLength": 1}
+  }
+}

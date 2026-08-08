@@ -25,13 +25,14 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 TAXONOMY_VERSION = "global-memory-taxonomy-v1"
 RETRIEVAL_CONFIG_VERSION = "global-memory-retrieval-v1"
 CARD_TYPES = {"positive_strategy", "negative_strategy", "risk_pattern", "system_diagnosis", "optimization_signal"}
-STAGE4_STATUSES = {"proposed", "shadow", "needs_human_review", "rejected_insufficient_evidence", "downgraded", "retired"}
+STAGE4_STATUSES = {"proposed", "shadow", "qualified", "needs_human_review", "rejected_insufficient_evidence", "downgraded", "retired"}
 LOCAL_SOURCES = {
     "operator_memory_bank.jsonl": "positive_strategy",
     "failure_memory_bank.jsonl": "negative_strategy",
     "invalid_generation_cases.jsonl": "risk_pattern",
     "operator_performance.jsonl": "optimization_signal",
     "agent_observation.json": "system_diagnosis",
+    "mechanism_publish_candidates.jsonl": "mechanism_publish_candidate",
 }
 
 
@@ -236,6 +237,27 @@ class GlobalMemoryStore:
         return records
 
     def _candidate_from_record(self, record: Mapping[str, Any], *, source: Path, line: int, experiment: Path, fact_type: str) -> dict[str, Any]:
+        if fact_type == "mechanism_publish_candidate":
+            taxonomy = _as_mapping(record.get("taxonomy"))
+            operators = [operator for operator in record.get("operator_ids") or [] if _text(operator)]
+            target_type = _text(record.get("target_card_type"))
+            if target_type not in CARD_TYPES:
+                target_type = "system_diagnosis"
+            return {
+                "source_ref": f"{source.resolve()}#{line}", "source_file": str(source.resolve()), "source_line": line,
+                "source_experiment": str(experiment.resolve()), "sample_id": "", "round": "", "branch_id": "",
+                "operator_id": operators[0] if operators else "", "fact_type": target_type,
+                "conclusion": _text(record.get("mechanism_summary")) or "Published mechanism candidate",
+                "classification_hints": {
+                    "scene_family": _text(taxonomy.get("scene_family")), "question_form": _text(taxonomy.get("question_form")),
+                    "reasoning_mechanism": _text(taxonomy.get("reasoning_mechanism")) or _text(record.get("mechanism_id")),
+                    "overscore_pattern": _text(taxonomy.get("overscore_pattern")),
+                    "applicability_conditions": list(record.get("applicability_conditions") or []),
+                    "exclusion_conditions": list(record.get("exclusion_conditions") or []),
+                },
+                "evidence_refs": list(record.get("evidence_refs") or []),
+                "payload": {key: value for key, value in record.items() if key not in {"prompt", "reference_answer", "scoring_result", "rubric", "score_prompt"}},
+            }
         signature = _as_mapping(record.get("sample_signature"))
         effect = _as_mapping(record.get("effect_analysis"))
         metadata = _as_mapping(record.get("meta_info")).get("question_evolution_metadata", {})
@@ -354,7 +376,15 @@ class GlobalMemoryStore:
 
     def _facts(self, con: sqlite3.Connection) -> list[dict[str, Any]]:
         rows = con.execute("SELECT * FROM candidate_facts ORDER BY candidate_id").fetchall()
-        return [{**dict(row), "classification_hints": json.loads(row["classification_hints"]), "evidence_refs": json.loads(row["evidence_refs"])} for row in rows]
+        return [
+            {
+                **dict(row),
+                "classification_hints": json.loads(row["classification_hints"]),
+                "evidence_refs": json.loads(row["evidence_refs"]),
+                "payload": json.loads(row["payload"]),
+            }
+            for row in rows
+        ]
 
     def integrate(self) -> dict[str, int]:
         """Serial Phase-2 compilation and conservative card lifecycle evaluation."""
@@ -378,15 +408,33 @@ class GlobalMemoryStore:
                     exclusions = hints.get("exclusion_conditions") or ["Do not use when the cited evidence cannot be independently verified."]
                     refs = [ref for fact in facts for ref in fact["evidence_refs"]]
                     increased = sum(1 for fact in facts if "score_increased" in fact["conclusion"].lower() or "score_increased" in str(fact["payload"]))
-                    status = "shadow" if len(facts) >= 2 and not increased else ("needs_human_review" if increased else "proposed")
+                    mechanism_facts = [fact for fact in facts if _text(_as_mapping(fact.get("payload")).get("record_type")) == "mechanism_publish_candidate"]
+                    if mechanism_facts:
+                        qualified = any(
+                            _text(_as_mapping(fact["payload"]).get("requested_status")) == "qualified"
+                            and _text(_as_mapping(fact["payload"]).get("validation_status")) == "validated"
+                            and (
+                                _as_mapping(_as_mapping(fact["payload"]).get("manual_review")).get("approved") is True
+                                or _text(_as_mapping(_as_mapping(fact["payload"]).get("manual_review")).get("status")).lower() in {"approved", "accepted", "passed"}
+                            )
+                            for fact in mechanism_facts
+                        )
+                        status = "qualified" if qualified and not increased else "proposed"
+                    else:
+                        status = "shadow" if len(facts) >= 2 and not increased else ("needs_human_review" if increased else "proposed")
                     body = {
                         "card_type": card_type, "scene_family": scene, "question_form": form, "reasoning_mechanism": mechanism,
                         "overscore_pattern": hints.get("overscore_pattern", ""),
                         "recommended_operators": [operator] if card_type == "positive_strategy" and operator else [],
                         "backup_operators": [], "avoid_operators": [operator] if card_type == "negative_strategy" and operator else [],
                         "applicability_conditions": applicability, "exclusion_conditions": exclusions,
-                        "evidence_summary": {"supporting_experiments": len({fact["source_experiment"] for fact in facts}), "supporting_samples": len({fact["sample_id"] for fact in facts if fact["sample_id"]}), "score_increased_rate": increased / len(facts), "effective_rate": 0.0, "invalid_generation_rate": 0.0},
+                        "evidence_summary": {
+                            "supporting_experiments": len({fact["source_experiment"] for fact in facts}),
+                            "supporting_samples": len({fact["sample_id"] for fact in facts if fact["sample_id"]} | {str(ref.get("root_sample_id")) for fact in mechanism_facts for ref in fact["evidence_refs"] if _text(ref.get("root_sample_id"))}),
+                            "score_increased_rate": increased / len(facts), "effective_rate": 0.0, "invalid_generation_rate": 0.0,
+                        },
                         "taxonomy_version": TAXONOMY_VERSION,
+                        "mechanism_id": _text(_as_mapping(mechanism_facts[0]["payload"]).get("mechanism_id")) if mechanism_facts else "",
                     }
                     try:
                         validate_stage4_card({**body, "status": status, "evidence_refs": refs})

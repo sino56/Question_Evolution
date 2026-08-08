@@ -75,6 +75,48 @@ python question_behavior_analysis.py observe \
 批次门槛；低于该门槛时不会发起任何观察器调用。旁路故障只留下失败记录或警告，
 不会阻断正式流水线。
 
+### 1.3 机制归纳、验证与路由旁路（22B / 25B + 22C-4）
+
+`mechanism_governance.py` 只消费 22A sidecar、效果分析和冻结配置，并只写
+新的 sidecar。它不会改写 `score_rate`、`operator_candidates`、既有
+`operator_plan`、`evolution_state` 或本地 memory。推荐按以下顺序离线运行：
+
+```bash
+# 22B-2: 多根样本、可定位证据和反例齐全时才产生 proposed 机制候选。
+python mechanism_governance.py induce \
+  --input experiments/.../round_1/behavior_observed_analysis.jsonl \
+  --source-input experiments/.../round_1/scored.jsonl \
+  --output experiments/.../round_1/mechanism_candidates.jsonl \
+  --publish-facts-output experiments/.../round_1/mechanism_publish_candidates.jsonl \
+  --rejections-output experiments/.../round_1/mechanism_induction_rejections.jsonl
+
+# 22B-3: 冻结配置须含 experiment_kind=retrospective|forward，且验证根样本不得来自候选机制的来源证据。
+python mechanism_governance.py validate \
+  --candidates experiments/.../round_1/mechanism_candidates.jsonl \
+  --effects experiments/.../round_2/effect_analysis.jsonl \
+  --frozen-config experiments/.../frozen_mechanism_evaluation.json \
+  --manual-reviews experiments/.../mechanism_reviews.jsonl \
+  --output experiments/.../mechanism_effect_validations.jsonl \
+  --matrix-output experiments/.../mechanism_effect_matrix.jsonl \
+  --publish-facts-output experiments/.../round_2/mechanism_publish_candidates.jsonl \
+  --report-output experiments/.../mechanism_effect_validation_report.json
+
+# 25B + 22C-4: stable snapshot 下的路由旁路对照，仍不改变 Router 输出。
+python mechanism_governance.py route-audit \
+  --routes experiments/.../round_2/routed.jsonl \
+  --candidates experiments/.../round_1/mechanism_candidates.jsonl \
+  --validations experiments/.../mechanism_effect_validations.jsonl \
+  --project-root . --memory-snapshot-id "$MEMORY_SNAPSHOT_ID" \
+  --output experiments/.../round_2/mechanism_route_audit.jsonl
+```
+
+`--mode limited` 仅在 stable 的非空 Global Memory snapshot、`qualified`
+机制、独立验证、人工批准同时满足时生成“可有限接入”的审计结论；它依然不会
+写入或重排 Router 候选。`--rollback` 显式记录并恢复 audit-only 行为。使用
+`route-replay` 可在冻结的独立验证集上写出回放报告。
+`mechanism_publish_candidates.jsonl` 是传给全局 Memory 发布器的候选事实，不是
+自动发布指令。
+
 ### 流程图
 ```text
 Stage 0 输入

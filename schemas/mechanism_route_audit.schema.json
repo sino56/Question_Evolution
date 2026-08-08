@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Mechanism Route Audit Sidecar",
+  "type": "object",
+  "required": ["record_type", "mechanism_route_audit_version", "memory_snapshot_id", "mechanism_suggestions", "disposition", "action_limit"],
+  "properties": {
+    "record_type": {"const": "mechanism_route_audit"},
+    "mechanism_route_audit_version": {"const": "mechanism-route-audit-v1"},
+    "disposition": {"enum": ["audit_only", "limited_integration_blocked", "limited_integration_eligible", "rollback_to_audit"]},
+    "mechanism_suggestions": {"type": "array", "items": {"type": "object"}},
+    "action_limit": {"type": "string", "minLength": 1}
+  }
+}

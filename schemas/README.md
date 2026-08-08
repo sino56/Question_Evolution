@@ -5,6 +5,15 @@ evolution stages. The schemas are intentionally small and permissive: they
 stabilize field names, ownership, and runtime validation for the current
 Stage 0-5 question evolution pipeline.
 
+## 22B / 25B mechanism governance sidecars
+
+`mechanism_candidate.schema.json` describes proposed, evidence-bound behavior
+mechanisms and risk patterns. `mechanism_effect_validation.schema.json` records
+frozen, root-sample-held-out validation of a mechanism/operator hypothesis.
+`mechanism_route_audit.schema.json` records audit-only routing comparisons. All
+three are sidecar contracts: none authorizes mutation of scored records,
+operator candidates, frozen plans, state, or local memory.
+
 ## Agent Harness Contracts
 
 `agent_tool_call.schema.json` and `agent_tool_result.schema.json` describe

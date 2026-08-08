@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Mechanism Operator Effect Validation",
+  "type": "object",
+  "required": ["record_type", "mechanism_effect_validation_version", "mechanism_id", "validation_status", "qualification_status", "frozen_evaluation_config", "source_root_sample_ids", "holdout_root_sample_ids", "action_limit"],
+  "properties": {
+    "record_type": {"const": "mechanism_effect_validation"},
+    "mechanism_effect_validation_version": {"const": "mechanism-effect-validation-v1"},
+    "validation_status": {"enum": ["validated", "insufficient_or_confounded_evidence"]},
+    "qualification_status": {"enum": ["proposed", "qualified"]},
+    "source_root_sample_ids": {"type": "array", "items": {"type": "string"}},
+    "holdout_root_sample_ids": {"type": "array", "items": {"type": "string"}},
+    "frozen_evaluation_config": {"type": "object"},
+    "action_limit": {"type": "string", "minLength": 1}
+  }
+}
