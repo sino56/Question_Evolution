@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
+from .skills import load_stage_skills
 
 PROPOSAL_STATUSES = {"proposed", "needs_human_review", "rejected_insufficient_evidence"}
 
@@ -27,6 +28,19 @@ def write_agent_report(
     multi_agent_review: Optional[Mapping[str, Any]] = None,
 ) -> Path:
     run_path = Path(run_dir)
+    skill_load = load_stage_skills(
+        "agent_reporting",
+        requested_context_layers=(
+            "task_context",
+            "memory_context_summary",
+            "dynamic_tail.observation_summary",
+            "dynamic_tail.event_refs",
+            "dynamic_tail.tool_results",
+            "artifact_refs",
+        ),
+        available_inputs=("agent_task", "agent_plan", "tool_events", "observation_summary", "decision_record"),
+        event_path=run_path / "agent_events.jsonl",
+    )
     observed = dict(observation or {})
     lines = [
         "# Question Evolution Agent Report",
@@ -72,7 +86,10 @@ def write_agent_report(
         f"- Decision: {(decision or {}).get('action', 'not decided')}",
         f"- Reason: {(decision or {}).get('reason', 'not available')}",
         "- Automatic scores are evidence only; any boundary candidate requires human confirmation before a policy or Memory change.",
+        f"- Reporting procedure: {', '.join(item.spec.skill_id for item in skill_load.loaded) or 'base safety rules'}",
     ])
+    if skill_load.fallback_to_base_rules:
+        lines.append("- Skill loading degraded to base safety rules; see `agent_events.jsonl` for the loading failure.")
     review = dict(multi_agent_review or {})
     merge = dict(review.get("merge") or {})
     if review:

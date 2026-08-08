@@ -1,0 +1,1 @@
+{"input":{"task_context":{"candidate_id":"c1"},"artifact_refs":[{"path":"round_1/scored.jsonl"}]},"expected_output":{"prioritized_candidates":[{"candidate_id":"c1","status":"precheck_only"}],"review_reasons":["automatic evidence"],"answerability_risks":[],"leakage_risks":[],"mechanism_hits":[],"artifact_refs":[{"path":"round_1/scored.jsonl"}]}}

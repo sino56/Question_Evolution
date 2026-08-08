@@ -1,0 +1,1 @@
+{"input":{"dynamic_tail":{"observation_summary":{"score_increased_count":1}},"artifact_refs":[{"path":"round_1/branch_results.jsonl"}]},"expected_output":{"failure_type":"business_failure","recommended_action":"manual_review_required","resume_point":"","must_not_rerun":["same-condition score_increased branch"],"evidence_refs":[{"path":"round_1/branch_results.jsonl"}]}}

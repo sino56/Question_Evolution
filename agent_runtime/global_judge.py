@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from agent_runtime.skills import load_stage_skills, validate_skill_output
+
 
 GLOBAL_JUDGE_VERSION = "global-judge-v1"
 EVIDENCE_PACK_VERSION = "global-judge-evidence-pack-v1"
@@ -460,6 +462,15 @@ def proposals_from_diagnoses(pack: Mapping[str, Any], diagnoses: Sequence[Mappin
             "rollback_conditions": ["score_increased rate rises", "invalid generation rate rises", "Judge disagreement is unacceptable", "observed effect escapes the declared scope"],
         }
         validate_proposal(proposal, allow_active=False)
+        validate_skill_output(
+            "strategy-proposal-skill",
+            {
+                "status": proposal["status"],
+                "proposal": proposal,
+                "evidence_strength": proposal["evidence_strength"],
+                "evidence_refs": list(proposal["evidence_refs"]),
+            },
+        )
         proposals.append(proposal)
     return proposals
 
@@ -502,6 +513,11 @@ def run_global_judge(pack: Mapping[str, Any]) -> dict[str, Any]:
     """Generate deterministic, evidence-bound diagnostics and proposal drafts."""
 
     validate_evidence_pack(pack)
+    skill_load = load_stage_skills(
+        "strategy_proposal",
+        requested_context_layers=("memory_context_summary", "dynamic_tail.observation_summary", "dynamic_tail.event_refs", "artifact_refs"),
+        available_inputs=("strategy_card_drafts", "conflict_review", "replay_holdout", "human_review_records"),
+    )
     diagnoses = [_diagnose_row(row) for row in pack.get("branch_records", []) if isinstance(row, Mapping)]
     if not diagnoses:
         diagnoses = [{
@@ -527,6 +543,7 @@ def run_global_judge(pack: Mapping[str, Any]) -> dict[str, Any]:
         "shadow_strategy_cards": shadow_cards, "shadow_rejections": shadow_rejections,
         "diagnosis_summary": dict(sorted(kinds.items())),
         "conclusion": "Offline advisory output only. No formal experiment artifact or live runtime policy was modified.",
+        "skill_load": skill_load.as_dict(),
     }
 
 

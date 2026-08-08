@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "agent-report-skill output",
+  "type": "object",
+  "required": ["summary"],
+  "properties": {
+    "summary": {"type": "string", "maxLength": 4000},
+    "sections": {"type": "object"},
+    "evidence_refs": {"type": "array"},
+    "artifact_refs": {"type": "array"}
+  }
+}

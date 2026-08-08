@@ -1,0 +1,1 @@
+{"input":{"task_context":{"operator_id":"O16"},"artifact_refs":[{"path":"round_1/branch_results.jsonl"}]},"expected_output":{"operator_risks":["sample fit requires review"],"applicability_conditions":[],"exclusion_condition_suggestions":[],"needs_human_review":["single observation"],"evidence_refs":[{"path":"round_1/branch_results.jsonl"}]}}

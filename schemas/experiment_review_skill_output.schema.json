@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "experiment-review-skill output",
+  "type": "object",
+  "required": ["summary", "outcome_type"],
+  "properties": {
+    "summary": {"type": "string", "maxLength": 4000},
+    "outcome_type": {"enum": ["score_decreased", "score_increased", "no_gain", "not_applicable", "validation_failed", "mixed"]},
+    "findings": {"type": "array"},
+    "needs_human_review": {"type": "array"},
+    "evidence_refs": {"type": "array"},
+    "artifact_refs": {"type": "array"}
+  }
+}

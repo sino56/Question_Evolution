@@ -1,0 +1,1 @@
+{"input":{"task_context":{"goal":"bounded exploration"},"memory_context_summary":{},"dynamic_tail":{"observation_summary":{}}},"expected_output":{"recommended_plan_type":"single_branch","budget_recommendation":{},"operator_strategy":{},"stop_conditions":["manual review"],"human_review_thresholds":[],"artifact_refs":[{"path":"agent_observation.json"}]}}

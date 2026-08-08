@@ -10,6 +10,7 @@ from .advisor_dispatcher import dependent_advisors, select_advisors
 from .advisor_executor import AdvisorExecutor
 from .evidence_pack import build_evidence_pack
 from .human_review_advisors import synthesize_prechecks
+from ..skills import load_stage_skills
 
 
 def run_post_experiment_review(
@@ -22,12 +23,24 @@ def run_post_experiment_review(
 ) -> dict[str, Any]:
     """Fail open: advisor failures never change primary experiment artifacts."""
 
+    skill_load = load_stage_skills(
+        "post_experiment_review",
+        requested_context_layers=(
+            "task_context",
+            "memory_context_summary",
+            "dynamic_tail.observation_summary",
+            "dynamic_tail.event_refs",
+            "artifact_refs",
+        ),
+        available_inputs=("experiment_summary", "branch_results", "effect_analysis", "memory_summary", "operator_id", "candidate_question", "parent_question", "validation_result", "score_change"),
+        event_path=Path(run_dir) / "agent_events.jsonl",
+    )
     evidence_pack = build_evidence_pack(run_dir, task=task, state=state, observation=observation, plan=plan)
     specs = select_advisors("post_experiment_review", observation)
     executor = AdvisorExecutor(run_dir, parent_run_id=str(state.get("agent_run_id") or Path(run_dir).name))
     records, advice_items = executor.execute(specs, evidence_pack)
     merged = merge_advice(run_dir, advice_items=advice_items, evidence_pack=evidence_pack)
-    return {"evidence_pack_hash": evidence_pack["evidence_pack_hash"], "advisor_records": records, "merge": merged}
+    return {"evidence_pack_hash": evidence_pack["evidence_pack_hash"], "advisor_records": records, "merge": merged, "skill_load": skill_load.as_dict()}
 
 
 def run_advisor_stage(
@@ -41,6 +54,21 @@ def run_advisor_stage(
 ) -> dict[str, Any]:
     """Run optional advisory stages with the plan's required dependency order."""
 
+    skill_load = None
+    if stage == "memory_compilation":
+        skill_load = load_stage_skills(
+            "memory_compilation",
+            requested_context_layers=("memory_context_summary", "dynamic_tail.observation_summary", "dynamic_tail.event_refs", "artifact_refs"),
+            available_inputs=("local_memory", "failure_memory", "invalid_generation_cases", "effect_analysis", "branch_results"),
+            event_path=Path(run_dir) / "agent_events.jsonl",
+        )
+    elif stage == "human_review_precheck":
+        skill_load = load_stage_skills(
+            "human_review_precheck",
+            requested_context_layers=("task_context", "dynamic_tail.observation_summary", "dynamic_tail.event_refs", "artifact_refs"),
+            available_inputs=("candidate_question", "parent_question", "score_result", "validation_result", "mechanism_analysis"),
+            event_path=Path(run_dir) / "agent_events.jsonl",
+        )
     evidence_pack = build_evidence_pack(run_dir, task=task, state=state, observation=observation, plan=plan)
     executor = AdvisorExecutor(run_dir, parent_run_id=str(state.get("agent_run_id") or Path(run_dir).name), max_concurrency=2 if stage == "memory_compilation" else 4)
     records: list[dict[str, Any]] = []
@@ -70,4 +98,7 @@ def run_advisor_stage(
         records.extend(batch_records)
         advice_items.extend(batch_advice)
     merged = merge_advice(run_dir, advice_items=advice_items, evidence_pack=evidence_pack)
-    return {"evidence_pack_hash": evidence_pack["evidence_pack_hash"], "advisor_records": records, "merge": merged}
+    result = {"evidence_pack_hash": evidence_pack["evidence_pack_hash"], "advisor_records": records, "merge": merged}
+    if skill_load is not None:
+        result["skill_load"] = skill_load.as_dict()
+    return result

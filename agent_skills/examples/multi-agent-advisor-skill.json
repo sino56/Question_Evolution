@@ -1,0 +1,1 @@
+{"input":{"advisor_spec_context":{"advisor_id":"router_diagnosis"},"evidence_pack_slice":{"evidence_refs":[{"path":"round_1/effect_analysis.jsonl"}]}},"expected_output":{"advisor_id":"router_diagnosis","status":"completed","summary":"Advisory only.","findings":[],"forbidden_actions_requested":[],"evidence_refs":[{"path":"round_1/effect_analysis.jsonl"}]}}

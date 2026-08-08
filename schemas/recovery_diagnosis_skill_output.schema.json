@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "recovery-diagnosis-skill output",
+  "type": "object",
+  "required": ["failure_type", "recommended_action", "must_not_rerun"],
+  "properties": {
+    "failure_type": {"enum": ["business_failure", "system_failure", "governance_block", "unknown"]},
+    "recommended_action": {"enum": ["resume", "rollback", "replan", "stop_and_report", "manual_review_required"]},
+    "resume_point": {"type": "string"},
+    "must_not_rerun": {"type": "array", "items": {"type": "string"}},
+    "evidence_refs": {"type": "array"},
+    "artifact_refs": {"type": "array"}
+  }
+}

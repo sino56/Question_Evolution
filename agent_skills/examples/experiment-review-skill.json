@@ -1,0 +1,1 @@
+{"input":{"task_context":{"goal":"review"},"artifact_refs":[{"path":"round_1/effect_analysis.jsonl"}]},"expected_output":{"summary":"Automatic result remains a candidate.","outcome_type":"no_gain","findings":[],"needs_human_review":[],"evidence_refs":[{"path":"round_1/effect_analysis.jsonl"}]}}

@@ -1,0 +1,1 @@
+{"input":{"artifact_refs":[{"path":"global_judge/evidence_pack.json"}]},"expected_output":{"status":"needs_human_review","proposal":{},"evidence_strength":"low","conflicts":[],"verification_plan":{},"evidence_refs":[{"path":"global_judge/evidence_pack.json"}]}}

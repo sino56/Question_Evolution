@@ -1,0 +1,1 @@
+{"input":{"memory_context_summary":{"failure_memory":"score_increased"},"artifact_refs":[{"path":"memory/failure_memory_bank.jsonl"}]},"expected_output":{"candidate_facts":[{"claim":"negative gain observed"}],"classification_keys":[],"strategy_card_drafts":[],"conflicts":[],"evidence_strength":"low","artifact_refs":[{"path":"memory/failure_memory_bank.jsonl"}]}}

@@ -21,6 +21,7 @@ from .review_advisors import review_advice
 from .human_review_advisors import human_review_advice
 from .evidence_pack import stable_hash
 from .advisor_model_client import request_model_advice
+from ..skills import load_stage_skills
 
 AdvisorHandler = Callable[[AdvisorSpec, Mapping[str, Any], ModelSelection], Mapping[str, Any]]
 
@@ -65,6 +66,12 @@ class AdvisorExecutor:
         except Exception as exc:
             record = {"advisor_task_id": task_id, "parent_run_id": self.parent_run_id, "advisor_id": spec.advisor_id, "status": "rejected_by_policy", **selection.as_dict(), "input_hash": "sha256:", "output_hash": "", "context_cache_key": "sha256:", "started_at": started, "ended_at": now(), "evidence_refs": [], "error_summary": str(exc), "parent_advisor_task_id": parent_advisor_task_id}
             return record, {"advisor_id": spec.advisor_id, "status": "rejected_by_policy", "summary": "Advisor context rejected by policy.", "findings": [], "forbidden_actions_requested": [], "input_hash": evidence_pack.get("evidence_pack_hash"), "snapshot_ids": evidence_pack.get("snapshot_ids", {})}
+        load_stage_skills(
+            "multi_agent_advice",
+            requested_context_layers=("advisor_spec_context", "evidence_pack_slice", "advisor_dynamic_instruction", "artifact_refs"),
+            available_inputs=("advisor_spec_context", "evidence_pack_slice", "allowed_tools", "output_schema"),
+            event_path=self.run_dir / "multi_agent" / "advisor_events.jsonl",
+        )
         output_dir = self._output_dir(spec)
         (output_dir / "advisor_input.json").write_text(json.dumps(context, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         append_advisor_event(self.run_dir, "advisor_started", {"advisor_task_id": task_id, "advisor_id": spec.advisor_id, "input_hash": context["input_hash"], "context_cache_key": context["context_cache_key"]})

@@ -16,6 +16,7 @@ from agent_runtime.observer import observe_experiment
 from agent_runtime.planner import build_plan
 from agent_runtime.policy import PolicyViolation, validate_plan
 from agent_runtime.reporter import write_agent_report, write_global_review_artifacts
+from agent_runtime.skills import load_stage_skills
 from agent_runtime.state import create_run_dir, initialize_state, update_state, write_context, write_plan_revision, write_task
 from agent_runtime.task import AgentTask, TaskValidationError, load_agent_task, parse_agent_task
 from agent_runtime.tools import ToolRegistry
@@ -117,6 +118,18 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
         return 2, run_dir
     update_state(run_dir, state, memory_snapshot_id=snapshot["memory_snapshot_id"], memory_snapshot_path=snapshot_path, memory_context_key=memory_context.get("memory_context_key"), memory_mode=memory_context.get("mode", snapshot.get("mode", "no_global_memory")))
     initial_context = build_context_pack(task, memory_context=memory_context)
+    load_stage_skills(
+        "planning_strategy",
+        requested_context_layers=(
+            "task_context",
+            "memory_context_summary",
+            "dynamic_tail.observation_summary",
+            "dynamic_tail.event_refs",
+            "artifact_refs",
+        ),
+        available_inputs=("agent_task", "budget", "allowed_tools", "memory_top_k", "observation_summary"),
+        event_path=run_dir / "agent_events.jsonl",
+    )
     update_state(run_dir, state, status="context_ready")
     plan = build_plan(task, command=command, context_pack=initial_context)
     plan["memory_snapshot_id"] = snapshot["memory_snapshot_id"]
@@ -177,6 +190,22 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
         # decision logic, and report creation remain available on degradation.
         multi_agent_review = {"merge": {"accepted_advice": [], "policy_rejections": [], "conflicts": []}, "degraded_reason": str(exc)}
     decision = decide_next_action(task, observation, tool_results=results)
+    if decision["action"] in {"blocked", "suspend"} or observation.get("score_increased_count") or observation.get("budget_exhausted"):
+        # This documents the recovery procedure without granting it any write
+        # authority.  The deterministic decision and normal policy checks are
+        # still the only route to an actual resume or replan.
+        load_stage_skills(
+            "recovery_diagnosis",
+            requested_context_layers=(
+                "task_context",
+                "dynamic_tail.observation_summary",
+                "dynamic_tail.event_refs",
+                "dynamic_tail.tool_results",
+                "artifact_refs",
+            ),
+            available_inputs=("agent_events", "tool_results", "checkpoint", "manifest", "termination_reason"),
+            event_path=run_dir / "agent_events.jsonl",
+        )
     write_decision(run_dir, decision)
     if decision["action"] == "replan":
         update_state(run_dir, state, status="replanning", current_step_id=None)

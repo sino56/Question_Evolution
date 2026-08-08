@@ -1,0 +1,1 @@
+{"input":{"task_context":{"goal":"report"},"dynamic_tail":{"observation_summary":{"status":"observed"}}},"expected_output":{"summary":"Report is proposal-only.","sections":{"risk":"manual review"},"artifact_refs":[{"path":"agent_observation.json"}]}}

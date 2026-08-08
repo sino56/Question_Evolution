@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from .advisor_registry import MODEL_TIERS
+from ..skills import load_stage_skills
 
 MODEL_ROUTER_VERSION = "advisor-model-router-v1"
 
@@ -45,6 +46,13 @@ def configured_models(environ: Mapping[str, str] | None = None) -> dict[str, str
 def select_model(model_tier: str, fallback_model_tier: str, *, models: Mapping[str, str] | None = None) -> ModelSelection:
     if model_tier not in MODEL_TIERS or fallback_model_tier not in MODEL_TIERS:
         raise ValueError("unknown model tier")
+    load_stage_skills(
+        "model_routing",
+        requested_context_layers=("advisor_spec_context", "evidence_pack_slice", "artifact_refs"),
+        available_inputs=("advisor_spec", "task_risk", "budget", "evidence_pack_slice_hash", "json_and_evidence_requirements"),
+    )
+    if model_tier in {"reasoning_high", "synthesis_high"} and fallback_model_tier == "extract_low_cost":
+        raise ValueError("high-risk reasoning and synthesis cannot fall back to extract_low_cost")
     available = dict(models) if models is not None else configured_models()
     if available.get(model_tier):
         return ModelSelection(model_tier, str(available[model_tier]), False)
