@@ -24,6 +24,16 @@ by the Reflector. `agent_tool_event.schema.json` records call IDs, idempotency,
 retry metadata, checkpoints, and state transitions without raw environment,
 model-response, or JSONL payloads.
 
+## Stage 7 Multi-agent Advisor Contracts
+
+`advisor_spec.schema.json` registers each read-only advisor, its trigger,
+input and tool allowlists, model capability tiers, timeout/retry policy, and
+structured-output requirements. `advisor_run_record.schema.json` is the
+append-only run audit record. `advisor_advice.schema.json` standardizes
+evidence-bound advice for conservative merging. None of these contracts grants
+an advisor access to formal experiment artifacts, prompts, Router output,
+operators, scores, or active global Memory.
+
 ## Record Ownership
 
 - `sample_id`, `index`, `round`, `prompt`, `meta_info`, `rubric`,

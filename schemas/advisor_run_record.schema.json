@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Advisor Run Record",
+  "type": "object",
+  "required": ["advisor_task_id", "parent_run_id", "advisor_id", "status", "model_tier", "selected_model", "fallback_used", "input_hash", "output_hash", "context_cache_key", "started_at", "ended_at", "evidence_refs", "error_summary", "parent_advisor_task_id"],
+  "properties": {
+    "advisor_task_id": {"type": "string", "minLength": 1},
+    "parent_run_id": {"type": "string", "minLength": 1},
+    "advisor_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["pending", "running", "completed", "failed", "skipped", "timeout", "rejected_by_policy"]},
+    "model_tier": {"enum": ["extract_low_cost", "reasoning_medium", "reasoning_high", "synthesis_high"]},
+    "selected_model": {"type": "string", "minLength": 1},
+    "fallback_used": {"type": "boolean"},
+    "input_hash": {"type": "string", "pattern": "^sha256:"},
+    "output_hash": {"type": "string"},
+    "context_cache_key": {"type": "string", "pattern": "^sha256:"},
+    "started_at": {"type": "string", "minLength": 1},
+    "ended_at": {"type": "string", "minLength": 1},
+    "evidence_refs": {"type": "array", "items": {"type": "object"}},
+    "error_summary": {"type": "string"},
+    "parent_advisor_task_id": {"type": ["string", "null"]}
+  },
+  "additionalProperties": true
+}

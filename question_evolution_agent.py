@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from agent_runtime.decisions import decide_next_action, write_decision
 from agent_runtime.context import build_context_pack
+from agent_runtime.multi_agent.coordinator import run_post_experiment_review
 from agent_runtime.global_memory import GlobalMemoryStore, SnapshotUnavailable, router_cache_key
 from agent_runtime.executor import Executor, ExecutorError
 from agent_runtime.observer import observe_experiment
@@ -168,6 +169,13 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
     observation = executor.observation
     if observation is None:
         observation = _blocked_observation("observation was not reached", state.get("experiment_dir") or task.resume_exp_dir)
+    multi_agent_review: Dict[str, Any] = {}
+    try:
+        multi_agent_review = run_post_experiment_review(run_dir, task=task.as_dict(), state=state, plan=plan, observation=observation)
+    except Exception as exc:
+        # Advisor collaboration is review-only.  Primary experiment results,
+        # decision logic, and report creation remain available on degradation.
+        multi_agent_review = {"merge": {"accepted_advice": [], "policy_rejections": [], "conflicts": []}, "degraded_reason": str(exc)}
     decision = decide_next_action(task, observation, tool_results=results)
     write_decision(run_dir, decision)
     if decision["action"] == "replan":
@@ -207,7 +215,7 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
     )
     report_step = next((step for step in plan["steps"] if step.get("tool_name") == "write_agent_report"), None)
     if report_step:
-        executor.execute_report(report_step, lambda: write_agent_report(run_dir, task=task.as_dict(), state=state, plan=plan, observation=observation, tool_results=results, decision=decision))
+        executor.execute_report(report_step, lambda: write_agent_report(run_dir, task=task.as_dict(), state=state, plan=plan, observation=observation, tool_results=results, decision=decision, multi_agent_review=multi_agent_review))
     if command == "review":
         write_global_review_artifacts(run_dir, observation)
     return (2 if status == "blocked" else 0), run_dir

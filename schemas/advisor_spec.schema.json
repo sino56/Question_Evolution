@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Advisor Specification",
+  "type": "object",
+  "required": ["advisor_id", "name", "stage", "purpose", "trigger", "allowed_inputs", "allowed_tools", "model_tier", "fallback_model_tier", "requires_json_output", "requires_evidence_refs", "output_schema", "max_runtime_seconds", "max_input_chars", "retry_count", "failure_policy", "version"],
+  "properties": {
+    "advisor_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+    "name": {"type": "string", "minLength": 1},
+    "stage": {"enum": ["post_experiment_review", "memory_compilation", "plan_candidates", "human_review_precheck"]},
+    "purpose": {"type": "string", "minLength": 1},
+    "trigger": {"type": "string", "minLength": 1},
+    "allowed_inputs": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "allowed_tools": {"type": "array", "minItems": 1, "items": {"enum": ["read_evidence_pack", "read_artifact_ref", "read_memory_ledger", "read_context_pack", "read_policy_snapshot", "read_candidate_summary", "write_temp_advice", "write_strategy_card_draft", "write_plan_candidate", "write_review_precheck"]}},
+    "model_tier": {"enum": ["extract_low_cost", "reasoning_medium", "reasoning_high", "synthesis_high"]},
+    "fallback_model_tier": {"enum": ["extract_low_cost", "reasoning_medium", "reasoning_high", "synthesis_high"]},
+    "requires_json_output": {"const": true},
+    "requires_evidence_refs": {"type": "boolean"},
+    "output_schema": {"const": "advisor_advice.schema.json"},
+    "max_runtime_seconds": {"type": "integer", "minimum": 1},
+    "max_input_chars": {"type": "integer", "minimum": 1},
+    "retry_count": {"type": "integer", "minimum": 0},
+    "failure_policy": {"enum": ["warn_and_continue", "skip_and_continue"]},
+    "version": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": false
+}

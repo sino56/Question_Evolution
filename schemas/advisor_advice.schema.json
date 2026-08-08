@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Advisor Advice",
+  "type": "object",
+  "required": ["advisor_id", "status", "summary", "findings", "forbidden_actions_requested", "input_hash", "snapshot_ids"],
+  "properties": {
+    "advisor_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["completed", "failed", "skipped", "timeout", "rejected_by_policy"]},
+    "summary": {"type": "string", "maxLength": 800},
+    "findings": {"type": "array", "maxItems": 20, "items": {"type": "object", "required": ["type", "severity", "claim", "evidence_refs", "recommended_action"], "properties": {"type": {"type": "string"}, "severity": {"enum": ["info", "low", "medium", "high", "critical"]}, "claim": {"type": "string", "minLength": 1}, "evidence_refs": {"type": "array", "items": {"type": "object"}}, "recommended_action": {"type": "string", "minLength": 1}}, "additionalProperties": true}},
+    "forbidden_actions_requested": {"type": "array", "items": {"type": "string"}},
+    "input_hash": {"type": "string", "pattern": "^sha256:"},
+    "snapshot_ids": {"type": "object"},
+    "truncated_by_merger": {"type": "boolean"}
+  },
+  "additionalProperties": true
+}

@@ -24,6 +24,7 @@ def write_agent_report(
     observation: Optional[Mapping[str, Any]],
     tool_results: Iterable[Mapping[str, Any]],
     decision: Optional[Mapping[str, Any]] = None,
+    multi_agent_review: Optional[Mapping[str, Any]] = None,
 ) -> Path:
     run_path = Path(run_dir)
     observed = dict(observation or {})
@@ -72,6 +73,15 @@ def write_agent_report(
         f"- Reason: {(decision or {}).get('reason', 'not available')}",
         "- Automatic scores are evidence only; any boundary candidate requires human confirmation before a policy or Memory change.",
     ])
+    review = dict(multi_agent_review or {})
+    merge = dict(review.get("merge") or {})
+    if review:
+        lines.extend(["", "## Multi-agent review advice", f"- Evidence pack hash: {review.get('evidence_pack_hash', 'not available')}", f"- Advisor runs: {len(review.get('advisor_records') or [])}", f"- Accepted advice: {len(merge.get('accepted_advice') or [])}", f"- Policy-rejected advice: {len(merge.get('policy_rejections') or [])}", f"- Conflicting advice: {len(merge.get('conflicts') or [])}"])
+        for item in merge.get("policy_rejections") or []:
+            lines.append(f"- Rejected advisor {item.get('advisor_id')}: {item.get('reason')}")
+        for conflict in merge.get("conflicts") or []:
+            lines.append(f"- Conflict requires human review: {conflict.get('finding_key')}")
+        lines.append("- These are read-only recommendations. They do not change scores, formal artifacts, prompts, operators, Router output, or active Memory.")
     return _write(run_path / "agent_report.md", "\n".join(lines) + "\n")
 
 
