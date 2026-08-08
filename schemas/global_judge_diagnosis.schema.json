@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Global Judge Diagnosis",
+  "type": "object",
+  "required": ["record_type", "diagnosis_version", "diagnosis_id", "diagnosis_kind", "diagnosis_level", "failure_reason", "evidence_refs"],
+  "properties": {
+    "record_type": {"const": "global_judge_diagnosis"},
+    "diagnosis_version": {"const": "global-judge-diagnosis-v1"},
+    "diagnosis_kind": {"enum": ["business_failure", "system_failure", "judge_instability", "strategy_conflict", "evidence_insufficient"]},
+    "diagnosis_level": {"enum": ["sample/data", "router", "operator selection", "operator generation", "validation", "rubric/judge", "memory", "search/cost"]},
+    "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "object"}}
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Offline Shadow Strategy Card",
+  "type": "object",
+  "required": ["record_type", "shadow_card_version", "shadow_card_id", "proposal_id", "status", "affected_scope", "evidence_refs", "action_limit"],
+  "properties": {
+    "record_type": {"const": "shadow_strategy_card"},
+    "status": {"const": "shadow"},
+    "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+    "action_limit": {"type": "string", "minLength": 1}
+  }
+}

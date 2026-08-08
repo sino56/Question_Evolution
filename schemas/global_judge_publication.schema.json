@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Global Judge Publication Ledger Record",
+  "type": "object",
+  "required": ["record_type", "publication_id", "status", "approval", "published_at", "authority"],
+  "properties": {
+    "record_type": {"const": "global_judge_publication"},
+    "status": {"enum": ["active", "rolled_back", "retired"]},
+    "approval": {"type": "object", "required": ["approved_by", "approved_at", "decision", "risk_acknowledgement"]},
+    "authority": {"const": "publisher"}
+  }
+}
