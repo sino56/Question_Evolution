@@ -14,7 +14,7 @@ from agent_runtime.observer import observe_experiment
 from agent_runtime.planner import build_plan
 from agent_runtime.policy import PolicyViolation, validate_plan
 from agent_runtime.reporter import write_agent_report, write_global_review_artifacts
-from agent_runtime.state import create_run_dir, initialize_state, update_state, write_context, write_plan, write_task
+from agent_runtime.state import create_run_dir, initialize_state, update_state, write_context, write_plan_revision, write_task
 from agent_runtime.task import AgentTask, TaskValidationError, load_agent_task, parse_agent_task
 from agent_runtime.tools import ToolExecutionError, ToolRegistry
 
@@ -72,29 +72,43 @@ def _blocked_observation(reason: str, experiment_dir: str = "") -> Dict[str, Any
 
 def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry] = None) -> tuple[int, Path]:
     run_dir = create_run_dir(ROOT)
-    state = initialize_state(run_dir, run_id=run_dir.name, mode=command)
+    state = initialize_state(
+        run_dir,
+        run_id=run_dir.name,
+        mode=command,
+        root_goal=task.goal,
+        budgets={"max_search_steps": task.max_search_steps, "boundary_target": task.boundary_target},
+    )
     write_task(run_dir, task.as_dict())
     initial_context = build_context_pack(task)
+    update_state(run_dir, state, status="context_ready")
     plan = build_plan(task, command=command, context_pack=initial_context)
-    write_context(run_dir, build_context_pack(task, plan=plan))
-    write_plan(run_dir, plan)
-    update_state(run_dir, state, status="planned")
-
     try:
         validate_plan(task, plan)
     except PolicyViolation as exc:
         plan["blocked_reasons"].append(str(exc))
-        write_plan(run_dir, plan)
+    plan = write_plan_revision(run_dir, state, plan)
+    write_context(run_dir, build_context_pack(task, plan=plan))
+    update_state(run_dir, state, status="planned", current_step_id=plan["steps"][0]["step_id"] if plan["steps"] else None)
     if plan["blocked_reasons"]:
         observation = _blocked_observation("; ".join(plan["blocked_reasons"]), task.resume_exp_dir)
         decision = decide_next_action(task, observation)
         write_decision(run_dir, decision)
-        update_state(run_dir, state, status="blocked", blocked_reason=decision["reason"])
+        update_state(
+            run_dir,
+            state,
+            status="blocked",
+            current_step_id=None,
+            blocked_reason=decision["reason"],
+            terminal_reason="invalid_plan",
+            requires_manual_review=bool(decision.get("requires_human_review")),
+            manual_review_status="pending" if decision.get("requires_human_review") else None,
+        )
         write_agent_report(run_dir, task=task.as_dict(), state=state, plan=plan, observation=observation, tool_results=[], decision=decision)
         return 2, run_dir
 
     if command == "dry-run":
-        update_state(run_dir, state, status="completed", completed_step_ids=["plan"])
+        update_state(run_dir, state, status="completed", current_step_id=None, completed_step_ids=["plan"], terminal_reason="dry_run_completed")
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return 0, run_dir
 
@@ -102,8 +116,8 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
     results: list[Dict[str, Any]] = []
     observation: Optional[Dict[str, Any]] = None
     for step in plan["steps"]:
-        tool = step["tool"]
-        update_state(run_dir, state, status="running", current_step_id=step["step_id"])
+        tool = step["tool_name"]
+        update_state(run_dir, state, status="observing" if tool == "observe_experiment" else "executing", current_step_id=step["step_id"])
         try:
             if tool == "check_environment":
                 result = registry.check_environment(task)
@@ -141,8 +155,41 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
         observation = _blocked_observation("observation was not reached", state.get("experiment_dir") or task.resume_exp_dir)
     decision = decide_next_action(task, observation, tool_results=results)
     write_decision(run_dir, decision)
-    status = "blocked" if decision["action"] == "blocked" else "completed"
-    update_state(run_dir, state, status=status, current_step_id=None, blocked_reason=decision["reason"] if status == "blocked" else None)
+    if decision["action"] == "replan":
+        update_state(run_dir, state, status="replanning", current_step_id=None)
+        plan = write_plan_revision(
+            run_dir,
+            state,
+            build_plan(task, command=command, context_pack=build_context_pack(task, plan=plan, observation=observation, previous_decision=decision)),
+            trigger_reason=decision["reason"],
+        )
+        status = "suspended"
+        terminal_reason = "replan_pending_execution"
+        manual_review = False
+    elif decision["action"] == "blocked":
+        status = "blocked"
+        terminal_reason = str(decision.get("terminal_reason") or "blocked")
+        manual_review = bool(decision.get("requires_human_review"))
+    elif decision.get("requires_human_review"):
+        # Automatic scoring remains evidence only.  A Session with pending
+        # review is intentionally suspended rather than marked completed.
+        status = "suspended"
+        terminal_reason = "manual_review_required"
+        manual_review = True
+    else:
+        status = "completed"
+        terminal_reason = str(decision.get("terminal_reason") or "completed")
+        manual_review = False
+    update_state(
+        run_dir,
+        state,
+        status=status,
+        current_step_id=None,
+        blocked_reason=decision["reason"] if status == "blocked" else None,
+        terminal_reason=terminal_reason,
+        requires_manual_review=manual_review,
+        manual_review_status="pending" if manual_review else None,
+    )
     write_agent_report(run_dir, task=task.as_dict(), state=state, plan=plan, observation=observation, tool_results=results, decision=decision)
     if command == "review":
         write_global_review_artifacts(run_dir, observation)

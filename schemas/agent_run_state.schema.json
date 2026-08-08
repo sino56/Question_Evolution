@@ -1,16 +1,25 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Question Evolution Agent Run State",
+  "title": "Question Evolution Agent Session Manifest",
   "type": "object",
-  "required": ["agent_run_id", "status", "command", "experiment_dir", "completed_step_ids"],
+  "required": ["agent_run_id", "session_id", "root_goal", "status", "plan_revision", "agent_run_dir", "budgets", "resume_checkpoint"],
   "properties": {
     "agent_run_id": {"type": "string", "minLength": 1},
-    "status": {"enum": ["created", "planned", "running", "observing", "completed", "blocked", "failed"]},
-    "command": {"enum": ["run", "resume", "review", "dry-run"]},
-    "experiment_dir": {"type": ["string", "null"]},
+    "session_id": {"type": "string", "minLength": 1},
+    "root_goal": {"type": "string"},
+    "status": {"enum": ["created", "context_ready", "planned", "executing", "observing", "replanning", "suspended", "completed", "stopped", "blocked", "failed"]},
+    "plan_revision": {"type": "integer", "minimum": 0},
     "current_step_id": {"type": ["string", "null"]},
-    "completed_step_ids": {"type": "array", "items": {"type": "string"}},
-    "blocked_reason": {"type": ["string", "null"]}
+    "current_plan_path": {"type": ["string", "null"]},
+    "latest_observation_path": {"type": "string"},
+    "event_log_path": {"type": "string"},
+    "agent_run_dir": {"type": "string"},
+    "experiment_dir": {"type": ["string", "null"]},
+    "budgets": {"type": "object"},
+    "terminal_reason": {"type": ["string", "null"]},
+    "requires_manual_review": {"type": "boolean"},
+    "manual_review_status": {"type": ["string", "null"]},
+    "resume_checkpoint": {"type": "object", "required": ["resume_exp_dir", "resume_start_round", "last_completed_step_id"]}
   },
   "additionalProperties": true
 }

@@ -27,13 +27,39 @@ def select_search_mode(task: AgentTask) -> tuple[str, List[str]]:
     return "multi_operator_branch", ["search_mode=auto defaulted to branch search because the goal did not select another mode"]
 
 
-def _step(step_id: str, tool: str, purpose: str, inputs: Mapping[str, Any], expected_outputs: List[str], *, stop_if_failed: bool = True, run_when: str = "always") -> Dict[str, Any]:
+def _step(
+    step_id: str,
+    tool: str,
+    purpose: str,
+    inputs: Mapping[str, Any],
+    expected_outputs: List[str],
+    *,
+    preconditions: Optional[List[str]] = None,
+    depends_on: Optional[List[str]] = None,
+    success_condition: str = "tool_completed",
+    business_failure_action: str = "observe_and_report",
+    system_failure_action: str = "suspend_or_block",
+    budget_limit: Optional[Mapping[str, Any]] = None,
+    stop_if_failed: bool = True,
+    run_when: str = "always",
+) -> Dict[str, Any]:
+    """Build a Stage-2 PlanStep while retaining Stage-1 field aliases."""
+
     return {
         "step_id": step_id,
+        "intent": purpose,
+        "tool_name": tool,
         "tool": tool,
         "purpose": purpose,
+        "arguments": dict(inputs),
         "inputs": dict(inputs),
+        "preconditions": list(preconditions or []),
         "expected_outputs": expected_outputs,
+        "success_condition": success_condition,
+        "business_failure_action": business_failure_action,
+        "system_failure_action": system_failure_action,
+        "budget_limit": dict(budget_limit or {}),
+        "depends_on": list(depends_on or []),
         "stop_if_failed": stop_if_failed,
         "run_when": run_when,
     }
@@ -62,41 +88,76 @@ def _deterministic_plan(task: AgentTask, *, command: str) -> Dict[str, Any]:
         env_overrides["EXP_ROOT"] = task.exp_root
 
     if task.is_review_only or command == "review":
+        plan_kind = "review_plan"
+        plan_layers = ["review_plan"]
         assumptions.append("report_only uses existing artifacts and never starts a pipeline subprocess")
         _append_if_allowed(steps, task, blocked, _step(
             "observe_experiment", "observe_experiment", "read published experiment artifacts and M1 summaries",
-            {"experiment_dir": task.resume_exp_dir}, ["agent_observation.json"],
+            {"experiment_dir": task.resume_exp_dir}, ["agent_observation.json", "published_manifest_validation"],
+            preconditions=["existing_experiment_dir"],
+            success_condition="published_artifacts_observed_or_blocked_with_evidence",
+            business_failure_action="report_missing_or_invalid_artifacts",
         ))
     elif command == "resume" or task.is_resume:
+        plan_kind = "recovery_plan"
+        plan_layers = ["recovery_plan"]
         _append_if_allowed(steps, task, blocked, _step(
             "resume_full_loop", "resume_full_loop", "resume the existing experiment using the registered loop entry point",
-            {"experiment_dir": task.resume_exp_dir, "start_round": task.resume_start_round}, ["updated experiment artifacts"],
+            {"experiment_dir": task.resume_exp_dir, "start_round": task.resume_start_round}, ["updated experiment artifacts", "final/final_scored.jsonl"],
+            preconditions=["existing_experiment_dir", "resume_checkpoint_valid", "published_manifest_validation_required"],
+            success_condition="resumed_loop_completed_with_published_scored_artifacts",
+            business_failure_action="observe_and_report",
+            budget_limit={"max_search_steps": task.max_search_steps},
         ))
         _append_if_allowed(steps, task, blocked, _step(
             "observe_experiment", "observe_experiment", "summarize the resumed experiment", {}, ["agent_observation.json"],
+            preconditions=["published_manifest_validation_required"],
+            depends_on=["resume_full_loop"],
+            success_condition="published_artifacts_observed_or_blocked_with_evidence",
+            business_failure_action="report_missing_or_invalid_artifacts",
         ))
     else:
+        plan_kind = "task_plan"
+        plan_layers = ["task_plan", "round_plan"]
         _append_if_allowed(steps, task, blocked, _step(
             "check_environment", "check_environment", "validate runtime prerequisites before a real experiment",
-            {"input_file": task.input_file}, ["runtime preflight JSON"],
+            {"input_file": task.input_file}, ["runtime preflight JSON", "environment_checked"],
+            success_condition="runtime_preflight_ready",
+            business_failure_action="stop_and_report",
         ))
         _append_if_allowed(steps, task, blocked, _step(
             "run_full_loop", "run_full_loop", "run the existing full Question Evolution loop without changing its control flow",
-            {"input_file": task.input_file}, ["experiment directory", "final/final_scored.jsonl"],
+            {"input_file": task.input_file}, ["experiment_dir", "final/final_scored.jsonl", "published_manifest_validation"],
+            preconditions=["environment_checked", "published_manifest_validation_required", "real_scoring_required"],
+            depends_on=["check_environment"],
+            success_condition="run_loop_completed_with_published_scored_artifacts",
+            business_failure_action="observe_and_report",
+            budget_limit={"max_search_steps": task.max_search_steps, "boundary_target": task.boundary_target},
         ))
         _append_if_allowed(steps, task, blocked, _step(
             "observe_experiment", "observe_experiment", "summarize the completed experiment and M1 memory", {}, ["agent_observation.json"],
+            preconditions=["published_manifest_validation_required"],
+            depends_on=["run_full_loop"],
+            success_condition="published_artifacts_observed_or_blocked_with_evidence",
+            business_failure_action="report_missing_or_invalid_artifacts",
         ))
 
     _append_if_allowed(steps, task, blocked, _step(
         "write_agent_report", "write_agent_report", "write an auditable M0 run report",
-        {}, ["agent_report.md"], stop_if_failed=False,
+        {}, ["agent_report.md"],
+        depends_on=["observe_experiment"],
+        success_condition="audit_report_written",
+        business_failure_action="report_failure",
+        stop_if_failed=False,
     ))
     if task.execution_scope != "full_iteration" and not task.is_review_only:
         blocked.append("the current registered loop only supports full_iteration; no partial execution entry point is registered")
 
     return {
         "plan_id": f"plan_{uuid.uuid4().hex[:16]}",
+        "plan_revision": 0,
+        "plan_kind": plan_kind,
+        "plan_layers": plan_layers,
         "goal_summary": task.goal[:1000],
         "selected_search_mode": selected_mode,
         "selected_execution_scope": task.execution_scope,
