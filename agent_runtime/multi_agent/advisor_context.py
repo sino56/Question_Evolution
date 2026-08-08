@@ -26,7 +26,7 @@ def build_evidence_slice(spec: AdvisorSpec, evidence_pack: Mapping[str, Any]) ->
         "advisor_id": spec.advisor_id,
         "snapshot_ids": dict(evidence_pack.get("snapshot_ids") or {}),
         "allowed_inputs": redact(allowed),
-        "evidence_refs": redact(list(evidence_pack.get("evidence_refs") or [])),
+        "evidence_refs": sorted(redact(list(evidence_pack.get("evidence_refs") or [])), key=stable_hash),
     }
     # Preserve the most decision-relevant material when the supplied evidence
     # exceeds the registered context budget; raw artifacts are always refs.
@@ -72,11 +72,19 @@ def build_advisor_context(
         "evidence_pack_slice_hash": evidence_slice["evidence_pack_slice_hash"],
         "model_router_policy_version": "advisor-model-router-v1",
     }
+    advisor_context_cache = {
+        "advisor_static_prefix_hash": stable_hash(static_prefix),
+        "advisor_spec_context_hash": stable_hash(spec_context),
+        "evidence_pack_slice_hash": evidence_slice["evidence_pack_slice_hash"],
+        "advisor_dynamic_instruction_hash": stable_hash(dynamic),
+        "context_cache_key": stable_hash(cache_payload),
+    }
     return {
         "advisor_static_prefix": static_prefix,
         "advisor_spec_context": spec_context,
         "evidence_pack_slice": evidence_slice,
         "advisor_dynamic_instruction": dynamic,
+        "advisor_context_cache": advisor_context_cache,
         "input_hash": stable_hash({"spec": spec_context, "slice": evidence_slice, "dynamic": dynamic}),
-        "context_cache_key": stable_hash(cache_payload),
+        "context_cache_key": advisor_context_cache["context_cache_key"],
     }

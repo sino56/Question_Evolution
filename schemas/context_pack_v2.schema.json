@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Agent Context Pack v2",
+  "type": "object",
+  "required": ["context_schema_version", "context_cache", "stable_prefix", "snapshot_prefix", "task_context", "memory_context", "dynamic_tail"],
+  "properties": {
+    "context_schema_version": {"const": "context-pack-v2"},
+    "context_cache": {"$ref": "context_cache.schema.json"},
+    "stable_prefix": {"type": "object"},
+    "snapshot_prefix": {"type": "object", "required": ["policy_snapshot_id", "prompt_snapshot_id", "operator_snapshot_id", "memory_snapshot_id", "tool_registry_version", "skill_registry_version"]},
+    "task_context": {"type": "object", "required": ["goal", "selected_search_mode", "selected_execution_scope", "plan_type", "budget", "allowed_tools"]},
+    "memory_context": {"type": "object", "required": ["memory_snapshot_id", "memory_context_key", "retrieval_config_version", "top_k", "cards"]},
+    "dynamic_tail": {"type": "object"}
+  },
+  "additionalProperties": true
+}

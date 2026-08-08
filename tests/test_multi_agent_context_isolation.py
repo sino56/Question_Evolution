@@ -34,8 +34,19 @@ def test_context_uses_slice_and_cache_key_binds_snapshot(tmp_path):
     assert first["context_cache_key"] == second["context_cache_key"]
     assert first["context_cache_key"] != changed["context_cache_key"]
     assert "experiment_dir" not in first["evidence_pack_slice"]["allowed_inputs"]
+    assert "experiment_dir" not in json.dumps(first["evidence_pack_slice"], ensure_ascii=False)
+    assert first["advisor_context_cache"]["evidence_pack_slice_hash"] == first["evidence_pack_slice"]["evidence_pack_slice_hash"]
+    assert first["advisor_context_cache"]["advisor_static_prefix_hash"].startswith("sha256:")
 
 
 def test_review_advisors_cannot_continue_old_context(tmp_path):
     with pytest.raises(ValueError, match="new context"):
         build_advisor_context(get_advisor("scoring_stability"), _pack(tmp_path), mode="continue", parent_advisor_task_id="adv-old")
+
+
+def test_dynamic_instruction_does_not_change_advisor_cache_key(tmp_path):
+    spec = get_advisor("router_diagnosis")
+    first = build_advisor_context(spec, _pack(tmp_path), dynamic_instruction="first concern")
+    second = build_advisor_context(spec, _pack(tmp_path), dynamic_instruction="second concern")
+    assert first["context_cache_key"] == second["context_cache_key"]
+    assert first["input_hash"] != second["input_hash"]

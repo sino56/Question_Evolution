@@ -14,6 +14,7 @@ from schema_validation import SchemaValidationError, load_schema, validate_insta
 
 from .policy import PolicyViolation, validate_plan
 from .task import AgentTask
+from .context_prompt import assemble_context_prompt
 
 
 def select_search_mode(task: AgentTask) -> tuple[str, List[str]]:
@@ -183,8 +184,8 @@ def _model_response(context_pack: Mapping[str, Any]) -> Mapping[str, Any]:
             "model": model,
             "temperature": float(os.getenv("AGENT_TEMPERATURE", "0")),
             "messages": [
-                {"role": "system", "content": "Return only one JSON AgentPlan. You may not propose file edits, prompt changes, or unregistered tools."},
-                {"role": "user", "content": json.dumps(context_pack, ensure_ascii=False)},
+                {"role": "system", "content": assemble_context_prompt(context_pack)},
+                {"role": "user", "content": "Return only one JSON AgentPlan. You may not propose file edits, prompt changes, or unregistered tools."},
             ],
         }, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},

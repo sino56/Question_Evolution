@@ -66,6 +66,7 @@ def _default_manifest(run_dir: Path, *, run_id: str, mode: str, root_goal: str =
         "memory_snapshot_id": None,
         "memory_snapshot_path": None,
         "memory_context_key": None,
+        "context_cache_key": None,
         "memory_mode": "no_global_memory",
         "requires_manual_review": False,
         "manual_review_status": None,

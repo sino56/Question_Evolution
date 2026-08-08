@@ -20,6 +20,7 @@
     "memory_snapshot_id": {"type": ["string", "null"]},
     "memory_snapshot_path": {"type": ["string", "null"]},
     "memory_context_key": {"type": ["string", "null"]},
+    "context_cache_key": {"type": ["string", "null"], "pattern": "^sha256:"},
     "memory_mode": {"type": "string"},
     "requires_manual_review": {"type": "boolean"},
     "manual_review_status": {"type": ["string", "null"]},

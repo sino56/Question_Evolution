@@ -1,25 +1,16 @@
-"""Build short, audit-friendly context packs without copying sensitive artifacts."""
+"""Build compatible Agent context packs with cache-safe v2 layers."""
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
-from .events import redact
-from .task import AgentTask, REGISTERED_TOOLS
-
-
-PROJECT_HARD_CONSTRAINTS = [
-    "Agent controls registered tools only; domain routing, generation, validation, and scoring remain in the pipeline.",
-    "Do not mutate prompts, Router, Rubric, operators, schemas, scores, state, or active Memory.",
-    "Do not treat automatic scores as confirmed capability boundaries.",
-    "Do not inject complete JSONL, logs, answers, rubrics, or secrets into the control layer.",
-]
+from .context_layers import PROJECT_HARD_CONSTRAINTS, build_context_layers, redact_context, registered_tools
+from .task import AgentTask
 
 
 def _truncate(value: Any, limit: int) -> Any:
-    text = json.dumps(redact(value), ensure_ascii=False, sort_keys=True)
+    text = json.dumps(redact_context(value), ensure_ascii=False, sort_keys=True)
     if len(text) <= limit:
         return json.loads(text)
     return {"truncated": True, "preview": text[:limit]}
@@ -32,9 +23,26 @@ def build_context_pack(
     observation: Optional[Mapping[str, Any]] = None,
     previous_decision: Optional[Mapping[str, Any]] = None,
     memory_context: Optional[Mapping[str, Any]] = None,
+    runtime_state: Optional[Mapping[str, Any]] = None,
+    snapshot_ids: Optional[Mapping[str, Any]] = None,
     max_chars: int = 60000,
 ) -> Dict[str, Any]:
-    pack = {
+    """Return legacy fields plus the v2 layered context contract.
+
+    Legacy keys remain for old reports and tools.  Model calls should consume
+    the v2 layers through :mod:`agent_runtime.context_prompt`.
+    """
+
+    layers = build_context_layers(
+        task,
+        plan=plan,
+        observation=observation,
+        previous_decision=previous_decision,
+        memory_context=memory_context,
+        runtime_state=runtime_state,
+        snapshot_ids=snapshot_ids,
+    )
+    legacy = {
         "goal": task.goal,
         "task_config": {
             "search_mode": task.search_mode,
@@ -47,10 +55,20 @@ def build_context_pack(
         "selected_plan": _truncate(plan or {}, min(12000, max_chars // 3)),
         "observation_summary": _truncate(observation or {}, min(18000, max_chars // 2)),
         "memory_summary": _truncate((observation or {}).get("memory_summary", {}), 5000),
-        # Stage 4 supplies only an audit-only, traceable Top-K context.  It is
-        # intentionally independent from M1 observation summaries.
-        "memory_context": _truncate(memory_context or {"cards": []}, 6000),
-        "available_tools": sorted(set(task.allowed_tools) & REGISTERED_TOOLS),
+        "memory_context": layers["memory_context"],
+        "available_tools": [item["tool_name"] for item in registered_tools(task.allowed_tools)],
         "previous_decision": _truncate(previous_decision or {}, 4000),
     }
+    pack = {**legacy, **layers}
+    if len(json.dumps(pack, ensure_ascii=False, sort_keys=True)) <= max_chars:
+        return pack
+    # Preserve the v2 contract for normal production calls.  Its layers are
+    # already independently bounded; reduce only duplicated legacy aliases.
+    if max_chars >= 5000:
+        pack["selected_plan"] = _truncate(plan or {}, 500)
+        pack["observation_summary"] = _truncate(observation or {}, 500)
+        pack["memory_summary"] = _truncate((observation or {}).get("memory_summary", {}), 500)
+        pack["previous_decision"] = _truncate(previous_decision or {}, 500)
+        return pack
+    # Very small diagnostic limits retain the legacy compact behavior.
     return _truncate(pack, max_chars)

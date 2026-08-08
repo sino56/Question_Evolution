@@ -117,7 +117,8 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
         write_agent_report(run_dir, task=task.as_dict(), state=state, plan={}, observation=observation, tool_results=[], decision={"action": "blocked", "reason": str(exc)})
         return 2, run_dir
     update_state(run_dir, state, memory_snapshot_id=snapshot["memory_snapshot_id"], memory_snapshot_path=snapshot_path, memory_context_key=memory_context.get("memory_context_key"), memory_mode=memory_context.get("mode", snapshot.get("mode", "no_global_memory")))
-    initial_context = build_context_pack(task, memory_context=memory_context)
+    initial_context = build_context_pack(task, memory_context=memory_context, runtime_state=state)
+    update_state(run_dir, state, context_cache_key=initial_context["context_cache"]["context_cache_key"])
     load_stage_skills(
         "planning_strategy",
         requested_context_layers=(
@@ -141,7 +142,9 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
     except PolicyViolation as exc:
         plan["blocked_reasons"].append(str(exc))
     plan = write_plan_revision(run_dir, state, plan)
-    write_context(run_dir, build_context_pack(task, plan=plan, memory_context=memory_context))
+    persisted_context = build_context_pack(task, plan=plan, memory_context=memory_context, runtime_state=state)
+    write_context(run_dir, persisted_context)
+    update_state(run_dir, state, context_cache_key=persisted_context["context_cache"]["context_cache_key"])
     update_state(run_dir, state, status="planned", current_step_id=plan["steps"][0]["step_id"] if plan["steps"] else None)
     if plan["blocked_reasons"]:
         observation = _blocked_observation("; ".join(plan["blocked_reasons"]), task.resume_exp_dir)
@@ -209,12 +212,30 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
     write_decision(run_dir, decision)
     if decision["action"] == "replan":
         update_state(run_dir, state, status="replanning", current_step_id=None)
+        replan_prompt_context = build_context_pack(
+            task,
+            plan=plan,
+            observation=observation,
+            previous_decision=decision,
+            memory_context=memory_context,
+            runtime_state=state,
+        )
         plan = write_plan_revision(
             run_dir,
             state,
-            {**build_plan(task, command=command, context_pack=build_context_pack(task, plan=plan, observation=observation, previous_decision=decision, memory_context=memory_context)), "memory_snapshot_id": snapshot["memory_snapshot_id"], "memory_context_key": memory_context.get("memory_context_key"), "router_cache_key": router_cache_key(base_key=str(plan["plan_id"]), memory_snapshot_id=str(snapshot["memory_snapshot_id"]))},
+            {**build_plan(task, command=command, context_pack=replan_prompt_context), "memory_snapshot_id": snapshot["memory_snapshot_id"], "memory_context_key": memory_context.get("memory_context_key"), "router_cache_key": router_cache_key(base_key=str(plan["plan_id"]), memory_snapshot_id=str(snapshot["memory_snapshot_id"]))},
             trigger_reason=decision["reason"],
         )
+        persisted_context = build_context_pack(
+            task,
+            plan=plan,
+            observation=observation,
+            previous_decision=decision,
+            memory_context=memory_context,
+            runtime_state=state,
+        )
+        write_context(run_dir, persisted_context)
+        update_state(run_dir, state, context_cache_key=persisted_context["context_cache"]["context_cache_key"])
         status = "suspended"
         terminal_reason = "replan_pending_execution"
         manual_review = False

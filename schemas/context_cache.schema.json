@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Context Cache Metadata",
+  "type": "object",
+  "required": ["context_cache_key", "stable_prefix_hash", "snapshot_prefix_hash", "task_context_hash", "memory_context_hash", "dynamic_tail_hash"],
+  "properties": {
+    "context_cache_key": {"type": "string", "pattern": "^sha256:"},
+    "stable_prefix_hash": {"type": "string", "pattern": "^sha256:"},
+    "snapshot_prefix_hash": {"type": "string", "pattern": "^sha256:"},
+    "task_context_hash": {"type": "string", "pattern": "^sha256:"},
+    "memory_context_hash": {"type": "string", "pattern": "^sha256:"},
+    "dynamic_tail_hash": {"type": "string", "pattern": "^sha256:"}
+  },
+  "additionalProperties": false
+}

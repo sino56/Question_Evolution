@@ -21,6 +21,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+from .context_cache import memory_context_key
+
 
 TAXONOMY_VERSION = "global-memory-taxonomy-v1"
 RETRIEVAL_CONFIG_VERSION = "global-memory-retrieval-v1"
@@ -540,18 +542,17 @@ class GlobalMemoryStore:
         snapshot = self.load_snapshot(snapshot_id)
         permitted = set(_as_mapping(snapshot.get("card_versions")).keys())
         tokens = {token for token in query.lower().split() if token}
-        scored: list[tuple[int, str, dict[str, Any]]] = []
+        scored: list[tuple[int, str, int, dict[str, Any]]] = []
         for card in self._cards():
             if card["card_id"] not in permitted or card["status"] == "retired":
                 continue
             searchable = " ".join(str(card.get(field, "")) for field in ("scene_family", "question_form", "reasoning_mechanism", "overscore_pattern", "card_type")).lower()
             score = sum(token in searchable for token in tokens)
-            scored.append((-score, card["card_id"], card))
-        selected = [card for _, _, card in sorted(scored)[:top_k]]
-        summaries = [{"card_id": card["card_id"], "version": card["version"], "status": card["status"], "summary": f"{card['card_type']}: {card.get('reasoning_mechanism') or card.get('question_form') or 'strategy evidence'}", "applicability": card.get("applicability_conditions", []), "exclusions": card.get("exclusion_conditions", []), "evidence_refs": card["evidence_refs"], "action_limit": "Audit-only reference; it must not alter the operator plan, routing, execution order, or scoring."} for card in selected]
-        normalized_query = " ".join(query.lower().split())
-        context_key = _hash({"memory_snapshot_id": snapshot_id, "normalized_query": normalized_query, "retrieval_config_version": RETRIEVAL_CONFIG_VERSION, "top_k": top_k})
-        return {"memory_snapshot_id": snapshot_id, "memory_context_key": context_key, "retrieval_config_version": RETRIEVAL_CONFIG_VERSION, "top_k": top_k, "cards": summaries}
+            scored.append((-score, card["card_id"], int(card.get("version") or 0), card))
+        selected = [(score, card) for score, _card_id, _version, card in sorted(scored)[:top_k]]
+        summaries = [{"card_id": card["card_id"], "version": card["version"], "status": card["status"], "retrieval_score": -score, "summary": f"{card['card_type']}: {card.get('reasoning_mechanism') or card.get('question_form') or 'strategy evidence'}", "applicability": card.get("applicability_conditions", []), "exclusions": card.get("exclusion_conditions", []), "evidence_refs": card["evidence_refs"], "action_limit": "Audit-only reference; it must not alter the operator plan, routing, execution order, or scoring."} for score, card in selected]
+        context_key = memory_context_key(memory_snapshot_id=snapshot_id, normalized_query=query, retrieval_config_version=RETRIEVAL_CONFIG_VERSION, top_k=top_k)
+        return {"memory_snapshot_id": snapshot_id, "memory_context_key": context_key, "retrieval_config_version": RETRIEVAL_CONFIG_VERSION, "top_k": top_k, "cards": summaries, "mode": snapshot.get("mode", "no_global_memory")}
 
     def import_trace(self, experiment_dir: str | Path) -> dict[str, Any]:
         experiment = Path(experiment_dir).resolve()

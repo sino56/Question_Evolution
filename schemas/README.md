@@ -24,6 +24,11 @@ by the Reflector. `agent_tool_event.schema.json` records call IDs, idempotency,
 retry metadata, checkpoints, and state transitions without raw environment,
 model-response, or JSONL payloads.
 
+`context_pack_v2.schema.json` and `context_cache.schema.json` define the
+cache-safe Agent context layers and their audit-only hashes.  They preserve
+legacy context fields while keeping dynamic paths, observations, and errors
+outside the stable prompt prefix.
+
 ## Stage 7 Multi-agent Advisor Contracts
 
 `advisor_spec.schema.json` registers each read-only advisor, its trigger,

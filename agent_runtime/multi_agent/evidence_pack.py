@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping
+
+from ..context_cache import sha256_digest
 
 SENSITIVE_KEYS = ("api_key", "apikey", "authorization", "base_url", "token", "secret", "password", "environment", "env")
 FULL_RESPONSE_KEYS = ("raw_response", "model_response", "response", "completion", "candidate_answer", "answer", "full_prompt", "prompt_log")
 
 
 def stable_hash(value: Any) -> str:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
-    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+    """Compatibility wrapper around the shared canonical context hash."""
+
+    return sha256_digest(value)
 
 
 def redact(value: Any, *, key: str = "") -> Any:
