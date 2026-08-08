@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Agent Plan",
+  "type": "object",
+  "required": ["plan_id", "goal_summary", "selected_search_mode", "selected_execution_scope", "selected_review_mode", "budget", "env_overrides", "steps", "assumptions", "blocked_reasons"],
+  "properties": {
+    "plan_id": {"type": "string", "minLength": 1},
+    "goal_summary": {"type": "string", "minLength": 1},
+    "selected_search_mode": {"enum": ["multi_operator_branch", "multi_operator_vertical_stack", "single_branch"]},
+    "selected_execution_scope": {"enum": ["full_iteration", "reference_rebuild_only", "debug_generation_only"]},
+    "selected_review_mode": {"enum": ["none", "report_only"]},
+    "budget": {"type": "object"},
+    "env_overrides": {"type": "object"},
+    "steps": {"type": "array", "items": {"type": "object", "required": ["step_id", "tool", "purpose", "inputs", "expected_outputs", "stop_if_failed", "run_when"]}},
+    "assumptions": {"type": "array", "items": {"type": "string"}},
+    "blocked_reasons": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": true
+}

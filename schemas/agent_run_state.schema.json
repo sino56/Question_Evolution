@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Agent Run State",
+  "type": "object",
+  "required": ["agent_run_id", "status", "command", "experiment_dir", "completed_step_ids"],
+  "properties": {
+    "agent_run_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["created", "planned", "running", "observing", "completed", "blocked", "failed"]},
+    "command": {"enum": ["run", "resume", "review", "dry-run"]},
+    "experiment_dir": {"type": ["string", "null"]},
+    "current_step_id": {"type": ["string", "null"]},
+    "completed_step_ids": {"type": "array", "items": {"type": "string"}},
+    "blocked_reason": {"type": ["string", "null"]}
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Agent Task",
+  "type": "object",
+  "required": ["goal"],
+  "properties": {
+    "goal": {"type": "string", "minLength": 1},
+    "input_file": {"type": "string"},
+    "search_mode": {"enum": ["auto", "multi_operator_branch", "multi_operator_vertical_stack", "single_branch"]},
+    "boundary_target": {"type": "integer", "minimum": 1},
+    "max_search_steps": {"type": "integer", "minimum": 1},
+    "execution_scope": {"enum": ["full_iteration", "reference_rebuild_only", "debug_generation_only"]},
+    "review_mode": {"enum": ["none", "report_only"]},
+    "planning_mode": {"enum": ["deterministic", "model_assisted"]},
+    "allowed_tools": {"type": "array", "items": {"type": "string"}},
+    "allow_prompt_mutation": {"const": false},
+    "allow_memory_active_publish": {"const": false},
+    "allow_global_memory_read": {"type": "boolean"},
+    "exp_root": {"type": "string"},
+    "resume_exp_dir": {"type": "string"},
+    "resume_start_round": {"type": ["integer", "null"], "minimum": 1}
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Agent Observation",
+  "type": "object",
+  "required": ["experiment_dir", "status", "final_records_count", "pending_count", "boundary_candidate_count", "score_increased_count", "not_applicable_count", "validation_failed_count", "branch_error_count", "target_reached", "missing_artifacts", "evidence_refs"],
+  "properties": {
+    "experiment_dir": {"type": "string"},
+    "status": {"enum": ["observed", "blocked"]},
+    "manifest_status": {"enum": ["not_checked", "damaged"]},
+    "final_records_count": {"type": "integer", "minimum": 0},
+    "pending_count": {"type": "integer", "minimum": 0},
+    "boundary_candidate_count": {"type": "integer", "minimum": 0},
+    "score_increased_count": {"type": "integer", "minimum": 0},
+    "not_applicable_count": {"type": "integer", "minimum": 0},
+    "validation_failed_count": {"type": "integer", "minimum": 0},
+    "branch_error_count": {"type": "integer", "minimum": 0},
+    "target_reached": {"type": "boolean"},
+    "missing_artifacts": {"type": "array", "items": {"type": "string"}},
+    "evidence_refs": {"type": "array", "items": {"type": "object"}}
+  },
+  "additionalProperties": true
+}

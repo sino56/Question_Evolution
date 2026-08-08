@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Agent Tool Event",
+  "type": "object",
+  "required": ["event_type", "created_at"],
+  "properties": {
+    "event_type": {"enum": ["tool_started", "tool_completed", "tool_failed", "decision"]},
+    "created_at": {"type": "string", "minLength": 1},
+    "tool": {"type": "string"},
+    "return_code": {"type": "integer"},
+    "duration_seconds": {"type": "number", "minimum": 0},
+    "recoverable": {"type": "boolean"}
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Agent Decision",
+  "type": "object",
+  "required": ["action", "reason", "requires_human_review", "created_at"],
+  "properties": {
+    "action": {"enum": ["run_pipeline", "resume_pipeline", "run_review", "stop_and_report", "blocked"]},
+    "reason": {"type": "string", "minLength": 1},
+    "requires_human_review": {"type": "boolean"},
+    "created_at": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": true
+}
