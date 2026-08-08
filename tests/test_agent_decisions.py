@@ -43,3 +43,12 @@ def test_review_stops_and_decision_is_written(tmp_path):
     write_decision(tmp_path / "run", decision)
     row = json.loads((tmp_path / "run" / "agent_decisions.jsonl").read_text(encoding="utf-8"))
     assert row["action"] == "stop_and_report"
+
+
+def test_reflector_rules_separate_negative_gain_and_retryable_system_failure(tmp_path):
+    negative = decide_next_action(task(tmp_path), observation(score_increased_count=1, observations=[{"type": "score_increased"}]))
+    assert negative["action"] == "stop_and_report"
+    assert negative["requires_human_review"] is True
+    retryable = decide_next_action(task(tmp_path), observation(observations=[{"type": "tool_retryable_failure"}]))
+    assert retryable["action"] == "suspend"
+    assert retryable["terminal_reason"] == "retryable_tool_failure"

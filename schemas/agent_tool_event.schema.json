@@ -4,12 +4,19 @@
   "type": "object",
   "required": ["event_type", "created_at"],
   "properties": {
-    "event_type": {"enum": ["tool_started", "tool_completed", "tool_failed", "decision"]},
+    "event_type": {"enum": ["tool_started", "tool_completed", "tool_failed", "tool_reused", "checkpoint_confirmed", "observation_created", "decision", "session_created", "session_status_changed", "plan_revision_created"]},
     "created_at": {"type": "string", "minLength": 1},
     "tool": {"type": "string"},
     "return_code": {"type": "integer"},
     "duration_seconds": {"type": "number", "minimum": 0},
-    "recoverable": {"type": "boolean"}
+    "recoverable": {"type": "boolean"},
+    "tool_call_id": {"type": "string"},
+    "idempotency_key": {"type": "string"},
+    "tool_version": {"type": "string"},
+    "attempt": {"type": "integer", "minimum": 1},
+    "retry_count": {"type": "integer", "minimum": 0},
+    "failure_category": {"type": ["string", "null"]},
+    "cost": {"type": "object"}
   },
   "additionalProperties": true
 }

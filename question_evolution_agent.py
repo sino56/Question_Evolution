@@ -8,15 +8,15 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from agent_runtime.decisions import decide_next_action, write_decision
-from agent_runtime.events import append_event
 from agent_runtime.context import build_context_pack
+from agent_runtime.executor import Executor, ExecutorError
 from agent_runtime.observer import observe_experiment
 from agent_runtime.planner import build_plan
 from agent_runtime.policy import PolicyViolation, validate_plan
 from agent_runtime.reporter import write_agent_report, write_global_review_artifacts
 from agent_runtime.state import create_run_dir, initialize_state, update_state, write_context, write_plan_revision, write_task
 from agent_runtime.task import AgentTask, TaskValidationError, load_agent_task, parse_agent_task
-from agent_runtime.tools import ToolExecutionError, ToolRegistry
+from agent_runtime.tools import ToolRegistry
 
 
 ROOT = Path(__file__).resolve().parent
@@ -113,44 +113,20 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
         return 0, run_dir
 
     registry = registry or ToolRegistry(project_root=ROOT, run_dir=run_dir)
-    results: list[Dict[str, Any]] = []
-    observation: Optional[Dict[str, Any]] = None
-    for step in plan["steps"]:
-        tool = step["tool_name"]
-        update_state(run_dir, state, status="observing" if tool == "observe_experiment" else "executing", current_step_id=step["step_id"])
-        try:
-            if tool == "check_environment":
-                result = registry.check_environment(task)
-                if result["ok"] and not result["ready"]:
-                    result = {**result, "ok": False, "recoverable": False, "stderr": "runtime preflight is not ready"}
-            elif tool == "run_full_loop":
-                result = registry.run_full_loop(task, plan["env_overrides"])
-                if result.get("experiment_dir"):
-                    update_state(run_dir, state, experiment_dir=result["experiment_dir"])
-            elif tool == "resume_full_loop":
-                result = registry.resume_full_loop(task, plan["env_overrides"])
-                update_state(run_dir, state, experiment_dir=result["experiment_dir"])
-            elif tool == "observe_experiment":
-                exp_dir = state.get("experiment_dir") or task.resume_exp_dir
-                observation = observe_experiment(
-                    exp_dir,
-                    run_dir=run_dir,
-                    boundary_target=task.boundary_target,
-                    task_search_mode=plan["selected_search_mode"],
-                ) if exp_dir else _blocked_observation("experiment directory could not be located")
-                result = {"tool": tool, "ok": observation["status"] != "blocked", "return_code": 0 if observation["status"] != "blocked" else 1, "recoverable": False}
-            else:  # write_agent_report is handled after a durable decision exists.
-                result = {"tool": tool, "ok": True, "return_code": 0, "recoverable": False}
-            results.append(result)
-            state["completed_step_ids"].append(step["step_id"])
-            update_state(run_dir, state, completed_step_ids=state["completed_step_ids"])
-            if not result["ok"] and step["stop_if_failed"]:
-                break
-        except (ToolExecutionError, OSError, ValueError) as exc:
-            append_event(run_dir / "agent_events.jsonl", "tool_failed", {"tool": tool, "return_code": -1, "stderr_summary": str(exc), "recoverable": False})
-            results.append({"tool": tool, "ok": False, "return_code": -1, "recoverable": False})
-            break
-
+    executor = Executor(
+        task=task,
+        plan=plan,
+        registry=registry,
+        run_dir=run_dir,
+        state=state,
+        observe=observe_experiment,
+        update_state=update_state,
+    )
+    try:
+        results = executor.execute(plan["steps"])
+    except ExecutorError as exc:
+        results = [{"tool": "executor", "ok": False, "return_code": -1, "recoverable": False, "failure_category": "fatal_system_error", "stderr_summary": str(exc)}]
+    observation = executor.observation
     if observation is None:
         observation = _blocked_observation("observation was not reached", state.get("experiment_dir") or task.resume_exp_dir)
     decision = decide_next_action(task, observation, tool_results=results)
@@ -170,12 +146,12 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
         status = "blocked"
         terminal_reason = str(decision.get("terminal_reason") or "blocked")
         manual_review = bool(decision.get("requires_human_review"))
-    elif decision.get("requires_human_review"):
+    elif decision["action"] == "suspend" or decision.get("requires_human_review"):
         # Automatic scoring remains evidence only.  A Session with pending
         # review is intentionally suspended rather than marked completed.
         status = "suspended"
-        terminal_reason = "manual_review_required"
-        manual_review = True
+        terminal_reason = str(decision.get("terminal_reason") or "manual_review_required")
+        manual_review = bool(decision.get("requires_human_review"))
     else:
         status = "completed"
         terminal_reason = str(decision.get("terminal_reason") or "completed")
@@ -190,7 +166,9 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
         requires_manual_review=manual_review,
         manual_review_status="pending" if manual_review else None,
     )
-    write_agent_report(run_dir, task=task.as_dict(), state=state, plan=plan, observation=observation, tool_results=results, decision=decision)
+    report_step = next((step for step in plan["steps"] if step.get("tool_name") == "write_agent_report"), None)
+    if report_step:
+        executor.execute_report(report_step, lambda: write_agent_report(run_dir, task=task.as_dict(), state=state, plan=plan, observation=observation, tool_results=results, decision=decision))
     if command == "review":
         write_global_review_artifacts(run_dir, observation)
     return (2 if status == "blocked" else 0), run_dir

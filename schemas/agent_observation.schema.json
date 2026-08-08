@@ -16,7 +16,8 @@
     "branch_error_count": {"type": "integer", "minimum": 0},
     "target_reached": {"type": "boolean"},
     "missing_artifacts": {"type": "array", "items": {"type": "string"}},
-    "evidence_refs": {"type": "array", "items": {"type": "object"}}
+    "evidence_refs": {"type": "array", "items": {"type": "object"}},
+    "observations": {"type": "array", "items": {"$ref": "agent_normalized_observation.schema.json"}}
   },
   "additionalProperties": true
 }

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Agent Normalized Observation",
+  "type": "object",
+  "required": ["observation_id", "source_tool", "type", "severity", "summary", "evidence_refs", "metrics", "recommended_actions", "requires_replan", "requires_human_review"],
+  "properties": {
+    "observation_id": {"type": "string", "minLength": 1},
+    "source_tool": {"type": "string", "minLength": 1},
+    "type": {"enum": ["environment_ready", "pipeline_started", "pipeline_completed", "candidate_invalid", "score_decreased", "score_unchanged", "score_increased", "not_applicable", "boundary_candidate_found", "budget_warning", "tool_retryable_failure", "tool_fatal_failure", "artifact_missing", "manifest_corrupted", "review_report_ready"]},
+    "severity": {"enum": ["info", "warning", "error"]},
+    "summary": {"type": "string"},
+    "evidence_refs": {"type": "array", "items": {"type": "object"}},
+    "metrics": {"type": "object"},
+    "recommended_actions": {"type": "array", "items": {"type": "string"}},
+    "requires_replan": {"type": "boolean"},
+    "requires_human_review": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}

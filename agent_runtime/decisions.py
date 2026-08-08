@@ -22,10 +22,19 @@ def decide_next_action(
     *,
     tool_results: Iterable[Mapping[str, Any]] = (),
 ) -> Dict[str, Any]:
+    normalized = list(observation.get("observations") or [])
+    observation_types = {str(item.get("type")) for item in normalized if isinstance(item, Mapping)}
     failures = [result for result in tool_results if not result.get("ok", False) and not result.get("recoverable", False)]
-    if failures:
+    retryable_failures = [result for result in tool_results if not result.get("ok", False) and result.get("recoverable", False)]
+    if "manifest_corrupted" in observation_types:
+        decision = {"action": "blocked", "reason": "published artifact manifest is corrupted", "requires_human_review": True,
+                    "terminal_reason": "manifest_corrupted"}
+    elif "tool_fatal_failure" in observation_types or failures:
         decision = {"action": "blocked", "reason": "a registered tool failed without a recovery path", "requires_human_review": True,
                     "terminal_reason": "unrecoverable_tool_failure"}
+    elif "tool_retryable_failure" in observation_types or retryable_failures:
+        decision = {"action": "suspend", "reason": "a registered tool encountered a retryable system failure after its retry policy", "requires_human_review": False,
+                    "terminal_reason": "retryable_tool_failure"}
     elif observation.get("status") == "blocked" or observation.get("manifest_status") == "damaged":
         decision = {"action": "blocked", "reason": str(observation.get("blocked_reason") or "experiment artifact is damaged"), "requires_human_review": True,
                     "terminal_reason": "artifact_blocked"}
@@ -33,7 +42,13 @@ def decide_next_action(
         needs_review = bool(observation.get("evidence_refs"))
         decision = {"action": "stop_and_report", "reason": "read-only review completed", "requires_human_review": needs_review,
                     "terminal_reason": "manual_review_required" if needs_review else "review_completed"}
-    elif observation.get("replan_required"):
+    elif "score_increased" in observation_types or int(observation.get("score_increased_count") or 0) > 0:
+        decision = {"action": "stop_and_report", "reason": "score_increased is negative gain and requires human review", "requires_human_review": True,
+                    "terminal_reason": "manual_review_required"}
+    elif "not_applicable" in observation_types or int(observation.get("not_applicable_count") or 0) > 0:
+        decision = {"action": "stop_and_report", "reason": "operator applicability issue observed; do not penalize the whole operator family", "requires_human_review": True,
+                    "terminal_reason": "manual_review_required"}
+    elif observation.get("replan_required") or any(bool(item.get("requires_replan")) for item in normalized if isinstance(item, Mapping)):
         decision = {"action": "replan", "reason": str(observation.get("replan_reason") or "observation requires a constrained replan"),
                     "requires_human_review": False, "terminal_reason": None}
     elif _is_budget_exhausted(observation):

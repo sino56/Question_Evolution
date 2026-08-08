@@ -9,7 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from agent_runtime.task import parse_agent_task
-from agent_runtime.tools import ToolRegistry
+from agent_runtime.tools import TOOL_SPECS, ToolRegistry, classify_system_failure, get_tool_spec
 
 
 def task(tmp_path, **changes):
@@ -63,3 +63,30 @@ def test_resume_uses_current_registered_resume_entrypoint(tmp_path, monkeypatch)
     result = registry.resume_full_loop(task(tmp_path, input_file="", resume_exp_dir="experiments/day/exp", resume_start_round=2), {"EXP_ROOT": str(tmp_path / "experiments")})
     assert calls[0][-2:] == ["--resume-exp-dir", str(experiment.resolve())]
     assert result["resume_start_round"] == 2
+
+
+def test_registered_tools_publish_phase3_contract_metadata():
+    assert set(TOOL_SPECS) == {"check_environment", "run_full_loop", "resume_full_loop", "observe_experiment", "write_agent_report"}
+    spec = get_tool_spec("run_full_loop")
+    assert spec.kind == "composite"
+    assert spec.version
+    assert spec.input_schema and spec.output_schema
+    assert spec.idempotency_key_fields
+    assert spec.timeout_seconds > 0
+    assert spec.retry_policy.max_attempts >= 1
+    assert "final/final_scored.jsonl" in spec.expected_artifacts
+    assert "pipeline_completed" in spec.observation_types
+
+
+def test_tool_result_is_redacted_and_retryable_failures_are_classified(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent_runtime.tools.shutil.which", lambda _: "bash")
+
+    def runner(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 1, stdout="", stderr="rate limit api_key=secret-value")
+
+    registry = ToolRegistry(project_root=tmp_path, run_dir=tmp_path / "run", runner=runner, sleeper=lambda _: None)
+    result = registry.run_full_loop(task(tmp_path), {"EXP_ROOT": str(tmp_path / "experiments")})
+    assert result["recoverable"] is True
+    assert result["failure_category"] == "retryable_system_error"
+    assert "secret-value" not in json.dumps(result)
+    assert classify_system_failure("manifest corrupted") == ("fatal_system_error", False)

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Agent Tool Call",
+  "type": "object",
+  "required": ["tool_call_id", "tool_name", "tool_version", "idempotency_key", "inputs"],
+  "properties": {
+    "tool_call_id": {"type": "string", "minLength": 1},
+    "tool_name": {"type": "string", "minLength": 1},
+    "tool_version": {"type": "string", "minLength": 1},
+    "idempotency_key": {"type": "string", "minLength": 1},
+    "inputs": {"type": "object"}
+  },
+  "additionalProperties": true
+}

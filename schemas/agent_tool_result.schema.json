@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Agent Tool Result",
+  "type": "object",
+  "required": ["tool", "tool_version", "tool_call_id", "idempotency_key", "ok", "return_code", "duration_seconds", "retry_count", "recoverable"],
+  "properties": {
+    "tool": {"type": "string", "minLength": 1},
+    "tool_version": {"type": "string", "minLength": 1},
+    "tool_call_id": {"type": "string", "minLength": 1},
+    "idempotency_key": {"type": "string", "minLength": 1},
+    "ok": {"type": "boolean"},
+    "return_code": {"type": "integer"},
+    "duration_seconds": {"type": "number", "minimum": 0},
+    "retry_count": {"type": "integer", "minimum": 0},
+    "recoverable": {"type": "boolean"},
+    "failure_category": {"type": ["string", "null"]},
+    "cost": {"type": "object"}
+  },
+  "additionalProperties": true
+}

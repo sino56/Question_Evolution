@@ -27,7 +27,7 @@ ENV_ALLOWLIST = {
     "ROUTER_CONCURRENCY",
     "SCORING_CONCURRENCY",
 }
-DECISIONS = {"run_pipeline", "resume_pipeline", "run_review", "stop_and_report", "replan", "blocked"}
+DECISIONS = {"run_pipeline", "resume_pipeline", "run_review", "stop_and_report", "replan", "suspend", "blocked"}
 PLAN_KINDS = {"task_plan", "recovery_plan", "review_plan"}
 _REQUIRED_STEP_FIELDS = {
     "step_id", "intent", "tool_name", "arguments", "preconditions", "expected_outputs",

@@ -5,6 +5,16 @@ evolution stages. The schemas are intentionally small and permissive: they
 stabilize field names, ownership, and runtime validation for the current
 Stage 0-5 question evolution pipeline.
 
+## Agent Harness Contracts
+
+`agent_tool_call.schema.json` and `agent_tool_result.schema.json` describe
+the redacted, versioned Tool Registry boundary. `agent_observation.schema.json`
+keeps the Stage 1/2 aggregate experiment summary and adds the Phase 3
+`observations` timeline, whose normalized entries are the only format consumed
+by the Reflector. `agent_tool_event.schema.json` records call IDs, idempotency,
+retry metadata, checkpoints, and state transitions without raw environment,
+model-response, or JSONL payloads.
+
 ## Record Ownership
 
 - `sample_id`, `index`, `round`, `prompt`, `meta_info`, `rubric`,

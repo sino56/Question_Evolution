@@ -3,11 +3,104 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 from pipeline_runtime import StageJsonError, load_json_records, validate_published_artifact
+
+
+OBSERVATION_TYPES = {
+    "environment_ready", "pipeline_started", "pipeline_completed", "candidate_invalid",
+    "score_decreased", "score_unchanged", "score_increased", "not_applicable",
+    "boundary_candidate_found", "budget_warning", "tool_retryable_failure",
+    "tool_fatal_failure", "artifact_missing", "manifest_corrupted", "review_report_ready",
+}
+
+
+def _observation(
+    source_tool: str,
+    observation_type: str,
+    summary: str,
+    *,
+    severity: str = "info",
+    evidence_refs: Iterable[Mapping[str, Any]] = (),
+    metrics: Mapping[str, Any] | None = None,
+    recommended_actions: Iterable[str] = (),
+    requires_replan: bool = False,
+    requires_human_review: bool = False,
+) -> Dict[str, Any]:
+    if observation_type not in OBSERVATION_TYPES:
+        raise ValueError(f"unsupported observation type: {observation_type}")
+    evidence = [dict(item) for item in evidence_refs][:40]
+    seed = json.dumps({"source_tool": source_tool, "type": observation_type, "summary": summary, "evidence": evidence}, ensure_ascii=False, sort_keys=True)
+    return {
+        "observation_id": "obs-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16],
+        "source_tool": source_tool,
+        "type": observation_type,
+        "severity": severity,
+        "summary": summary,
+        "evidence_refs": evidence,
+        "metrics": dict(metrics or {}),
+        "recommended_actions": list(recommended_actions),
+        "requires_replan": requires_replan,
+        "requires_human_review": requires_human_review,
+    }
+
+
+def normalize_tool_result(tool_result: Mapping[str, Any], *, experiment_observation: Mapping[str, Any] | None = None) -> List[Dict[str, Any]]:
+    """Convert tool-specific results into the Phase-3 stable Observation API."""
+
+    tool = str(tool_result.get("tool") or "unknown_tool")
+    if not tool_result.get("ok", False) and not (tool == "observe_experiment" and experiment_observation is not None):
+        retryable = bool(tool_result.get("recoverable"))
+        return [_observation(
+            tool,
+            "tool_retryable_failure" if retryable else "tool_fatal_failure",
+            str(tool_result.get("artifact_validation") or tool_result.get("stderr_summary") or tool_result.get("failure_category") or "registered tool failed"),
+            severity="warning" if retryable else "error",
+            metrics={"return_code": tool_result.get("return_code"), "retry_count": tool_result.get("retry_count", 0), "duration_seconds": tool_result.get("duration_seconds", 0)},
+            recommended_actions=["retry_or_suspend"] if retryable else ["block_and_report"],
+            requires_human_review=not retryable,
+        )]
+    if tool == "check_environment":
+        return [_observation("check_environment", "environment_ready", "runtime preflight completed", metrics={"ready": bool(tool_result.get("ready"))})]
+    if tool in {"run_full_loop", "resume_full_loop"}:
+        return [
+            _observation(tool, "pipeline_started", "registered pipeline invocation started", metrics={"experiment_dir": tool_result.get("experiment_dir")}),
+            _observation(tool, "pipeline_completed", "registered pipeline invocation returned published artifacts", metrics={"duration_seconds": tool_result.get("duration_seconds", 0), "retry_count": tool_result.get("retry_count", 0)}),
+        ]
+    if tool == "write_agent_report":
+        return [_observation(tool, "review_report_ready", "agent report written", metrics={"report_path": tool_result.get("report_path")})]
+    aggregate = experiment_observation or tool_result.get("observation") or {}
+    observations: List[Dict[str, Any]] = []
+    evidence = aggregate.get("evidence_refs") or []
+    counts = {
+        "score_decreased": int(aggregate.get("status_counts", {}).get("score_decreased", 0)),
+        "score_unchanged": int(aggregate.get("status_counts", {}).get("score_unchanged", 0)),
+        "score_increased": int(aggregate.get("score_increased_count", 0)),
+        "not_applicable": int(aggregate.get("not_applicable_count", 0)),
+        "candidate_invalid": int(aggregate.get("validation_failed_count", 0)),
+        "boundary_candidate_found": int(aggregate.get("boundary_candidate_count", 0)),
+    }
+    for kind, count in counts.items():
+        if count:
+            observations.append(_observation(
+                tool, kind, f"{count} {kind} result(s) observed", severity="warning" if kind in {"score_increased", "not_applicable", "candidate_invalid"} else "info",
+                evidence_refs=evidence, metrics={"count": count},
+                recommended_actions=( ["report", "manual_review"] if kind == "score_increased" else ["report"] ),
+                requires_replan=kind == "score_unchanged", requires_human_review=kind == "score_increased",
+            ))
+    if aggregate.get("budget_exhausted") or "budget" in str(aggregate.get("termination_reason") or "").lower():
+        observations.append(_observation(tool, "budget_warning", "search budget was exhausted", severity="warning", metrics={"termination_reason": aggregate.get("termination_reason")}, recommended_actions=["stop_and_report"]))
+    if aggregate.get("manifest_status") == "damaged":
+        observations.append(_observation(tool, "manifest_corrupted", "published artifact manifest is damaged", severity="error", evidence_refs=evidence, recommended_actions=["block_and_report"], requires_human_review=True))
+    elif aggregate.get("missing_artifacts"):
+        observations.append(_observation(tool, "artifact_missing", "optional or expected experiment artifacts are missing", severity="warning", metrics={"missing_count": len(aggregate.get("missing_artifacts") or [])}, recommended_actions=["report"] ))
+    if not observations:
+        observations.append(_observation(tool, "pipeline_completed", "experiment artifacts were observed without a classified branch result", evidence_refs=evidence))
+    return observations
 
 
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -102,6 +195,11 @@ def observe_experiment(
             "experiment_dir": str(root), "status": "blocked", "blocked_reason": "experiment directory does not exist",
             "missing_artifacts": [str(root)], "memory_summary": {}, "evidence_refs": [],
         }
+        observation["observations"] = [_observation(
+            "observe_experiment", "tool_fatal_failure", "experiment directory does not exist",
+            severity="error", metrics={"experiment_dir": str(root)}, recommended_actions=["block_and_report"],
+            requires_human_review=True,
+        )]
         if run_dir:
             _write_json(Path(run_dir) / "agent_observation.json", observation)
         return observation
@@ -193,6 +291,10 @@ def observe_experiment(
         "memory_summary": memory,
         "evidence_refs": evidence,
     }
+    observation["observations"] = normalize_tool_result(
+        {"tool": "observe_experiment", "ok": observation["status"] != "blocked", "observation": observation},
+        experiment_observation=observation,
+    )
     if run_dir:
         _write_json(Path(run_dir) / "agent_observation.json", observation)
     return observation

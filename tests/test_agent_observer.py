@@ -7,8 +7,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agent_runtime.observer import observe_experiment
+from agent_runtime.observer import OBSERVATION_TYPES, normalize_tool_result, observe_experiment
 from agent_runtime.reporter import write_agent_report, write_global_review_artifacts
+from schema_validation import load_schema, validate_instance
 
 
 def write_jsonl(path, rows):
@@ -34,7 +35,10 @@ def test_observer_summarizes_branch_statuses_and_pending(tmp_path):
     assert observation["pending_count"] == 1
     assert observation["target_reached"] is True
     assert observation["termination_reason"] == "candidate_list_exhausted"
+    assert {item["type"] for item in observation["observations"]} >= {"boundary_candidate_found", "score_increased", "candidate_invalid"}
     assert (tmp_path / "agent-run" / "agent_observation.json").exists()
+    schema_path = ROOT / "schemas" / "agent_observation.schema.json"
+    validate_instance(observation, load_schema(schema_path), schema_dir=schema_path.parent)
 
 
 def test_observer_reports_missing_files_and_blocks_corrupt_json(tmp_path):
@@ -56,3 +60,13 @@ def test_reports_remain_proposal_only(tmp_path):
     artifacts = write_global_review_artifacts(tmp_path, observation)
     proposal = json.loads(artifacts["optimization_proposals"].read_text(encoding="utf-8"))
     assert proposal["status"] == "needs_human_review"
+
+
+def test_normalized_observations_have_the_phase3_contract_and_failure_semantics():
+    retryable = normalize_tool_result({"tool": "run_full_loop", "ok": False, "recoverable": True, "return_code": -1, "retry_count": 1})[0]
+    assert set(retryable) == {"observation_id", "source_tool", "type", "severity", "summary", "evidence_refs", "metrics", "recommended_actions", "requires_replan", "requires_human_review"}
+    assert retryable["type"] == "tool_retryable_failure"
+    assert retryable["type"] in OBSERVATION_TYPES
+    score_increased = normalize_tool_result({"tool": "observe_experiment", "ok": True}, experiment_observation={"score_increased_count": 1, "evidence_refs": []})[0]
+    assert score_increased["type"] == "score_increased"
+    assert score_increased["requires_human_review"] is True

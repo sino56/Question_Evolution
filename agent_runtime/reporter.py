@@ -46,8 +46,12 @@ def write_agent_report(
         "",
         "## Tool results",
     ]
+    total_duration = 0.0
     for result in tool_results:
-        lines.append(f"- {result.get('tool')}: {'completed' if result.get('ok') else 'failed'} (return code {result.get('return_code')})")
+        duration = float(result.get("duration_seconds") or 0)
+        total_duration += duration
+        lines.append(f"- {result.get('tool')}: {'completed' if result.get('ok') else 'failed'} (return code {result.get('return_code')}, {duration:.3f}s, retries {result.get('retry_count', 0)})")
+    lines.append(f"- Recorded tool duration: {total_duration:.3f}s")
     lines.extend([
         "",
         "## Observation",
@@ -59,6 +63,7 @@ def write_agent_report(
         f"- Target reached: {observed.get('target_reached', False)}",
         f"- Main issue: {observed.get('main_issue', 'not available')}",
         f"- Missing artifacts: {', '.join(observed.get('missing_artifacts', [])) or 'none'}",
+        f"- Normalized observations: {', '.join(str(item.get('type')) for item in observed.get('observations', []) if isinstance(item, Mapping)) or 'none'}",
         "",
         "## Decision and next step",
         f"- Decision: {(decision or {}).get('action', 'not decided')}",

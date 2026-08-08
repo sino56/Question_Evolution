@@ -105,6 +105,7 @@ def test_budget_exhaustion_has_an_explicit_non_success_terminal_reason(tmp_path)
 
 def test_automatic_boundary_result_suspends_session_for_manual_review(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "ROOT", tmp_path)
+    monkeypatch.setattr("agent_runtime.executor.validate_published_artifact", lambda *_args, **_kwargs: (True, "ok"))
     task = make_task(tmp_path)
 
     class FakeRegistry(ToolRegistry):
@@ -119,15 +120,15 @@ def test_automatic_boundary_result_suspends_session_for_manual_review(tmp_path, 
             exp_dir.mkdir(parents=True, exist_ok=True)
             return {"tool": "run_full_loop", "ok": True, "return_code": 0, "recoverable": False, "experiment_dir": str(exp_dir)}
 
-    monkeypatch.setattr(
-        cli,
-        "observe_experiment",
-        lambda *_args, **_kwargs: {
+    def fake_observer(*_args, **kwargs):
+        (Path(kwargs["run_dir"]) / "agent_observation.json").write_text("{}\n", encoding="utf-8")
+        return {
             "status": "observed", "manifest_status": "not_checked", "target_reached": True,
             "boundary_candidate_count": 1, "pending_count": 0, "final_records_count": 1,
             "score_increased_count": 0, "evidence_refs": [],
-        },
-    )
+        }
+
+    monkeypatch.setattr(cli, "observe_experiment", fake_observer)
     code, run_dir = cli.run_agent("run", task, registry=FakeRegistry())
     manifest = json.loads((run_dir / "session_manifest.json").read_text(encoding="utf-8"))
 
