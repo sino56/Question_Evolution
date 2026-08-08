@@ -31,6 +31,7 @@ def build_context_pack(
     plan: Optional[Mapping[str, Any]] = None,
     observation: Optional[Mapping[str, Any]] = None,
     previous_decision: Optional[Mapping[str, Any]] = None,
+    memory_context: Optional[Mapping[str, Any]] = None,
     max_chars: int = 60000,
 ) -> Dict[str, Any]:
     pack = {
@@ -46,6 +47,9 @@ def build_context_pack(
         "selected_plan": _truncate(plan or {}, min(12000, max_chars // 3)),
         "observation_summary": _truncate(observation or {}, min(18000, max_chars // 2)),
         "memory_summary": _truncate((observation or {}).get("memory_summary", {}), 5000),
+        # Stage 4 supplies only an audit-only, traceable Top-K context.  It is
+        # intentionally independent from M1 observation summaries.
+        "memory_context": _truncate(memory_context or {"cards": []}, 6000),
         "available_tools": sorted(set(task.allowed_tools) & REGISTERED_TOOLS),
         "previous_decision": _truncate(previous_decision or {}, 4000),
     }

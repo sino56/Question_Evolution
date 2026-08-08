@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from agent_runtime.decisions import decide_next_action, write_decision
 from agent_runtime.context import build_context_pack
+from agent_runtime.global_memory import GlobalMemoryStore, SnapshotUnavailable, router_cache_key
 from agent_runtime.executor import Executor, ExecutorError
 from agent_runtime.observer import observe_experiment
 from agent_runtime.planner import build_plan
@@ -20,6 +21,32 @@ from agent_runtime.tools import ToolRegistry
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _memory_runtime(task: AgentTask) -> tuple[dict[str, Any], dict[str, Any], str | None]:
+    """Freeze memory before planning; failed resume snapshots degrade explicitly."""
+
+    store = GlobalMemoryStore(ROOT)
+    degraded = False
+    if task.memory_snapshot_id:
+        try:
+            snapshot = store.load_snapshot(task.memory_snapshot_id)
+        except SnapshotUnavailable:
+            if not task.is_resume:
+                raise
+            snapshot = store.create_snapshot()
+            degraded = True
+    else:
+        snapshot = store.create_snapshot()
+        # A resumed session without its original identifier must never read the
+        # latest global cards as though they were the frozen original snapshot.
+        degraded = task.is_resume
+    if task.allow_global_memory_read and not degraded and snapshot.get("mode") == "global_memory":
+        context = store.retrieve(snapshot_id=str(snapshot["memory_snapshot_id"]), query=task.goal, top_k=3)
+    else:
+        context = {"memory_snapshot_id": snapshot["memory_snapshot_id"], "memory_context_key": None, "retrieval_config_version": "global-memory-retrieval-v1", "top_k": 0, "cards": [], "mode": "no_global_memory" if degraded else snapshot.get("mode", "no_global_memory")}
+    path = store.root / "snapshots" / f"{snapshot['memory_snapshot_id']}.json"
+    return snapshot, context, str(path) if path.exists() else None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -80,15 +107,27 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
         budgets={"max_search_steps": task.max_search_steps, "boundary_target": task.boundary_target},
     )
     write_task(run_dir, task.as_dict())
-    initial_context = build_context_pack(task)
+    try:
+        snapshot, memory_context, snapshot_path = _memory_runtime(task)
+    except SnapshotUnavailable as exc:
+        observation = _blocked_observation(str(exc), task.resume_exp_dir)
+        update_state(run_dir, state, status="blocked", terminal_reason="memory_snapshot_unavailable", blocked_reason=str(exc))
+        write_agent_report(run_dir, task=task.as_dict(), state=state, plan={}, observation=observation, tool_results=[], decision={"action": "blocked", "reason": str(exc)})
+        return 2, run_dir
+    update_state(run_dir, state, memory_snapshot_id=snapshot["memory_snapshot_id"], memory_snapshot_path=snapshot_path, memory_context_key=memory_context.get("memory_context_key"), memory_mode=memory_context.get("mode", snapshot.get("mode", "no_global_memory")))
+    initial_context = build_context_pack(task, memory_context=memory_context)
     update_state(run_dir, state, status="context_ready")
     plan = build_plan(task, command=command, context_pack=initial_context)
+    plan["memory_snapshot_id"] = snapshot["memory_snapshot_id"]
+    plan["memory_context_key"] = memory_context.get("memory_context_key")
+    plan["router_cache_key"] = router_cache_key(base_key=str(plan["plan_id"]), memory_snapshot_id=str(snapshot["memory_snapshot_id"]))
+    plan["env_overrides"]["MEMORY_SNAPSHOT_ID"] = snapshot["memory_snapshot_id"]
     try:
         validate_plan(task, plan)
     except PolicyViolation as exc:
         plan["blocked_reasons"].append(str(exc))
     plan = write_plan_revision(run_dir, state, plan)
-    write_context(run_dir, build_context_pack(task, plan=plan))
+    write_context(run_dir, build_context_pack(task, plan=plan, memory_context=memory_context))
     update_state(run_dir, state, status="planned", current_step_id=plan["steps"][0]["step_id"] if plan["steps"] else None)
     if plan["blocked_reasons"]:
         observation = _blocked_observation("; ".join(plan["blocked_reasons"]), task.resume_exp_dir)
@@ -136,7 +175,7 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
         plan = write_plan_revision(
             run_dir,
             state,
-            build_plan(task, command=command, context_pack=build_context_pack(task, plan=plan, observation=observation, previous_decision=decision)),
+            {**build_plan(task, command=command, context_pack=build_context_pack(task, plan=plan, observation=observation, previous_decision=decision, memory_context=memory_context)), "memory_snapshot_id": snapshot["memory_snapshot_id"], "memory_context_key": memory_context.get("memory_context_key"), "router_cache_key": router_cache_key(base_key=str(plan["plan_id"]), memory_snapshot_id=str(snapshot["memory_snapshot_id"]))},
             trigger_reason=decision["reason"],
         )
         status = "suspended"

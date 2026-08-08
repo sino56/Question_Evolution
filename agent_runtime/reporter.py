@@ -39,6 +39,8 @@ def write_agent_report(
         f"- Plan revision: {state.get('plan_revision', 0)}",
         f"- Current plan: {state.get('current_plan_path') or 'not available'}",
         f"- Terminal reason: {state.get('terminal_reason') or 'not applicable'}",
+        f"- Memory snapshot: {state.get('memory_snapshot_id') or 'not available'} ({state.get('memory_mode') or 'no_global_memory'})",
+        f"- Memory context key: {state.get('memory_context_key') or 'not applicable'}",
         f"- Manual review: {'pending' if state.get('requires_manual_review') else (state.get('manual_review_status') or 'not required')}",
         f"- Search mode: {plan.get('selected_search_mode')}",
         f"- Execution scope: {plan.get('selected_execution_scope')}",

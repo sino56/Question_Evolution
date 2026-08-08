@@ -1633,6 +1633,10 @@ def _cache_key(compact_input: Mapping[str, Any], settings: RouterSettings) -> st
             "registry_revision": _registry_revision(),
             "memory_snapshot": _digest_json(
                 {
+                    # The global-memory compiler controls this frozen ID.  It
+                    # makes cache reuse safe across Session snapshots without
+                    # making global memory an online routing policy.
+                    "memory_snapshot_id": os.getenv("MEMORY_SNAPSHOT_ID", ""),
                     "memory_operator_ids": compact_input.get("memory_operator_ids", []),
                     "avoid_operator_ids": compact_input.get("avoid_operator_ids", []),
                     "recommended_operator_ids": compact_input.get("recommended_operator_ids", []),
@@ -2217,6 +2221,7 @@ def _router_manifest_config(
         "router_retries": settings.retries,
         "router_concurrency": settings.concurrency,
         "router_cache": os.path.abspath(router_cache_path) if router_cache_path else None,
+        "memory_snapshot_id": args.memory_snapshot_id or None,
         "route_revision": ROUTE_REVISION if settings.routing_mode == ROUTING_MODE_HYBRID else None,
     }
 
@@ -2295,6 +2300,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Append-only successful-route cache JSONL. Defaults to memory/router_cache.jsonl in hybrid mode.",
     )
+    parser.add_argument("--memory-snapshot-id", default=os.getenv("MEMORY_SNAPSHOT_ID", ""), help="Frozen audit snapshot; affects cache identity only.")
     parser.add_argument(
         "--router-trace-output",
         default=None,
@@ -2389,6 +2395,11 @@ def main() -> None:
             full_score_threshold=args.full_score_threshold,
             failure_memory_window_rounds=max(1, args.failure_memory_window_rounds),
         )
+    if args.memory_snapshot_id:
+        for record in routed:
+            route = record.get("operator_route")
+            if isinstance(route, dict):
+                route["memory_snapshot_id"] = args.memory_snapshot_id
     metrics.compute_seconds += time.monotonic() - compute_started
     sidecars: List[Tuple[str, str, int]] = []
     if trace_store is not None and router_trace_path is not None:

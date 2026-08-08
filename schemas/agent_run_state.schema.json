@@ -17,6 +17,10 @@
     "experiment_dir": {"type": ["string", "null"]},
     "budgets": {"type": "object"},
     "terminal_reason": {"type": ["string", "null"]},
+    "memory_snapshot_id": {"type": ["string", "null"]},
+    "memory_snapshot_path": {"type": ["string", "null"]},
+    "memory_context_key": {"type": ["string", "null"]},
+    "memory_mode": {"type": "string"},
     "requires_manual_review": {"type": "boolean"},
     "manual_review_status": {"type": ["string", "null"]},
     "resume_checkpoint": {"type": "object", "required": ["resume_exp_dir", "resume_start_round", "last_completed_step_id"]}

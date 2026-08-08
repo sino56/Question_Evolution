@@ -62,6 +62,7 @@ class AgentTask:
     allow_prompt_mutation: bool = False
     allow_memory_active_publish: bool = False
     allow_global_memory_read: bool = False
+    memory_snapshot_id: str = ""
     exp_root: str = "experiments"
     resume_exp_dir: str = ""
     resume_start_round: Optional[int] = None
@@ -153,6 +154,7 @@ def parse_agent_task(raw: Mapping[str, Any], *, project_root: Path) -> AgentTask
         allow_prompt_mutation=bool(raw.get("allow_prompt_mutation", False)),
         allow_memory_active_publish=bool(raw.get("allow_memory_active_publish", False)),
         allow_global_memory_read=bool(raw.get("allow_global_memory_read", False)),
+        memory_snapshot_id=_clean(raw.get("memory_snapshot_id")),
         exp_root=exp_root,
         resume_exp_dir=resume_exp_dir,
         resume_start_round=resume_start_round,

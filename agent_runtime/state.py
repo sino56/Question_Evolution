@@ -63,6 +63,10 @@ def _default_manifest(run_dir: Path, *, run_id: str, mode: str, root_goal: str =
         "agent_run_dir": str(run_dir.resolve()),
         "budgets": dict(budgets or {}),
         "terminal_reason": None,
+        "memory_snapshot_id": None,
+        "memory_snapshot_path": None,
+        "memory_context_key": None,
+        "memory_mode": "no_global_memory",
         "requires_manual_review": False,
         "manual_review_status": None,
         "resume_checkpoint": {

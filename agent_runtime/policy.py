@@ -26,6 +26,9 @@ ENV_ALLOWLIST = {
     "SEARCH_SAMPLE_TIMEOUT_SECONDS",
     "ROUTER_CONCURRENCY",
     "SCORING_CONCURRENCY",
+    # Metadata only: the router includes it in its cache identity and route
+    # artifact; it never injects global strategy cards into the router.
+    "MEMORY_SNAPSHOT_ID",
 }
 DECISIONS = {"run_pipeline", "resume_pipeline", "run_review", "stop_and_report", "replan", "suspend", "blocked"}
 PLAN_KINDS = {"task_plan", "recovery_plan", "review_plan"}

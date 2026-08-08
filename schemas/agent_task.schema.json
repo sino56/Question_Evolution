@@ -16,6 +16,7 @@
     "allow_prompt_mutation": {"const": false},
     "allow_memory_active_publish": {"const": false},
     "allow_global_memory_read": {"type": "boolean"},
+    "memory_snapshot_id": {"type": "string"},
     "exp_root": {"type": "string"},
     "resume_exp_dir": {"type": "string"},
     "resume_start_round": {"type": ["integer", "null"], "minimum": 1}
