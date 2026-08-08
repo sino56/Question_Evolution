@@ -163,7 +163,7 @@ def _deterministic_plan(task: AgentTask, *, command: str) -> Dict[str, Any]:
         "selected_search_mode": selected_mode,
         "selected_execution_scope": task.execution_scope,
         "selected_review_mode": task.review_mode,
-        "budget": {"boundary_target": task.boundary_target, "max_search_steps": task.max_search_steps},
+        "budget": {"boundary_target": task.boundary_target, "max_search_steps": task.max_search_steps, "hard_limits": dict(task.budget_limits)},
         "env_overrides": env_overrides,
         "steps": steps,
         "assumptions": assumptions,

@@ -55,6 +55,7 @@ class AgentTask:
     search_mode: str = "auto"
     boundary_target: int = 5
     max_search_steps: int = 25
+    budget_limits: Dict[str, int] = field(default_factory=dict)
     execution_scope: str = "full_iteration"
     review_mode: str = "none"
     planning_mode: str = "deterministic"
@@ -123,6 +124,19 @@ def parse_agent_task(raw: Mapping[str, Any], *, project_root: Path) -> AgentTask
         if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
             raise TaskValidationError(f"{number_field} must be an integer >= {minimum}")
 
+    budget_limits = raw.get("budget_limits", {})
+    allowed_budget_types = {"generation", "candidate", "branch", "search_steps", "scoring", "repeat_scoring", "vertical_depth", "model_calls", "time_seconds"}
+    if not isinstance(budget_limits, Mapping):
+        raise TaskValidationError("budget_limits must be an object")
+    normalized_budget_limits: Dict[str, int] = {}
+    for name, amount in budget_limits.items():
+        kind = _clean(name)
+        if kind not in allowed_budget_types:
+            raise TaskValidationError(f"unsupported budget_limits type: {kind}")
+        if not isinstance(amount, int) or isinstance(amount, bool) or amount < 0:
+            raise TaskValidationError(f"budget_limits.{kind} must be an integer >= 0")
+        normalized_budget_limits[kind] = amount
+
     supplied_tools = raw.get("allowed_tools", sorted(REGISTERED_TOOLS))
     if not isinstance(supplied_tools, list) or not all(isinstance(tool, str) for tool in supplied_tools):
         raise TaskValidationError("allowed_tools must be a list of registered tool names")
@@ -147,6 +161,7 @@ def parse_agent_task(raw: Mapping[str, Any], *, project_root: Path) -> AgentTask
         search_mode=search_mode,
         boundary_target=raw.get("boundary_target", 5),
         max_search_steps=raw.get("max_search_steps", 25),
+        budget_limits=normalized_budget_limits,
         execution_scope=execution_scope,
         review_mode=review_mode,
         planning_mode=planning_mode,

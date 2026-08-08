@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Agent Budget Ledger",
+  "type": "object",
+  "required": ["version", "hard_limits", "allocations", "consumed", "remaining", "events"],
+  "properties": {
+    "version": {"const": "budget-ledger-v1"},
+    "hard_limits": {"type": "object", "additionalProperties": {"type": "number", "minimum": 0}},
+    "allocations": {"type": "object", "additionalProperties": {"type": "object", "additionalProperties": {"type": "number", "minimum": 0}}},
+    "consumed": {"type": "object", "additionalProperties": {"type": "object", "additionalProperties": {"type": "number", "minimum": 0}}},
+    "remaining": {"type": "object", "additionalProperties": {"type": "number", "minimum": 0}},
+    "events": {"type": "array", "items": {"type": "object"}}
+  },
+  "additionalProperties": false
+}

@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from agent_runtime.decisions import decide_next_action, write_decision
+from agent_runtime.budgeting import (
+    assess_budget_reallocation,
+    build_budget_replan,
+    write_budget_artifacts,
+)
 from agent_runtime.context import build_context_pack
 from agent_runtime.multi_agent.coordinator import run_post_experiment_review
 from agent_runtime.global_memory import GlobalMemoryStore, SnapshotUnavailable, router_cache_key
@@ -185,6 +190,17 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
     observation = executor.observation
     if observation is None:
         observation = _blocked_observation("observation was not reached", state.get("experiment_dir") or task.resume_exp_dir)
+    # Stage 10 reads the published aggregate only.  It records a proposal and
+    # validator decision now, but applies an approved transfer only when the
+    # normal deterministic controller already selected a future-only replan.
+    budget_ledger, budget_observation, budget_proposal, budget_decision = assess_budget_reallocation(
+        run_dir, task=task, state=state, observation=observation,
+    )
+    observation["budget_reallocation"] = {
+        "proposal_id": budget_proposal["proposal_id"],
+        "decision_id": budget_decision["decision_id"],
+        "status": budget_decision["status"],
+    }
     multi_agent_review: Dict[str, Any] = {}
     try:
         multi_agent_review = run_post_experiment_review(run_dir, task=task.as_dict(), state=state, plan=plan, observation=observation)
@@ -220,12 +236,29 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
             memory_context=memory_context,
             runtime_state=state,
         )
-        plan = write_plan_revision(
-            run_dir,
-            state,
-            {**build_plan(task, command=command, context_pack=replan_prompt_context), "memory_snapshot_id": snapshot["memory_snapshot_id"], "memory_context_key": memory_context.get("memory_context_key"), "router_cache_key": router_cache_key(base_key=str(plan["plan_id"]), memory_snapshot_id=str(snapshot["memory_snapshot_id"]))},
-            trigger_reason=decision["reason"],
-        )
+        if budget_decision["status"] == "approved":
+            budget_ledger.apply_changes(budget_decision["approved_changes"], proposal_id=budget_proposal["proposal_id"])
+            write_budget_artifacts(run_dir, ledger=budget_ledger, proposal=budget_proposal, decision=budget_decision)
+            update_state(run_dir, state, budgets={**dict(state.get("budgets") or {}), "remaining": budget_ledger.remaining_by_type()})
+            plan = write_plan_revision(
+                run_dir,
+                state,
+                build_budget_replan(
+                    plan,
+                    proposal=budget_proposal,
+                    decision=budget_decision,
+                    ledger=budget_ledger,
+                    completed_step_ids=list(state.get("completed_step_ids") or []),
+                ),
+                trigger_reason=f"approved_budget_reallocation:{budget_proposal['proposal_id']}",
+            )
+        else:
+            plan = write_plan_revision(
+                run_dir,
+                state,
+                {**build_plan(task, command=command, context_pack=replan_prompt_context), "memory_snapshot_id": snapshot["memory_snapshot_id"], "memory_context_key": memory_context.get("memory_context_key"), "router_cache_key": router_cache_key(base_key=str(plan["plan_id"]), memory_snapshot_id=str(snapshot["memory_snapshot_id"]))},
+                trigger_reason=decision["reason"],
+            )
         persisted_context = build_context_pack(
             task,
             plan=plan,

@@ -122,12 +122,15 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _collect_statuses(records: Iterable[Mapping[str, Any]], counter: Counter[str], evidence: List[Dict[str, Any]], source: Path) -> None:
+def _collect_statuses(records: Iterable[Mapping[str, Any]], counter: Counter[str], evidence: List[Dict[str, Any]], source: Path, operator_counter: Counter[tuple[str, str]]) -> None:
     for record in records:
         for container in (record, _mapping(record.get("branch_result")), _mapping(record.get("effect_analysis"))):
             status = container.get("branch_status") or container.get("effect_label")
             if isinstance(status, str) and status:
                 counter[status] += 1
+                operator_id = str(container.get("operator_id", container.get("operator_used")) or "").strip()
+                if operator_id:
+                    operator_counter[(operator_id, status)] += 1
                 if len(evidence) < 40:
                     evidence.append({
                         "path": str(source),
@@ -154,6 +157,24 @@ def _pending_count(records: Iterable[Mapping[str, Any]]) -> int:
             if frontier_status in {"pending", "running"}:
                 pending += 1
     return pending
+
+
+def _operator_plan_summary(records: Iterable[Mapping[str, Any]]) -> tuple[Dict[str, int], Dict[str, int]]:
+    statuses: Counter[str] = Counter()
+    attempts: Counter[str] = Counter()
+    for record in records:
+        for state_name in ("search_state", "vertical_search_state"):
+            state = _mapping(record.get(state_name))
+            for entry in state.get("operator_plan") or []:
+                if not isinstance(entry, Mapping):
+                    continue
+                status = str(entry.get("status") or "")
+                operator = str(entry.get("operator_id") or "")
+                if status:
+                    statuses[status] += 1
+                if operator:
+                    attempts[operator] += int(entry.get("generation_attempt_count") or 0)
+    return dict(statuses), dict(attempts)
 
 
 def _memory_summary(memory_dir: Path, issues: List[str]) -> Dict[str, Any]:
@@ -230,6 +251,7 @@ def observe_experiment(
         missing.append("final/final_scored.jsonl")
 
     status_counter: Counter[str] = Counter()
+    operator_status_counter: Counter[tuple[str, str]] = Counter()
     evidence: List[Dict[str, Any]] = []
     state_records: List[Dict[str, Any]] = []
     for round_dir in sorted(path for path in root.glob("round_*") if path.is_dir()):
@@ -237,14 +259,15 @@ def observe_experiment(
             for filename in ("branch_results.jsonl", "exploration_candidates.jsonl", "effect_analysis.jsonl"):
                 artifact = parent / filename
                 if artifact.exists():
-                    _collect_statuses(_read_records(artifact, issues=issues), status_counter, evidence, artifact)
+                    _collect_statuses(_read_records(artifact, issues=issues), status_counter, evidence, artifact, operator_status_counter)
         for filename in ("state_updated.jsonl", "search_state_updated.jsonl"):
             artifact = round_dir / filename
             if artifact.exists():
                 state_records.extend(_read_records(artifact, issues=issues))
-    _collect_statuses(final_records, status_counter, evidence, final_path)
+    _collect_statuses(final_records, status_counter, evidence, final_path, operator_status_counter)
     pending = _pending_count(state_records or final_records)
     memory = _memory_summary(root / "memory", issues)
+    operator_plan_status, operator_attempt_count = _operator_plan_summary(state_records or final_records)
 
     boundary_count = status_counter["boundary_candidate"] + status_counter["exploration_candidate"]
     score_increased = status_counter["score_increased"]
@@ -287,6 +310,9 @@ def observe_experiment(
         "termination_reason": termination_reason,
         "main_issue": primary_issue,
         "status_counts": dict(status_counter),
+        "operator_status_counts": {operator: {status: count for (seen_operator, status), count in operator_status_counter.items() if seen_operator == operator} for operator in sorted({operator for operator, _ in operator_status_counter})},
+        "operator_plan_status": operator_plan_status,
+        "operator_attempt_count": operator_attempt_count,
         "missing_artifacts": missing,
         "memory_summary": memory,
         "evidence_refs": evidence,

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Budget Reallocation Proposal",
+  "type": "object",
+  "required": ["proposal_id", "trigger", "summary", "current_budget", "changes", "requires_validator", "forbidden_actions_requested", "analysis_status"],
+  "properties": {
+    "proposal_id": {"type": "string", "minLength": 1},
+    "trigger": {"type": "string", "minLength": 1},
+    "summary": {"type": "string"},
+    "current_budget": {"type": "object"},
+    "changes": {"type": "array", "items": {"type": "object", "required": ["target", "action", "budget_type", "from", "to", "reason", "evidence_refs"], "properties": {"target": {"type": "string", "minLength": 1}, "action": {"enum": ["increase", "reduce"]}, "budget_type": {"type": "string"}, "from": {"type": "number", "minimum": 0}, "to": {"type": "number", "minimum": 0}, "reason": {"type": "string", "minLength": 1}, "evidence_refs": {"type": "array", "items": {"type": "object"}}}}},
+    "requires_validator": {"const": true},
+    "forbidden_actions_requested": {"type": "array", "items": {"type": "string"}},
+    "analysis_status": {"enum": ["proposed", "no_change", "needs_human_review"]}
+  },
+  "additionalProperties": false
+}

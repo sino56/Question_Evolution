@@ -117,6 +117,45 @@ python mechanism_governance.py route-audit \
 `mechanism_publish_candidates.jsonl` 是传给全局 Memory 发布器的候选事实，不是
 自动发布指令。
 
+### 1.4 Agent 动态预算重分配（阶段 10）
+
+Agent 的预算调整只处理**剩余**预算，并且只能在已发布产物的阶段边界提出：
+
+```text
+published observation
+-> budget proposal (evidence-bound)
+-> BudgetValidator
+-> immutable new plan revision
+-> registered future execution
+```
+
+`AgentTask` 可选 `budget_limits` 对象，用于声明 `generation`、`candidate`、
+`branch`、`search_steps`、`scoring`、`repeat_scoring`、`vertical_depth`、
+`model_calls` 和 `time_seconds` 的硬上限。例如：
+
+```json
+{
+  "budget_limits": {
+    "generation": 12,
+    "scoring": 18,
+    "repeat_scoring": 4,
+    "model_calls": 20
+  }
+}
+```
+
+每个 Agent run 的 `budget_ledger.json` 保留硬上限、消耗、剩余分配和追加事件；
+每次注册工具调用都会留下账本记录，配置 `model_calls` 时会在调用前严格扣除。
+观察器把各算子的 `validation_failed`、`not_applicable`、`score_increased`、
+`score_decreased` 和可选评分方差整理成证据。只有守恒、未改历史消耗、未绕过校验/
+评分、且不继续 `score_increased` 路径的建议才会通过 `BudgetValidator`。
+
+运行目录中的 `budget_reallocation_proposals.jsonl`、
+`budget_reallocation_decisions.jsonl` 和 `budget_reallocation_report.md` 分别保存
+建议、校验结果和调整前后差异。批准的调整只会在正常控制器已经要求 `replan` 时
+创建新的 `plans/plan_rNNN.json`；旧计划、已完成步骤、搜索状态和正式 Memory 均不被
+改写。缺证据、完全排除算子或风险不明的建议保持 `needs_human_review`。
+
 ### 流程图
 ```text
 Stage 0 输入

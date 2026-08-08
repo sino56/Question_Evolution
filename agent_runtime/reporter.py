@@ -90,6 +90,9 @@ def write_agent_report(
     ])
     if skill_load.fallback_to_base_rules:
         lines.append("- Skill loading degraded to base safety rules; see `agent_events.jsonl` for the loading failure.")
+    budget_report = run_path / "budget_reallocation_report.md"
+    if budget_report.is_file():
+        lines.extend(["", budget_report.read_text(encoding="utf-8").strip()])
     review = dict(multi_agent_review or {})
     merge = dict(review.get("merge") or {})
     if review:

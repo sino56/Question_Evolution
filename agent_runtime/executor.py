@@ -18,6 +18,8 @@ from typing import Any, Callable, Dict, Iterable, Mapping, MutableMapping, Optio
 from pipeline_runtime import validate_published_artifact
 
 from .events import append_event, redact
+from .budgeting import BudgetLedgerError, load_or_create_ledger, save_ledger
+from .budgeting.budget_state import UNALLOCATED_TARGET
 from .observer import normalize_tool_result
 from .policy import validate_plan
 from .task import AgentTask, REGISTERED_TOOLS
@@ -57,6 +59,7 @@ class Executor:
         self.events_path = self.run_dir / "agent_events.jsonl"
         self.ledger_path = self.run_dir / "tool_idempotency.json"
         self.ledger = self._load_ledger()
+        self.budget_ledger = load_or_create_ledger(self.run_dir, task=task, state=state)
         self.results: list[Dict[str, Any]] = []
         self.normalized_observations: list[Dict[str, Any]] = []
         self.observation: Optional[Dict[str, Any]] = None
@@ -190,6 +193,12 @@ class Executor:
 
         call_id = f"call_{uuid.uuid4().hex[:16]}"
         spec = get_tool_spec(tool)
+        if "model_calls" in self.budget_ledger.hard_limits:
+            try:
+                self.budget_ledger.consume("model_calls", UNALLOCATED_TARGET, 1, evidence_ref={"tool": tool, "tool_call_id": call_id})
+            except BudgetLedgerError as exc:
+                raise ExecutorError(str(exc)) from exc
+            save_ledger(self.run_dir, self.budget_ledger)
         append_event(self.events_path, "tool_started", {"tool": tool, "tool_version": spec.version, "tool_call_id": call_id, "idempotency_key": key, "timeout_seconds": spec.timeout_seconds})
         started = time.monotonic()
         try:
@@ -209,6 +218,8 @@ class Executor:
             result = {"tool": tool, "tool_version": spec.version, "tool_call_id": call_id, "idempotency_key": key, "ok": False, "return_code": -1, "duration_seconds": round(time.monotonic() - started, 6), "retry_count": 0, "failure_category": "fatal_system_error", "recoverable": False, "stderr_summary": str(exc), "cost": {"known_cost": None, "unit": "not_reported"}}
         self.ledger[key] = redact(result)
         self._save_ledger()
+        self.budget_ledger.record_tool_call(tool, tool_call_id=call_id, duration_seconds=float(result.get("duration_seconds") or 0), ok=bool(result.get("ok")))
+        save_ledger(self.run_dir, self.budget_ledger)
         self._record_observations(result)
         event_type = "tool_completed" if result.get("ok") else "tool_failed"
         append_event(self.events_path, event_type, result)

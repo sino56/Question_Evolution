@@ -62,6 +62,7 @@ def _default_manifest(run_dir: Path, *, run_id: str, mode: str, root_goal: str =
         "event_log_path": str((run_dir / "agent_events.jsonl").resolve()),
         "agent_run_dir": str(run_dir.resolve()),
         "budgets": dict(budgets or {}),
+        "budget_ledger_path": str((run_dir / "budget_ledger.json").resolve()),
         "terminal_reason": None,
         "memory_snapshot_id": None,
         "memory_snapshot_path": None,

@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -72,3 +73,23 @@ def test_executor_marks_missing_formal_artifact_as_fatal_failure(tmp_path):
     assert result["failure_category"] == "fatal_system_error"
     assert "artifact_missing" in result["artifact_validation"]
     assert state["completed_step_ids"] == []
+
+
+def test_executor_records_every_non_reused_call_and_enforces_model_call_budget(tmp_path):
+    calls = []
+
+    class Registry:
+        def check_environment(self, task):
+            calls.append(task.input_file)
+            return {"tool": "check_environment", "ok": True, "ready": True, "return_code": 0}
+
+    state = {"completed_step_ids": []}
+    task = parse_agent_task(
+        {"goal": "find boundaries", "input_file": "data/data.jsonl", "budget_limits": {"model_calls": 1}, "allowed_tools": ["check_environment"]},
+        project_root=tmp_path,
+    )
+    executor = Executor(task=task, plan={"plan_id": "plan-1", "env_overrides": {}}, registry=Registry(), run_dir=tmp_path / "run", state=state, observe=lambda *_args, **_kwargs: {}, update_state=_update)
+    executor.execute_step(_step("check_environment"))
+    ledger = json.loads((tmp_path / "run" / "budget_ledger.json").read_text(encoding="utf-8"))
+    assert ledger["consumed"]["model_calls"]["pool:unallocated"] == 1
+    assert any(event["event_type"] == "tool_call_observed" for event in ledger["events"])

@@ -9,6 +9,7 @@
     "search_mode": {"enum": ["auto", "multi_operator_branch", "multi_operator_vertical_stack", "single_branch"]},
     "boundary_target": {"type": "integer", "minimum": 1},
     "max_search_steps": {"type": "integer", "minimum": 1},
+    "budget_limits": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
     "execution_scope": {"enum": ["full_iteration", "reference_rebuild_only", "debug_generation_only"]},
     "review_mode": {"enum": ["none", "report_only"]},
     "planning_mode": {"enum": ["deterministic", "model_assisted"]},

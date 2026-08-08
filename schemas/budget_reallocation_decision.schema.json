@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Budget Reallocation Decision",
+  "type": "object",
+  "required": ["decision_id", "proposal_id", "status", "rejection_reasons", "review_reasons", "approved_changes", "budget_before", "budget_after", "created_at"],
+  "properties": {
+    "decision_id": {"type": "string", "minLength": 1},
+    "proposal_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["approved", "needs_human_review", "rejected_by_budget_validator", "no_change"]},
+    "rejection_reasons": {"type": "array", "items": {"type": "string"}},
+    "review_reasons": {"type": "array", "items": {"type": "string"}},
+    "approved_changes": {"type": "array", "items": {"type": "object"}},
+    "budget_before": {"type": "object"},
+    "budget_after": {"type": "object"},
+    "created_at": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": false
+}

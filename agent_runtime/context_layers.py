@@ -141,6 +141,7 @@ def build_context_layers(
         "budget": {
             "boundary_target": task.boundary_target,
             "max_search_steps": task.max_search_steps,
+            "hard_limits": dict(task.budget_limits),
         },
         "allowed_tools": [item["tool_name"] for item in stable_prefix["tool_registry"]],
         "task_config": {

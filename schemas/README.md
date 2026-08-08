@@ -29,6 +29,17 @@ cache-safe Agent context layers and their audit-only hashes.  They preserve
 legacy context fields while keeping dynamic paths, observations, and errors
 outside the stable prompt prefix.
 
+## Stage 10 dynamic-budget contracts
+
+`budget_state.schema.json` is an append-only Agent control-plane ledger of
+hard limits, historical consumption and remaining allocations.  It is not a
+pipeline search-state schema.  `budget_reallocation_proposal.schema.json`
+requires target, budget type, before/after values and evidence for every
+transfer.  `budget_reallocation_decision.schema.json` records the independent
+validator result.  Approved transfers create a new Agent plan revision only;
+none of these files authorizes direct mutation of `search_state`,
+`operator_plan`, `vertical_search_state`, scores, snapshots or Memory.
+
 ## Stage 7 Multi-agent Advisor Contracts
 
 `advisor_spec.schema.json` registers each read-only advisor, its trigger,
