@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Behavior Analysis Shadow Record",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["analysis_id", "root_sample_id", "node_id", "prompt_fingerprint", "rubric_fingerprint", "evaluation_config_fingerprint", "source_trial_ids", "group_statistics", "behavior_labels", "observer_result", "analysis_status", "analysis_version", "created_at"],
+  "properties": {
+    "analysis_status": {"const": "shadow"},
+    "analysis_version": {"const": "question-behavior-v1"},
+    "observer_status": {"enum": ["not_requested", "skipped", "completed", "failed"]},
+    "observer_result": {
+      "type": "object",
+      "properties": {
+        "analysis_status": {"enum": ["completed", "failed", "skipped"]},
+        "confidence": {"enum": ["low", "medium", "high"]},
+        "rubric_evidence": {"type": "array"}
+      }
+    },
+    "behavior_labels": {"type": "array", "items": {"enum": ["insufficient_trials", "judge_unstable", "cross_judge_disputed", "rubric_or_question_risk", "informative_answer_gap", "uniformly_hard", "uniformly_easy", "near_group"]}}
+  }
+}

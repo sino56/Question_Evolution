@@ -48,6 +48,33 @@ Stage 5: collect_answers.py -> gen_rubric.py -> scoring.py
 `run_loop.sh` 会立即停止，不允许缺失样本的部分输出继续进入下一阶段。
 Rubric 阶段按样本逐条处理，即使多个样本的 prompt 相同也不会随机删除记录。
 
+### 1.2 题目行为诊断旁路（22A）
+
+`question_behavior_analysis.py` 提供独立于主链的三段式诊断：`statistics`
+（22A-0 离线组内统计与阈值校准报告）、`diagnose`（22A-1 规则化
+`behavior_analysis.jsonl`）和 `observe`（22A-2 对少量合格题的真实单题观察）。
+它只读取已评分 JSONL，绝不改写 `score_rate`、`scoring_result`、路由、状态或
+正式 memory。Qwen 是唯一决策评分来源；GPT 只用于离线分歧观察。
+
+```bash
+python question_behavior_analysis.py diagnose \
+  --input experiments/.../round_1/scored.jsonl \
+  --output experiments/.../round_1/behavior_analysis.jsonl \
+  --report-output experiments/.../round_1/behavior_analysis_report.json
+
+python question_behavior_analysis.py observe \
+  --input experiments/.../round_1/behavior_analysis.jsonl \
+  --source-input experiments/.../round_1/scored.jsonl \
+  --output experiments/.../round_1/behavior_observed_analysis.jsonl \
+  --model "$GPT_MODEL" --base-url "$OPENAI_BASE_URL"
+```
+
+主循环默认关闭这条旁路。设置 `ENABLE_QUESTION_BEHAVIOR_ANALYSIS=true` 后才会
+生成统计与规则诊断；再设置 `ENABLE_QUESTION_BEHAVIOR_OBSERVER=true` 才会调用
+观察器。`QUESTION_BEHAVIOR_MIN_ELIGIBLE_COVERAGE` 可在完成 22A-0 校准后冻结为
+批次门槛；低于该门槛时不会发起任何观察器调用。旁路故障只留下失败记录或警告，
+不会阻断正式流水线。
+
 ### 流程图
 ```text
 Stage 0 输入

@@ -106,6 +106,11 @@ SCORING_ANSWER_TRIALS=${SCORING_ANSWER_TRIALS:-3}
 GPT_ANSWER_TRIALS=${GPT_ANSWER_TRIALS:-3}
 QWEN_JUDGE_REPEATS=${QWEN_JUDGE_REPEATS:-2}
 GPT_JUDGE_REPEATS=${GPT_JUDGE_REPEATS:-2}
+ENABLE_QUESTION_BEHAVIOR_ANALYSIS=${ENABLE_QUESTION_BEHAVIOR_ANALYSIS:-false}
+ENABLE_QUESTION_BEHAVIOR_OBSERVER=${ENABLE_QUESTION_BEHAVIOR_OBSERVER:-false}
+QUESTION_BEHAVIOR_OBSERVER_MODEL=${QUESTION_BEHAVIOR_OBSERVER_MODEL:-$CONFIG_GPT_MODEL}
+QUESTION_BEHAVIOR_OBSERVER_BASE_URL=${QUESTION_BEHAVIOR_OBSERVER_BASE_URL:-$CONFIG_BASE_URL}
+QUESTION_BEHAVIOR_MIN_ELIGIBLE_COVERAGE=${QUESTION_BEHAVIOR_MIN_ELIGIBLE_COVERAGE:-0.0}
 
 DEFAULT_INPUT_FILE="admitted_seed_samples.jsonl"
 LEGACY_INPUT_FILE="data/data.jsonl"
@@ -443,6 +448,34 @@ append_summary_round_if_missing() {
     fi
 }
 
+# 22A is a deliberately isolated shadow sidecar.  Its outputs are never fed
+# back into score_rate, routing, state, or memory; failure only emits a warning.
+run_question_behavior_analysis() {
+    local scored_file="$1"
+    local round_dir="$2"
+    [ "$ENABLE_QUESTION_BEHAVIOR_ANALYSIS" = "true" ] || return 0
+    local diagnosis="$round_dir/behavior_analysis.jsonl"
+    local report="$round_dir/behavior_analysis_report.json"
+    python question_behavior_analysis.py statistics --input "$scored_file" --output "$report" || {
+        echo "22A-0 离线统计失败；主流程继续，未使用旁路结论" >&2
+        return 0
+    }
+    if ! python artifact_cli.py validate --output "$diagnosis" --stage "question_behavior_diagnosis" --input "$scored_file" >/dev/null 2>&1; then
+        if ! python question_behavior_analysis.py diagnose --input "$scored_file" --output "$diagnosis" --report-output "$report"; then
+            echo "22A-1 旁路诊断失败；主流程继续，未使用旁路结论" >&2
+            return 0
+        fi
+    fi
+    if [ "$ENABLE_QUESTION_BEHAVIOR_OBSERVER" = "true" ]; then
+        local observed="$round_dir/behavior_observed_analysis.jsonl"
+        if ! python artifact_cli.py validate --output "$observed" --stage "question_behavior_observer" --input "$diagnosis" >/dev/null 2>&1; then
+            if ! python question_behavior_analysis.py observe --input "$diagnosis" --source-input "$scored_file" --output "$observed" --model "$QUESTION_BEHAVIOR_OBSERVER_MODEL" --base-url "$QUESTION_BEHAVIOR_OBSERVER_BASE_URL" --min-eligible-coverage "$QUESTION_BEHAVIOR_MIN_ELIGIBLE_COVERAGE"; then
+                echo "22A-2 真实观察器运行失败；主流程继续，未使用旁路结论" >&2
+            fi
+        fi
+    fi
+}
+
 # ===================== Round 0: 初始评分 =====================
 ROUND=0
 ROUND_DIR="$EXP_DIR/round_$ROUND"
@@ -493,6 +526,8 @@ run_if_missing "$ROUND_DIR/scored.jsonl" "round0_stability_probe" "$ROUND_DIR/in
         --cache-dir "$ROUND_DIR/round0_cache" \
         --report-output "$ROUND_DIR/round0_stability_report.json" \
         --performance-events "$ROUND_DIR/performance_events.jsonl"
+
+run_question_behavior_analysis "$ROUND_DIR/scored.jsonl" "$ROUND_DIR"
 
 AVG_RATE=$(compute_avg_score_rate "$ROUND_DIR/scored.jsonl")
 echo "Round $ROUND 平均得分率: $AVG_RATE"
@@ -778,6 +813,8 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --concurrency "$SCORING_CONCURRENCY" \
                 --performance-events "$ROUND_DIR/performance_events.jsonl"
     fi
+
+    run_question_behavior_analysis "$ROUND_DIR/scored.jsonl" "$ROUND_DIR"
 
     run_if_missing "$ROUND_DIR/effect_analysis.jsonl" "analyze_evolution_effect" "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 12/13: analyze_evolution_effect.py" \
         python analyze_evolution_effect.py \

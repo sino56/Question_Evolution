@@ -318,6 +318,11 @@ $SCORING_ANSWER_TRIALS = Get-EnvOrDefault "SCORING_ANSWER_TRIALS" "3"
 $GPT_ANSWER_TRIALS = Get-EnvOrDefault "GPT_ANSWER_TRIALS" "3"
 $QWEN_JUDGE_REPEATS = Get-EnvOrDefault "QWEN_JUDGE_REPEATS" "2"
 $GPT_JUDGE_REPEATS = Get-EnvOrDefault "GPT_JUDGE_REPEATS" "2"
+$ENABLE_QUESTION_BEHAVIOR_ANALYSIS = Get-EnvOrDefault "ENABLE_QUESTION_BEHAVIOR_ANALYSIS" "false"
+$ENABLE_QUESTION_BEHAVIOR_OBSERVER = Get-EnvOrDefault "ENABLE_QUESTION_BEHAVIOR_OBSERVER" "false"
+$QUESTION_BEHAVIOR_OBSERVER_MODEL = Get-EnvOrDefault "QUESTION_BEHAVIOR_OBSERVER_MODEL" $GPT_MODEL
+$QUESTION_BEHAVIOR_OBSERVER_BASE_URL = Get-EnvOrDefault "QUESTION_BEHAVIOR_OBSERVER_BASE_URL" $OPENAI_BASE_URL
+$QUESTION_BEHAVIOR_MIN_ELIGIBLE_COVERAGE = Get-EnvOrDefault "QUESTION_BEHAVIOR_MIN_ELIGIBLE_COVERAGE" "0.0"
 $SCORING_CONCURRENCY = Get-EnvOrDefault "SCORING_CONCURRENCY" "20"
 $QWEN_SCORING_MAX_CONCURRENT = Get-EnvOrDefault "QWEN_SCORING_MAX_CONCURRENT" "20"
 $GPT_SCORING_MAX_CONCURRENT = Get-EnvOrDefault "GPT_SCORING_MAX_CONCURRENT" "20"
@@ -392,6 +397,27 @@ if ($DIFFICULTY_GAIN_ENABLE_WEAK_PROBE -eq "true") {
 $uncertainLowProbeArgs = @()
 if ($ENABLE_UNCERTAIN_LOW_PROBE -eq "true") { $uncertainLowProbeArgs += @("--enable-uncertain-low-probe", "--uncertain-low-probe-min-score", $UNCERTAIN_LOW_PROBE_MIN_SCORE) }
 
+function Invoke-QuestionBehaviorAnalysis {
+    param([string]$ScoredFile, [string]$RoundDir)
+    if ($ENABLE_QUESTION_BEHAVIOR_ANALYSIS -ne "true") { return }
+    $diagnosis = Join-Path $RoundDir "behavior_analysis.jsonl"
+    $report = Join-Path $RoundDir "behavior_analysis_report.json"
+    try {
+        Invoke-Python "question_behavior_analysis.py" "statistics" "--input" $ScoredFile "--output" $report
+        if (-not (Test-PublishedArtifact $diagnosis "question_behavior_diagnosis" $ScoredFile)) {
+            Invoke-Python "question_behavior_analysis.py" "diagnose" "--input" $ScoredFile "--output" $diagnosis "--report-output" $report
+        }
+        if ($ENABLE_QUESTION_BEHAVIOR_OBSERVER -eq "true") {
+            $observed = Join-Path $RoundDir "behavior_observed_analysis.jsonl"
+            if (-not (Test-PublishedArtifact $observed "question_behavior_observer" $diagnosis)) {
+                Invoke-Python "question_behavior_analysis.py" "observe" "--input" $diagnosis "--source-input" $ScoredFile "--output" $observed "--model" $QUESTION_BEHAVIOR_OBSERVER_MODEL "--base-url" $QUESTION_BEHAVIOR_OBSERVER_BASE_URL "--min-eligible-coverage" $QUESTION_BEHAVIOR_MIN_ELIGIBLE_COVERAGE
+            }
+        }
+    } catch {
+        Write-Warning "22A shadow sidecar failed; formal pipeline continues without using it: $($_.Exception.Message)"
+    }
+}
+
 Write-Host "本次实验目录: $EXP_DIR"
 Write-Host "Memory 目录: $MEMORY_DIR"
 if ($isResume) { Write-Host "运行模式: 从已有实验目录恢复" }
@@ -418,6 +444,7 @@ Invoke-Step $roundInput "prepare_round_input" $InputFile "[Round 0] Step 0/2: �
 Invoke-Step $roundScored "round0_stability_probe" $roundInput "[Round 0] Step 1/2: round0_stability_probe.py baseline" {
     Invoke-Python "round0_stability_probe.py" "--input" $roundInput "--output" $roundScored "--answer-mode" "llm" "--answer-base-url" $QWEN_BASE_URL "--answer-api-key" $QWEN_API_KEY "--answer-model" $QWEN_MODEL "--judge-base-url" $QWEN_BASE_URL "--judge-api-key" $QWEN_API_KEY "--judge-model" $QWEN_MODEL "--qwen-judge-repeats" $QWEN_JUDGE_REPEATS "--gpt-judge-base-url" $GPT_JUDGE_BASE_URL "--gpt-judge-api-key" $GPT_JUDGE_API_KEY "--gpt-judge-model" $GPT_JUDGE_MODEL "--gpt-judge-repeats" $GPT_JUDGE_REPEATS "--gpt-answer-trials" $GPT_ANSWER_TRIALS "--gpt-answer-base-url" $GPT_ANSWER_BASE_URL "--gpt-answer-api-key" $GPT_ANSWER_API_KEY "--gpt-answer-model" $GPT_ANSWER_MODEL "--qwen-max-concurrent" $QWEN_SCORING_MAX_CONCURRENT "--gpt-max-concurrent" $GPT_SCORING_MAX_CONCURRENT "--max-concurrent" $SCORING_CONCURRENCY "--initial-trials" $ROUND0_INITIAL_TRIALS "--extra-trials" $ROUND0_EXTRA_TRIALS "--max-trials" $ROUND0_MAX_TRIALS "--answer-temperature" $ROUND0_ANSWER_TEMPERATURE "--answer-top-p" $ROUND0_ANSWER_TOP_P "--answer-seed-base" $ROUND0_ANSWER_SEED_BASE "--judge-temperature" $ROUND0_JUDGE_TEMPERATURE "--score-threshold" $MIN_SCORE_RATE "--strong-high-threshold" $ROUND0_STRONG_HIGH_RATE "--edge-low" $ROUND0_EDGE_LOW "--edge-high" $ROUND0_EDGE_HIGH "--cache-dir" (Join-Path $roundDir "round0_cache") "--report-output" (Join-Path $roundDir "round0_stability_report.json") "--performance-events" (Join-Path $roundDir "performance_events.jsonl")
 }
+Invoke-QuestionBehaviorAnalysis $roundScored $roundDir
 
 $previousScored = $roundScored
 $previousAverage = [double](Get-AverageScoreRate $roundScored)
@@ -517,6 +544,8 @@ for ($round = 1; $round -le $MaxRounds; $round += 1) {
     else {
         Write-Host "检测到已存在 $roundScored，跳过本轮生成闭环"
     }
+
+    Invoke-QuestionBehaviorAnalysis $roundScored $roundDir
 
     $effectAnalysis = Join-Path $roundDir "effect_analysis.jsonl"
     $stateUpdated = Join-Path $roundDir "state_updated.jsonl"
