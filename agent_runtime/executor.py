@@ -12,6 +12,7 @@ import inspect
 import json
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, MutableMapping, Optional
 
@@ -22,13 +23,75 @@ from .events import append_event, redact
 from .budgeting import BudgetLedgerError, load_or_create_ledger, save_ledger
 from .budgeting.budget_state import UNALLOCATED_TARGET
 from .observer import normalize_tool_result
-from .policy import validate_plan
+from .policy import ENV_ALLOWLIST, validate_env_overrides, validate_plan
 from .task import AgentTask, REGISTERED_TOOLS
-from .tools import ToolExecutionError, get_tool_spec
+from .tools import ToolExecutionError, cost_estimate, get_tool_spec
+
+
+_STEP_ARGUMENT_ENV_ALIASES = {
+    "input_file": "INPUT_FILE",
+    "exp_root": "EXP_ROOT",
+    "search_mode": "SEARCH_MODE",
+    "search_boundary_target": "SEARCH_BOUNDARY_TARGET",
+    "boundary_target": "SEARCH_BOUNDARY_TARGET",
+    "max_search_steps": "MAX_SEARCH_STEPS",
+    "execution_scope": "EXECUTION_SCOPE",
+}
+# Positional tool parameters that are never environment overrides.
+_STEP_ARGUMENT_POSITIONAL = {"experiment_dir", "start_round", "resume_exp_dir", "resume_start_round"}
+# Step arguments that must stay integers when applied to an ``AgentTask``.
+_STEP_ARGUMENT_INT_FIELDS = {
+    "SEARCH_BOUNDARY_TARGET": "boundary_target",
+    "MAX_SEARCH_STEPS": "max_search_steps",
+}
+_STEP_ARGUMENT_TASK_FIELDS = {
+    "INPUT_FILE": "input_file",
+    "EXP_ROOT": "exp_root",
+    "SEARCH_MODE": "search_mode",
+    "EXECUTION_SCOPE": "execution_scope",
+    **{env: field for env, field in _STEP_ARGUMENT_INT_FIELDS.items()},
+}
 
 
 class ExecutorError(RuntimeError):
     """A precondition, budget, idempotency, or artifact failure."""
+
+
+def _arguments_to_env_overrides(arguments: Mapping[str, Any]) -> Dict[str, str]:
+    """Translate documented Step arguments into whitelisted env overrides.
+
+    ``Step.arguments`` used to be decorative for composite tools: the executor
+    passed ``plan.env_overrides`` and silently dropped everything a step
+    declared, so a Planner could not parameterise a single step (design §9.2).
+
+    Only the explicit alias map and the environment allowlist are accepted.  An
+    unknown argument name is reported as a contract error instead of being
+    dropped quietly -- a silently ignored argument is what made the original
+    bug invisible in the first place.
+    """
+
+    resolved: Dict[str, str] = {}
+    unknown: list[str] = []
+    for raw_key, value in dict(arguments or {}).items():
+        name = str(raw_key)
+        if name in _STEP_ARGUMENT_POSITIONAL:
+            continue
+        env_key = _STEP_ARGUMENT_ENV_ALIASES.get(name, name)
+        if env_key not in ENV_ALLOWLIST:
+            # Accept snake_case spellings of declared environment variables so
+            # a step can parameterise itself naturally (e.g. ``search_max_depth``).
+            env_key = env_key.upper()
+        if env_key in ENV_ALLOWLIST:
+            resolved[env_key] = value
+        else:
+            unknown.append(name)
+    if unknown:
+        raise ExecutorError(
+            "step arguments are not executable: "
+            + ", ".join(sorted(unknown))
+            + " (expected a registered env override or a positional tool parameter)"
+        )
+    return {str(key): str(value) for key, value in resolved.items()}
 
 
 class Executor:
@@ -102,17 +165,86 @@ class Executor:
         temporary.replace(self.ledger_path)
 
     def _idempotency_key(self, step: Mapping[str, Any]) -> str:
+        """Return a plan-independent idempotency key.
+
+        The key intentionally excludes ``plan_id``.  ``plan_id`` is regenerated
+        on every ``build_plan`` call, so binding the key to it meant a replan
+        produced a *different* key for the same logical call and re-consumed
+        model budget (design §11.2).  The key is now
+        ``(tool, version, whitelisted business inputs)`` only; the ledger itself
+        is session-scoped (``run_dir`` is the Session directory), so reuse now
+        works across every plan revision of one Session.  ``plan_id`` is kept
+        purely as provenance on the stored entry.
+        """
+
         spec = get_tool_spec(str(step["tool_name"]))
         inputs = dict(step.get("arguments") or step.get("inputs") or {})
-        values = {field: inputs.get(field, getattr(self.task, field, None)) for field in spec.idempotency_key_fields}
-        payload = {"tool": spec.tool_name, "version": spec.version, "plan_id": self.plan.get("plan_id"), "inputs": redact(values)}
+        overrides = self._effective_env_overrides(step)
+        values: Dict[str, Any] = {}
+        for field in spec.idempotency_key_fields:
+            if field in inputs:
+                values[field] = inputs[field]
+                continue
+            # Prefer the resolved environment contract: the same logical call
+            # must yield the same key even when a step supplies its input
+            # through ``arguments`` rather than through its own task field.
+            env_key = _STEP_ARGUMENT_ENV_ALIASES.get(field, field.upper())
+            values[field] = overrides.get(env_key, getattr(self.task, field, None))
+        # The allowlist *is* the business-input whitelist, so the whole
+        # validated environment contract participates in the key.  Relying on
+        # ``idempotency_key_fields`` alone let a step change e.g.
+        # ``SEARCH_MAX_DEPTH`` without changing its key, which would have made
+        # the executor wrongly reuse an earlier run.
+        payload = {
+            "tool": spec.tool_name,
+            "version": spec.version,
+            "inputs": redact(values),
+            "env": redact(overrides),
+        }
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+    def _effective_env_overrides(self, step: Mapping[str, Any]) -> Dict[str, str]:
+        """Merge the plan env contract with whitelisted Step-level overrides.
+
+        Step arguments win over ``plan.env_overrides`` so a single step can
+        narrow or widen its own contract (design §9.2).
+        """
+
+        merged: Dict[str, Any] = dict(self.plan.get("env_overrides") or {})
+        merged.update(_arguments_to_env_overrides(step.get("arguments") or step.get("inputs") or {}))
+        return validate_env_overrides(merged)
+
+    def _task_for_step(self, step: Mapping[str, Any]) -> AgentTask:
+        """Apply Step arguments to a task copy for tools that take a task.
+
+        ``check_environment`` and ``observe_experiment`` receive the ``AgentTask``
+        object rather than a raw env mapping, so their documented arguments are
+        projected onto the task instead of being dropped.
+        """
+
+        values = _arguments_to_env_overrides(step.get("arguments") or step.get("inputs") or {})
+        changes: Dict[str, Any] = {}
+        for env_key, field_name in _STEP_ARGUMENT_TASK_FIELDS.items():
+            if env_key not in values:
+                continue
+            raw_value = values[env_key]
+            if env_key in _STEP_ARGUMENT_INT_FIELDS:
+                try:
+                    changes[field_name] = int(raw_value)
+                except (TypeError, ValueError) as exc:
+                    raise ExecutorError(f"step argument {env_key} must be an integer") from exc
+            else:
+                changes[field_name] = raw_value
+        return replace(self.task, **changes) if changes else self.task
 
     def _validate_step(self, step: Mapping[str, Any]) -> None:
         tool = str(step.get("tool_name") or step.get("tool") or "")
         if tool not in REGISTERED_TOOLS or tool not in self.task.allowed_tools:
             raise ExecutorError(f"step uses an unregistered or unauthorized tool: {tool}")
         get_tool_spec(tool)
+        # Fail fast: a Step argument that cannot be projected onto the tool's
+        # contract must never be dropped silently (T-1).
+        _arguments_to_env_overrides(step.get("arguments") or step.get("inputs") or {})
         completed = set(self.state.get("completed_step_ids") or [])
         missing_dependencies = set(step.get("depends_on") or []) - completed
         if missing_dependencies:
@@ -183,27 +315,50 @@ class Executor:
         return True, "ok", False
 
     def _invoke_registry(self, method_name: str, *args: Any, tool_call_id: str, idempotency_key: str, **kwargs: Any) -> Dict[str, Any]:
+        """Invoke a registry capability, passing only the kwargs it declares.
+
+        The previous implementation toggled *all three* runtime kwargs based on
+        whether the method happened to name ``record_events``.  A method that
+        declared ``tool_call_id`` but not ``record_events`` therefore silently
+        lost its idempotency key -- and any signature change degraded into
+        duplicate event recording instead of an error (T-8).  Each runtime kwarg
+        is now injected independently and only when the callable accepts it.
+        """
+
         method = getattr(self.registry, method_name)
         parameters = inspect.signature(method).parameters
-        if "record_events" in parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
-            kwargs.update({"tool_call_id": tool_call_id, "idempotency_key": idempotency_key, "record_events": False})
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        for name, value in (
+            ("tool_call_id", tool_call_id),
+            ("idempotency_key", idempotency_key),
+            ("record_events", False),
+        ):
+            if accepts_kwargs or name in parameters:
+                kwargs[name] = value
         return dict(method(*args, **kwargs))
 
     def _run_step(self, step: Mapping[str, Any], *, idempotency_key: str, tool_call_id: str) -> Dict[str, Any]:
         tool = str(step["tool_name"])
+        env_overrides = self._effective_env_overrides(step)
         if tool == "check_environment":
-            return self._invoke_registry("check_environment", self.task, tool_call_id=tool_call_id, idempotency_key=idempotency_key)
+            return self._invoke_registry("check_environment", self._task_for_step(step), tool_call_id=tool_call_id, idempotency_key=idempotency_key)
         if tool == "run_full_loop":
-            return self._invoke_registry("run_full_loop", self.task, self.plan.get("env_overrides", {}), tool_call_id=tool_call_id, idempotency_key=idempotency_key)
+            return self._invoke_registry("run_full_loop", self.task, env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key)
         if tool == "resume_full_loop":
-            return self._invoke_registry("resume_full_loop", self.task, self.plan.get("env_overrides", {}), tool_call_id=tool_call_id, idempotency_key=idempotency_key)
+            return self._invoke_registry("resume_full_loop", self.task, env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key)
         if tool == "observe_experiment":
             exp_dir = self.state.get("experiment_dir") or self.task.resume_exp_dir
             if not exp_dir:
                 raise ExecutorError("experiment directory could not be located")
-            observed = self.observe(exp_dir, run_dir=self.run_dir, boundary_target=self.task.boundary_target, task_search_mode=str(self.plan.get("selected_search_mode") or ""))
+            boundary_target = env_overrides.get("SEARCH_BOUNDARY_TARGET") or env_overrides.get("BOUNDARY_TARGET")
+            try:
+                resolved_boundary_target = int(boundary_target) if boundary_target not in (None, "") else self.task.boundary_target
+            except (TypeError, ValueError) as exc:
+                raise ExecutorError("SEARCH_BOUNDARY_TARGET must be an integer") from exc
+            search_mode = str(env_overrides.get("SEARCH_MODE") or self.plan.get("selected_search_mode") or "")
+            observed = self.observe(exp_dir, run_dir=self.run_dir, boundary_target=resolved_boundary_target, task_search_mode=search_mode)
             self.observation = observed
-            return {"tool": tool, "tool_version": get_tool_spec(tool).version, "tool_call_id": tool_call_id, "idempotency_key": idempotency_key, "ok": observed.get("status") != "blocked", "return_code": 0 if observed.get("status") != "blocked" else 1, "duration_seconds": 0.0, "retry_count": 0, "failure_category": None if observed.get("status") != "blocked" else "fatal_system_error", "recoverable": False, "observation": observed, "cost": {"known_cost": 0, "unit": "local"}}
+            return {"tool": tool, "tool_version": get_tool_spec(tool).version, "tool_call_id": tool_call_id, "idempotency_key": idempotency_key, "ok": observed.get("status") != "blocked", "return_code": 0 if observed.get("status") != "blocked" else 1, "duration_seconds": 0.0, "retry_count": 0, "failure_category": None if observed.get("status") != "blocked" else "fatal_system_error", "recoverable": False, "observation": observed, "cost": cost_estimate(get_tool_spec(tool))}
         raise ExecutorError(f"{tool} must be executed after a durable decision")
 
     def execute_step(self, step: Mapping[str, Any]) -> Dict[str, Any]:
@@ -235,7 +390,7 @@ class Executor:
             result.setdefault("idempotency_key", key)
             result.setdefault("retry_count", 0)
             result.setdefault("recoverable", False)
-            result.setdefault("cost", {"known_cost": None, "unit": "not_reported"})
+            result.setdefault("cost", cost_estimate(spec))
             result["duration_seconds"] = round(float(result.get("duration_seconds") or (time.monotonic() - started)), 6)
             valid, reason, artifact_gate = self._verify_outputs(step, result)
             if not valid:
@@ -255,9 +410,14 @@ class Executor:
             validate_contract("agent_tool_result.schema.json", dict(result), path="$.tool_result")
             observation_items = self._observation_items(result)
         except (ExecutorError, ToolExecutionError, OSError, ValueError, ContractViolation) as exc:
-            result = {"tool": tool, "tool_version": spec.version, "tool_call_id": call_id, "idempotency_key": key, "ok": False, "return_code": -1, "duration_seconds": round(time.monotonic() - started, 6), "retry_count": 0, "failure_category": "fatal_system_error", "recoverable": False, "stderr_summary": str(exc), "cost": {"known_cost": None, "unit": "not_reported"}}
+            result = {"tool": tool, "tool_version": spec.version, "tool_call_id": call_id, "idempotency_key": key, "ok": False, "return_code": -1, "duration_seconds": round(time.monotonic() - started, 6), "retry_count": 0, "failure_category": "fatal_system_error", "recoverable": False, "stderr_summary": str(exc), "cost": cost_estimate(spec)}
             observation_items = self._observation_items(result)
-        self.ledger[key] = redact(result)
+        entry = redact(result)
+        # Provenance only: the key no longer depends on the plan, but the
+        # ledger still records which revision produced the entry (T-2).
+        entry["produced_by_plan_id"] = self.plan.get("plan_id")
+        entry["produced_by_plan_revision"] = self.plan.get("plan_revision")
+        self.ledger[key] = entry
         self._save_ledger()
         self.budget_ledger.record_tool_call(tool, tool_call_id=call_id, duration_seconds=float(result.get("duration_seconds") or 0), ok=bool(result.get("ok")))
         save_ledger(self.run_dir, self.budget_ledger)
@@ -298,9 +458,9 @@ class Executor:
         try:
             report_path = writer()
             ok = Path(report_path).is_file()
-            result = {"tool": tool, "tool_version": spec.version, "tool_call_id": call_id, "idempotency_key": key, "ok": ok, "return_code": 0 if ok else 1, "duration_seconds": round(time.monotonic() - started, 6), "retry_count": 0, "failure_category": None if ok else "fatal_system_error", "recoverable": False, "report_path": str(report_path), "cost": {"known_cost": 0, "unit": "local"}}
+            result = {"tool": tool, "tool_version": spec.version, "tool_call_id": call_id, "idempotency_key": key, "ok": ok, "return_code": 0 if ok else 1, "duration_seconds": round(time.monotonic() - started, 6), "retry_count": 0, "failure_category": None if ok else "fatal_system_error", "recoverable": False, "report_path": str(report_path), "cost": cost_estimate(spec)}
         except OSError as exc:
-            result = {"tool": tool, "tool_version": spec.version, "tool_call_id": call_id, "idempotency_key": key, "ok": False, "return_code": -1, "duration_seconds": round(time.monotonic() - started, 6), "retry_count": 0, "failure_category": "fatal_system_error", "recoverable": False, "stderr_summary": str(exc), "cost": {"known_cost": 0, "unit": "local"}}
+            result = {"tool": tool, "tool_version": spec.version, "tool_call_id": call_id, "idempotency_key": key, "ok": False, "return_code": -1, "duration_seconds": round(time.monotonic() - started, 6), "retry_count": 0, "failure_category": "fatal_system_error", "recoverable": False, "stderr_summary": str(exc), "cost": cost_estimate(spec)}
         append_event(self.events_path, "tool_completed" if result["ok"] else "tool_failed", result)
         try:
             observation_items = self._observation_items(result)
