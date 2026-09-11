@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Mapping, Optional
 
@@ -207,12 +208,45 @@ def redact_context(value: Any, *, key: str = "") -> Any:
     return redact(value, key=key)
 
 
+def _canonical(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _overflow_marker(text: str) -> dict[str, Any]:
+    return {
+        "__overflow__": {
+            "original_chars": len(text),
+            "original_bytes": len(text.encode("utf-8")),
+            "sha256": "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+    }
+
+
 def _bounded(value: Any, limit: int) -> Any:
+    """Bound a context field while keeping the result valid, traceable JSON.
+
+    When the field exceeds ``limit`` the largest set of whole top-level keys
+    that still fits is retained and an ``__overflow__`` pointer (with the
+    original size and SHA-256) is appended.  Truncation therefore never emits a
+    half-cut JSON token that downstream consumers cannot parse.
+    """
+
     safe = redact_context(value)
-    text = json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    text = _canonical(safe)
     if len(text) <= limit:
         return safe
-    return {"truncated": True, "preview": text[:limit]}
+    overflow = _overflow_marker(text)
+    if isinstance(safe, Mapping):
+        kept: dict[str, Any] = {}
+        for field in sorted(safe):
+            candidate = {**kept, str(field): safe[field], **overflow}
+            if len(_canonical(candidate)) > limit:
+                # Skip this oversized field but keep trying the smaller ones so
+                # one huge value cannot hide every other field.
+                continue
+            kept[str(field)] = safe[field]
+        return {**kept, **overflow}
+    return {**overflow, "kind": type(safe).__name__}
 
 
 def _number(value: Any) -> float:

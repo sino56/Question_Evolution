@@ -5,15 +5,20 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Mapping, Optional
 
-from .context_layers import PROJECT_HARD_CONSTRAINTS, build_context_layers, redact_context, registered_tools
+from .context_layers import PROJECT_HARD_CONSTRAINTS, _bounded, build_context_layers, registered_tools
 from .task import AgentTask
 
 
 def _truncate(value: Any, limit: int) -> Any:
-    text = json.dumps(redact_context(value), ensure_ascii=False, sort_keys=True)
-    if len(text) <= limit:
-        return json.loads(text)
-    return {"truncated": True, "preview": text[:limit]}
+    """Bound a legacy context alias with the same structured truncation.
+
+    The previous implementation cut the serialized JSON mid-token, producing a
+    ``preview`` string that was not valid JSON; it now reuses the layered
+    ``_bounded`` contract so every emitted field remains parseable and carries
+    an ``__overflow__`` pointer.
+    """
+
+    return _bounded(value, limit)
 
 
 def build_context_pack(

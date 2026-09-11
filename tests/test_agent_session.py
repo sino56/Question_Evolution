@@ -123,7 +123,7 @@ def test_automatic_boundary_result_suspends_session_for_manual_review(tmp_path, 
     def fake_observer(*_args, **kwargs):
         (Path(kwargs["run_dir"]) / "agent_observation.json").write_text("{}\n", encoding="utf-8")
         return {
-            "status": "observed", "manifest_status": "not_checked", "target_reached": True,
+            "status": "observed", "manifest_status": "ok", "target_reached": True,
             "boundary_candidate_count": 1, "pending_count": 0, "final_records_count": 1,
             "score_increased_count": 0, "evidence_refs": [],
         }

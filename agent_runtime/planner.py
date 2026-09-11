@@ -7,6 +7,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -226,18 +227,68 @@ def _model_response(context_pack: Mapping[str, Any]) -> Mapping[str, Any]:
     return candidate
 
 
+_MODEL_EDITABLE_PLAN_FIELDS = ("goal_summary", "assumptions")
+_MODEL_EDITABLE_STEP_FIELDS = ("intent", "purpose")
+# ``plan_id`` / ``step_id`` are deliberately excluded: they are generated fresh
+# by the deterministic planner and are never shown to the control model, so a
+# model cannot be expected to echo them.  ``_merge_model_plan`` always keeps the
+# baseline identity, so those fields cannot be hijacked either.
+_PROTECTED_PLAN_FIELDS = (
+    "plan_kind", "plan_layers", "selected_search_mode", "selected_execution_scope",
+    "selected_review_mode", "budget", "env_overrides", "blocked_reasons",
+)
+_PROTECTED_STEP_FIELDS = (
+    "tool", "tool_name", "arguments", "inputs", "preconditions", "expected_outputs",
+    "success_condition", "business_failure_action", "system_failure_action", "budget_limit",
+    "depends_on", "stop_if_failed", "run_when",
+)
+
+
 def _validate_model_plan(task: AgentTask, candidate: Mapping[str, Any], baseline: Mapping[str, Any]) -> None:
+    """Reject any model plan that is not a prose-only edit of the baseline.
+
+    The model may refine ``goal_summary``, ``assumptions``, and per-step
+    ``intent``/``purpose``.  Every execution-bearing field must equal the
+    deterministic baseline exactly; comparing only the tool sequence let a
+    model rewrite budgets, ``stop_if_failed``, and step arguments.
+    """
+
     schema_path = Path(__file__).resolve().parents[1] / "schemas" / "agent_plan.schema.json"
     validate_instance(dict(candidate), load_schema(schema_path), schema_dir=schema_path.parent)
     validate_plan(task, candidate)
-    protected = ("selected_search_mode", "selected_execution_scope", "selected_review_mode", "budget", "env_overrides")
-    for field in protected:
+    candidate_steps = candidate.get("steps")
+    baseline_steps = baseline["steps"]
+    if not isinstance(candidate_steps, list) or len(candidate_steps) != len(baseline_steps):
+        raise PolicyViolation("model plan changed the registered execution skeleton")
+    for field in _PROTECTED_PLAN_FIELDS:
         if candidate.get(field) != baseline.get(field):
             raise PolicyViolation(f"model plan changed protected field: {field}")
-    expected_tools = [step["tool"] for step in baseline["steps"]]
-    actual_tools = [step.get("tool") for step in candidate.get("steps", []) if isinstance(step, Mapping)]
-    if actual_tools != expected_tools:
-        raise PolicyViolation("model plan changed the registered execution skeleton")
+    for candidate_step, baseline_step in zip(candidate_steps, baseline_steps):
+        if not isinstance(candidate_step, Mapping):
+            raise PolicyViolation("model plan step must be an object")
+        for field in _PROTECTED_STEP_FIELDS:
+            if candidate_step.get(field) != baseline_step.get(field):
+                raise PolicyViolation(f"model plan changed protected step field: {field}")
+
+
+def _merge_model_plan(candidate: Mapping[str, Any], baseline: Mapping[str, Any]) -> Dict[str, Any]:
+    """Build the effective plan from the baseline plus the model's prose edits."""
+
+    result = deepcopy(dict(baseline))
+    goal = candidate.get("goal_summary")
+    if isinstance(goal, str) and goal.strip():
+        result["goal_summary"] = goal
+    assumptions = candidate.get("assumptions")
+    if isinstance(assumptions, list) and all(isinstance(item, str) for item in assumptions):
+        result["assumptions"] = list(assumptions)
+    for merged_step, candidate_step in zip(result["steps"], candidate.get("steps") or []):
+        if not isinstance(candidate_step, Mapping):
+            continue
+        for field in _MODEL_EDITABLE_STEP_FIELDS:
+            value = candidate_step.get(field)
+            if isinstance(value, str) and value.strip():
+                merged_step[field] = value
+    return result
 
 
 def build_plan(
@@ -264,7 +315,7 @@ def build_plan(
         baseline["assumptions"].append("model_assisted planning fell back to deterministic planning because model output was unavailable or invalid")
         baseline["model_fallback_reason"] = type(exc).__name__
         return baseline
-    result = dict(candidate)
+    result = _merge_model_plan(candidate, baseline)
     result["planner_source"] = "model_assisted"
     try:
         validate_contract("agent_plan.schema.json", result, path="$.plan")

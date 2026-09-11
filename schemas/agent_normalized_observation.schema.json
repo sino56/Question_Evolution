@@ -6,7 +6,7 @@
   "properties": {
     "observation_id": {"type": "string", "minLength": 1},
     "source_tool": {"type": "string", "minLength": 1},
-    "type": {"enum": ["environment_ready", "pipeline_started", "pipeline_completed", "candidate_invalid", "score_decreased", "score_unchanged", "score_increased", "not_applicable", "boundary_candidate_found", "budget_warning", "tool_retryable_failure", "tool_fatal_failure", "artifact_missing", "manifest_corrupted", "review_report_ready"]},
+    "type": {"enum": ["environment_ready", "pipeline_started", "pipeline_completed", "candidate_invalid", "score_decreased", "score_unchanged", "score_increased", "not_applicable", "boundary_candidate_found", "budget_warning", "tool_retryable_failure", "tool_fatal_failure", "artifact_missing", "manifest_corrupted", "review_report_ready", "effective_boundary_found", "judge_instability_detected", "rollback_completed", "memory_written"]},
     "severity": {"enum": ["info", "warning", "error"]},
     "summary": {"type": "string"},
     "evidence_refs": {"type": "array", "items": {"type": "object"}},

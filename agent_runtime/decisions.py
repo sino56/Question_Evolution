@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, Mapping
 
 from .contracts import validate_contract
 from .events import append_event
+from .observer import BUDGET_TERMINAL_REASONS
 from .policy import validate_decision
 from .task import AgentTask
 
@@ -17,11 +18,36 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _correlation(
+    *,
+    session_id: str | None = None,
+    plan_id: str | None = None,
+    plan_revision: int | None = None,
+    observation_id: str | None = None,
+) -> Dict[str, Any]:
+    """Return the audit links that let a decision be traced back to its inputs."""
+
+    links: Dict[str, Any] = {}
+    if session_id:
+        links["session_id"] = str(session_id)
+    if plan_id:
+        links["plan_id"] = str(plan_id)
+    if plan_revision is not None:
+        links["plan_revision"] = int(plan_revision)
+    if observation_id:
+        links["observation_id"] = str(observation_id)
+    return links
+
+
 def decide_next_action(
     task: AgentTask,
     observation: Mapping[str, Any],
     *,
     tool_results: Iterable[Mapping[str, Any]] = (),
+    session_id: str | None = None,
+    plan_id: str | None = None,
+    plan_revision: int | None = None,
+    observation_id: str | None = None,
 ) -> Dict[str, Any]:
     normalized = list(observation.get("observations") or [])
     observation_types = {str(item.get("type")) for item in normalized if isinstance(item, Mapping)}
@@ -49,6 +75,9 @@ def decide_next_action(
     elif "not_applicable" in observation_types or int(observation.get("not_applicable_count") or 0) > 0:
         decision = {"action": "stop_and_report", "reason": "operator applicability issue observed; do not penalize the whole operator family", "requires_human_review": True,
                     "terminal_reason": "manual_review_required"}
+    elif "judge_instability_detected" in observation_types:
+        decision = {"action": "suspend", "reason": "journal quality is unstable; attribution must pause and the affected samples must be re-evaluated",
+                    "requires_human_review": True, "terminal_reason": "judge_instability"}
     elif observation.get("replan_required") or any(bool(item.get("requires_replan")) for item in normalized if isinstance(item, Mapping)):
         decision = {"action": "replan", "reason": str(observation.get("replan_reason") or "observation requires a constrained replan"),
                     "requires_human_review": False, "terminal_reason": None}
@@ -56,6 +85,9 @@ def decide_next_action(
         reason = str(observation.get("termination_reason") or "budget_exhausted")
         decision = {"action": "stop_and_report", "reason": reason, "requires_human_review": False,
                     "terminal_reason": reason}
+    elif "effective_boundary_found" in observation_types:
+        decision = {"action": "stop_and_report", "reason": "an effective capability boundary was found; store it and complete the Session",
+                    "requires_human_review": True, "terminal_reason": "effective_boundary_found"}
     elif bool(observation.get("target_reached")):
         decision = {"action": "stop_and_report", "reason": "automatic boundary-candidate target reached", "requires_human_review": True,
                     "terminal_reason": "manual_review_required"}
@@ -74,13 +106,22 @@ def decide_next_action(
             "terminal_reason": "manual_review_required",
         }
     decision.update({"created_at": _now(), "observation_status": observation.get("status")})
+    decision.update(_correlation(session_id=session_id, plan_id=plan_id, plan_revision=plan_revision, observation_id=observation_id))
     validate_decision(decision)
     return decision
 
 
 def _is_budget_exhausted(observation: Mapping[str, Any]) -> bool:
-    reason = str(observation.get("termination_reason") or "").lower()
-    return bool(observation.get("budget_exhausted")) or "budget" in reason or "max_search_steps" in reason
+    """Return True only for an explicit budget terminal state.
+
+    Substring matching on the reason text previously treated any label that
+    merely contained "budget" (for example ``budget_observation_ready``) as an
+    exhausted budget, which silently suppressed the human-review requirement.
+    """
+
+    if observation.get("budget_exhausted") is True:
+        return True
+    return str(observation.get("termination_reason") or "").strip() in BUDGET_TERMINAL_REASONS
 
 
 def write_decision(run_dir: str | Path, decision: Mapping[str, Any]) -> Dict[str, Any]:

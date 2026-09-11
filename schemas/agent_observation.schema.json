@@ -6,7 +6,13 @@
   "properties": {
     "experiment_dir": {"type": "string"},
     "status": {"enum": ["observed", "blocked"]},
-    "manifest_status": {"enum": ["not_checked", "damaged"]},
+    "manifest_status": {"enum": ["ok", "not_checked", "damaged"]},
+    "judge_stability": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {"status": {"enum": ["stable", "unstable", "not_reported"]}},
+      "additionalProperties": true
+    },
     "final_records_count": {"type": "integer", "minimum": 0},
     "pending_count": {"type": "integer", "minimum": 0},
     "boundary_candidate_count": {"type": "integer", "minimum": 0},

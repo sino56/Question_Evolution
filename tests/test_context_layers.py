@@ -76,4 +76,9 @@ def test_observations_and_task_tool_input_order_do_not_change_prefixes(tmp_path)
 def test_large_dynamic_observation_keeps_the_v2_contract(tmp_path):
     pack = build_context_pack(_task(tmp_path), observation={"large": "x" * 100000})
     assert pack["context_schema_version"] == "context-pack-v2"
-    assert pack["dynamic_tail"]["observation_summary"]["truncated"] is True
+    summary = pack["dynamic_tail"]["observation_summary"]
+    # Truncation must stay parseable JSON and carry a traceable pointer.
+    assert "__overflow__" in summary
+    assert summary["__overflow__"]["sha256"].startswith("sha256:")
+    assert "large" not in summary
+    json.loads(json.dumps(summary, ensure_ascii=False))

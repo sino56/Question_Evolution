@@ -16,6 +16,18 @@ OBSERVATION_TYPES = {
     "score_decreased", "score_unchanged", "score_increased", "not_applicable",
     "boundary_candidate_found", "budget_warning", "tool_retryable_failure",
     "tool_fatal_failure", "artifact_missing", "manifest_corrupted", "review_report_ready",
+    # Design §12.1 reflector actions that had no representable observation.
+    "effective_boundary_found", "judge_instability_detected", "rollback_completed", "memory_written",
+}
+MANIFEST_STATUSES = ("ok", "damaged", "not_checked")
+BUDGET_TERMINAL_REASONS = {
+    "budget_exhausted",
+    "max_search_steps_budget_exhausted",
+    "evaluation_budget_exhausted",
+    "request_budget_exhausted",
+    "search_budget_exhausted",
+    "generation_budget_exhausted",
+    "scoring_budget_exhausted",
 }
 
 
@@ -47,6 +59,34 @@ def _observation(
         "requires_replan": requires_replan,
         "requires_human_review": requires_human_review,
     }
+
+
+def _judge_stability(statistics: Mapping[str, Any]) -> Dict[str, Any]:
+    """Derive judge stability from structured statistics only, never labels."""
+
+    if not isinstance(statistics, Mapping):
+        return {"status": "not_reported"}
+    for field in ("judge_instability_rate", "judge_disagreement_rate"):
+        value = statistics.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return {"status": "unstable" if float(value) > 0 else "stable", field: float(value)}
+    count = statistics.get("judge_instability_count")
+    if isinstance(count, int) and not isinstance(count, bool):
+        return {"status": "unstable" if count > 0 else "stable", "judge_instability_count": count}
+    return {"status": "not_reported"}
+
+
+def _memory_records(aggregate: Mapping[str, Any]) -> int:
+    memory = aggregate.get("memory_summary") if isinstance(aggregate.get("memory_summary"), Mapping) else {}
+    banks = memory.get("banks") if isinstance(memory.get("banks"), Mapping) else {}
+    total = 0
+    for entry in banks.values():
+        if isinstance(entry, Mapping):
+            try:
+                total += max(0, int(entry.get("record_count") or 0))
+            except (TypeError, ValueError):
+                continue
+    return total
 
 
 def normalize_tool_result(tool_result: Mapping[str, Any], *, experiment_observation: Mapping[str, Any] | None = None) -> List[Dict[str, Any]]:
@@ -94,6 +134,25 @@ def normalize_tool_result(tool_result: Mapping[str, Any], *, experiment_observat
             ))
     if aggregate.get("budget_exhausted") or "budget" in str(aggregate.get("termination_reason") or "").lower():
         observations.append(_observation(tool, "budget_warning", "search budget was exhausted", severity="warning", metrics={"termination_reason": aggregate.get("termination_reason")}, recommended_actions=["stop_and_report"]))
+    if isinstance(aggregate.get("judge_stability"), Mapping) and aggregate["judge_stability"].get("status") == "unstable":
+        observations.append(_observation(
+            tool, "judge_instability_detected", "structured statistics report judge instability",
+            severity="warning", evidence_refs=evidence, metrics=dict(aggregate["judge_stability"]),
+            recommended_actions=["suspend_attribution", "re_evaluate"], requires_replan=True, requires_human_review=True,
+        ))
+    if aggregate.get("target_reached"):
+        observations.append(_observation(
+            tool, "effective_boundary_found", "the boundary-candidate target was reached with published evidence",
+            severity="info", evidence_refs=evidence,
+            metrics={"boundary_candidate_count": int(aggregate.get("boundary_candidate_count") or 0)},
+            recommended_actions=["save_boundary", "report"], requires_human_review=True,
+        ))
+    memory_records = _memory_records(aggregate)
+    if memory_records:
+        observations.append(_observation(
+            tool, "memory_written", "the experiment wrote local memory records",
+            metrics={"record_count": memory_records}, recommended_actions=["report"],
+        ))
     if aggregate.get("manifest_status") == "damaged":
         observations.append(_observation(tool, "manifest_corrupted", "published artifact manifest is damaged", severity="error", evidence_refs=evidence, recommended_actions=["block_and_report"], requires_human_review=True))
     elif aggregate.get("missing_artifacts"):
@@ -190,13 +249,25 @@ def _memory_summary(memory_dir: Path, issues: List[str]) -> Dict[str, Any]:
 
 
 def _artifact_integrity(experiment_dir: Path) -> Tuple[str, List[str]]:
+    """Return one of ``ok / damaged / not_checked`` plus damaged outputs.
+
+    ``not_checked`` means the experiment published no manifest at all; it is a
+    distinct state from ``ok`` so a plan that *requires* published-manifest
+    validation can treat "nothing was checked" as unmet.
+    """
+
     damaged: List[str] = []
-    for manifest in experiment_dir.rglob("*.manifest.json"):
+    manifests = list(experiment_dir.rglob("*.manifest.json"))
+    for manifest in manifests:
         output = Path(str(manifest)[: -len(".manifest.json")])
         valid, reason = validate_published_artifact(str(output))
         if not valid:
             damaged.append(f"{output}: {reason}")
-    return ("damaged" if damaged else "not_checked"), damaged
+    if damaged:
+        return "damaged", damaged
+    if manifests:
+        return "ok", []
+    return "not_checked", []
 
 
 def observe_experiment(
@@ -298,6 +369,7 @@ def observe_experiment(
         "status": status,
         "blocked_reason": "; ".join(damaged + issues) if status == "blocked" else None,
         "manifest_status": manifest_status,
+        "judge_stability": _judge_stability(statistics),
         "search_mode": search_mode or None,
         "final_records_count": len(final_records),
         "pending_count": pending,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from agent_runtime.decisions import decide_next_action, write_decision
 from agent_runtime.budgeting import (
@@ -55,6 +55,15 @@ def _memory_runtime(task: AgentTask) -> tuple[dict[str, Any], dict[str, Any], st
         context = {"memory_snapshot_id": snapshot["memory_snapshot_id"], "memory_context_key": None, "retrieval_config_version": "global-memory-retrieval-v1", "top_k": 0, "cards": [], "mode": "no_global_memory" if degraded else snapshot.get("mode", "no_global_memory")}
     path = store.root / "snapshots" / f"{snapshot['memory_snapshot_id']}.json"
     return snapshot, context, str(path) if path.exists() else None
+
+
+def _first_observation_id(observations: Any) -> str | None:
+    """Return the anchor observation_id for decision correlation."""
+
+    for item in observations or []:
+        if isinstance(item, Mapping) and item.get("observation_id"):
+            return str(item["observation_id"])
+    return None
 
 
 def _bind_memory_identity(
@@ -229,7 +238,15 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
         # Advisor collaboration is review-only.  Primary experiment results,
         # decision logic, and report creation remain available on degradation.
         multi_agent_review = {"merge": {"accepted_advice": [], "policy_rejections": [], "conflicts": []}, "degraded_reason": str(exc)}
-    decision = decide_next_action(task, observation, tool_results=results)
+    decision = decide_next_action(
+        task,
+        observation,
+        tool_results=results,
+        session_id=str(state.get("session_id") or run_dir.name),
+        plan_id=str(plan.get("plan_id") or ""),
+        plan_revision=int(state.get("plan_revision") or 0),
+        observation_id=_first_observation_id(executor.normalized_observations),
+    )
     if decision["action"] in {"blocked", "suspend"} or observation.get("score_increased_count") or observation.get("budget_exhausted"):
         # This documents the recovery procedure without granting it any write
         # authority.  The deterministic decision and normal policy checks are

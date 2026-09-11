@@ -171,8 +171,15 @@ class Executor:
                 valid, reason = validate_published_artifact(str(Path(str(exp_dir)) / "final" / "final_scored.jsonl"))
                 if not valid:
                     return False, f"artifact_missing:{reason}", True
-        if tool == "observe_experiment" and "agent_observation.json" in expected and not (self.run_dir / "agent_observation.json").is_file():
-            return False, "artifact_missing:agent_observation.json", True
+        if tool == "observe_experiment":
+            preconditions = set(step.get("preconditions") or [])
+            observed = result.get("observation") if isinstance(result.get("observation"), Mapping) else {}
+            if "published_manifest_validation_required" in preconditions and str(observed.get("manifest_status") or "not_checked") == "not_checked":
+                # A step that *requires* published-manifest validation cannot be
+                # satisfied by "nothing was checked".
+                return False, "artifact_missing:published_manifest_not_checked", True
+            if "agent_observation.json" in expected and not (self.run_dir / "agent_observation.json").is_file():
+                return False, "artifact_missing:agent_observation.json", True
         return True, "ok", False
 
     def _invoke_registry(self, method_name: str, *args: Any, tool_call_id: str, idempotency_key: str, **kwargs: Any) -> Dict[str, Any]:
