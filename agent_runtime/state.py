@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
+from .contracts import validate_contract
 from .events import append_event
 
 
@@ -122,6 +123,9 @@ def load_state(run_dir: Path) -> Dict[str, Any]:
 
 def save_state(run_dir: Path, state: Mapping[str, Any]) -> None:
     manifest = _hydrate_manifest(run_dir, state)
+    # The Session Manifest is a formal contract: gate it before it lands on
+    # disk so a drifting field can never silently reach the next stage.
+    validate_contract("agent_run_state.schema.json", manifest, path="$.session_manifest")
     # Keep the original filename as the stable Stage-1 public contract and
     # expose the explicit Session name for new consumers.
     _write_json(run_dir / "agent_run_state.json", manifest)

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from schema_validation import SchemaValidationError, load_schema, validate_instance
 
+from .contracts import ContractViolation, validate_contract
 from .policy import PolicyViolation, validate_plan
 from .task import AgentTask
 from .context_prompt import assemble_context_prompt
@@ -26,6 +27,36 @@ def select_search_mode(task: AgentTask) -> tuple[str, List[str]]:
     if any(marker in goal for marker in ("逐轮", "主链", "single branch", "single_branch")):
         return "single_branch", ["search_mode=auto matched a sequential main-chain goal"]
     return "multi_operator_branch", ["search_mode=auto defaulted to branch search because the goal did not select another mode"]
+
+
+def plan_env_overrides(
+    task: AgentTask,
+    *,
+    command: str,
+    memory_snapshot_id: Optional[str] = None,
+) -> Dict[str, str]:
+    """Return the single authoritative ``plan.env_overrides`` mapping.
+
+    Every plan (initial, replanned, or budget-replanned) derives its
+    environment contract from this one function.  ``MEMORY_SNAPSHOT_ID`` is
+    part of the router cache identity, so it must never be dropped when a
+    plan is rebuilt during a replan decision.
+    """
+
+    selected_mode, _ = select_search_mode(task)
+    overrides: Dict[str, str] = {
+        "SEARCH_MODE": selected_mode,
+        "SEARCH_BOUNDARY_TARGET": str(task.boundary_target),
+        "MAX_SEARCH_STEPS": str(task.max_search_steps),
+        "EXECUTION_SCOPE": task.execution_scope,
+    }
+    if task.input_file:
+        overrides["INPUT_FILE"] = task.input_file
+    if task.exp_root:
+        overrides["EXP_ROOT"] = task.exp_root
+    if memory_snapshot_id:
+        overrides["MEMORY_SNAPSHOT_ID"] = str(memory_snapshot_id)
+    return overrides
 
 
 def _step(
@@ -77,16 +108,7 @@ def _deterministic_plan(task: AgentTask, *, command: str) -> Dict[str, Any]:
     selected_mode, assumptions = select_search_mode(task)
     steps: List[Dict[str, Any]] = []
     blocked: List[str] = []
-    env_overrides = {
-        "SEARCH_MODE": selected_mode,
-        "SEARCH_BOUNDARY_TARGET": str(task.boundary_target),
-        "MAX_SEARCH_STEPS": str(task.max_search_steps),
-        "EXECUTION_SCOPE": task.execution_scope,
-    }
-    if task.input_file:
-        env_overrides["INPUT_FILE"] = task.input_file
-    if task.exp_root:
-        env_overrides["EXP_ROOT"] = task.exp_root
+    env_overrides = plan_env_overrides(task, command=command)
 
     if task.is_review_only or command == "review":
         plan_kind = "review_plan"
@@ -232,6 +254,7 @@ def build_plan(
     """
 
     baseline = _deterministic_plan(task, command=command)
+    validate_contract("agent_plan.schema.json", baseline, path="$.plan")
     if task.planning_mode != "model_assisted":
         return baseline
     try:
@@ -243,4 +266,10 @@ def build_plan(
         return baseline
     result = dict(candidate)
     result["planner_source"] = "model_assisted"
+    try:
+        validate_contract("agent_plan.schema.json", result, path="$.plan")
+    except ContractViolation as exc:
+        baseline["assumptions"].append("model_assisted planning fell back to deterministic planning because model output was unavailable or invalid")
+        baseline["model_fallback_reason"] = type(exc).__name__
+        return baseline
     return result

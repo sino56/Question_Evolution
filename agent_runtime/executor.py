@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, Iterable, Mapping, MutableMapping, Optio
 
 from pipeline_runtime import validate_published_artifact
 
+from .contracts import ContractViolation, validate_contract
 from .events import append_event, redact
 from .budgeting import BudgetLedgerError, load_or_create_ledger, save_ledger
 from .budgeting.budget_state import UNALLOCATED_TARGET
@@ -64,9 +65,18 @@ class Executor:
         self.normalized_observations: list[Dict[str, Any]] = []
         self.observation: Optional[Dict[str, Any]] = None
 
-    def _record_observations(self, result: Mapping[str, Any]) -> None:
+    def _observation_items(self, result: Mapping[str, Any]) -> list[Dict[str, Any]]:
+        """Normalize a tool result and gate every item against its contract."""
+
         aggregate = result.get("observation") if isinstance(result.get("observation"), Mapping) else None
         items = list(aggregate.get("observations") or []) if aggregate else normalize_tool_result(result)
+        validated: list[Dict[str, Any]] = []
+        for item in items:
+            validate_contract("agent_normalized_observation.schema.json", item, path="$.observation")
+            validated.append(dict(item))
+        return validated
+
+    def _write_observations(self, items: Iterable[Mapping[str, Any]]) -> None:
         target = self.run_dir / "agent_observation_timeline.jsonl"
         with target.open("a", encoding="utf-8") as handle:
             for item in items:
@@ -135,26 +145,35 @@ class Executor:
             else:
                 raise ExecutorError(f"unsupported step precondition: {condition}")
 
-    def _verify_outputs(self, step: Mapping[str, Any], result: Mapping[str, Any]) -> tuple[bool, str]:
+    def _verify_outputs(self, step: Mapping[str, Any], result: Mapping[str, Any]) -> tuple[bool, str, bool]:
+        """Return ``(valid, reason, artifact_gate)``.
+
+        ``artifact_gate`` is True only when the registered tool itself
+        reported success but a *formal artifact* check failed.  A tool-reported
+        failure keeps its own ``failure_category`` / ``recoverable`` values, so
+        a retryable system error is never silently promoted to a fatal one
+        (design §3.4: business and system failures stay separated).
+        """
+
         if not result.get("ok"):
-            return False, str(result.get("failure_category") or "tool_execution_error")
+            return False, str(result.get("failure_category") or "tool_execution_error"), False
         expected = set(step.get("expected_outputs") or [])
         tool = str(result.get("tool"))
         if tool == "check_environment" and "environment_checked" in expected and not result.get("ready"):
-            return False, "environment_not_ready"
+            return False, "environment_not_ready", True
         if tool in {"run_full_loop", "resume_full_loop"}:
             exp_dir = result.get("experiment_dir")
             if "experiment_dir" in expected and (not exp_dir or not Path(str(exp_dir)).is_dir()):
-                return False, "artifact_missing:experiment_dir"
+                return False, "artifact_missing:experiment_dir", True
             if "final/final_scored.jsonl" in expected:
                 if not exp_dir:
-                    return False, "artifact_missing:final/final_scored.jsonl"
+                    return False, "artifact_missing:final/final_scored.jsonl", True
                 valid, reason = validate_published_artifact(str(Path(str(exp_dir)) / "final" / "final_scored.jsonl"))
                 if not valid:
-                    return False, f"artifact_missing:{reason}"
+                    return False, f"artifact_missing:{reason}", True
         if tool == "observe_experiment" and "agent_observation.json" in expected and not (self.run_dir / "agent_observation.json").is_file():
-            return False, "artifact_missing:agent_observation.json"
-        return True, "ok"
+            return False, "artifact_missing:agent_observation.json", True
+        return True, "ok", False
 
     def _invoke_registry(self, method_name: str, *args: Any, tool_call_id: str, idempotency_key: str, **kwargs: Any) -> Dict[str, Any]:
         method = getattr(self.registry, method_name)
@@ -211,16 +230,31 @@ class Executor:
             result.setdefault("recoverable", False)
             result.setdefault("cost", {"known_cost": None, "unit": "not_reported"})
             result["duration_seconds"] = round(float(result.get("duration_seconds") or (time.monotonic() - started)), 6)
-            valid, reason = self._verify_outputs(step, result)
+            valid, reason, artifact_gate = self._verify_outputs(step, result)
             if not valid:
-                result.update({"ok": False, "recoverable": False, "failure_category": "fatal_system_error", "artifact_validation": reason})
-        except (ExecutorError, ToolExecutionError, OSError, ValueError) as exc:
+                if artifact_gate:
+                    # The tool succeeded but its formal artifact contract was
+                    # not met: this is an unrecoverable system failure.
+                    result.update({"ok": False, "recoverable": False, "failure_category": "fatal_system_error", "artifact_validation": reason})
+                else:
+                    # The tool already classified its own failure.  Preserve
+                    # ``recoverable``/``failure_category`` so retryable system
+                    # failures remain distinguishable from fatal ones.
+                    result["artifact_validation"] = reason
+                    if not result.get("failure_category"):
+                        result["failure_category"] = reason
+                    if not isinstance(result.get("recoverable"), bool):
+                        result["recoverable"] = False
+            validate_contract("agent_tool_result.schema.json", dict(result), path="$.tool_result")
+            observation_items = self._observation_items(result)
+        except (ExecutorError, ToolExecutionError, OSError, ValueError, ContractViolation) as exc:
             result = {"tool": tool, "tool_version": spec.version, "tool_call_id": call_id, "idempotency_key": key, "ok": False, "return_code": -1, "duration_seconds": round(time.monotonic() - started, 6), "retry_count": 0, "failure_category": "fatal_system_error", "recoverable": False, "stderr_summary": str(exc), "cost": {"known_cost": None, "unit": "not_reported"}}
+            observation_items = self._observation_items(result)
         self.ledger[key] = redact(result)
         self._save_ledger()
         self.budget_ledger.record_tool_call(tool, tool_call_id=call_id, duration_seconds=float(result.get("duration_seconds") or 0), ok=bool(result.get("ok")))
         save_ledger(self.run_dir, self.budget_ledger)
-        self._record_observations(result)
+        self._write_observations(observation_items)
         event_type = "tool_completed" if result.get("ok") else "tool_failed"
         append_event(self.events_path, event_type, result)
         self.results.append(result)
@@ -261,7 +295,13 @@ class Executor:
         except OSError as exc:
             result = {"tool": tool, "tool_version": spec.version, "tool_call_id": call_id, "idempotency_key": key, "ok": False, "return_code": -1, "duration_seconds": round(time.monotonic() - started, 6), "retry_count": 0, "failure_category": "fatal_system_error", "recoverable": False, "stderr_summary": str(exc), "cost": {"known_cost": 0, "unit": "local"}}
         append_event(self.events_path, "tool_completed" if result["ok"] else "tool_failed", result)
-        self._record_observations(result)
+        try:
+            observation_items = self._observation_items(result)
+            validate_contract("agent_tool_result.schema.json", dict(result), path="$.tool_result")
+        except ContractViolation as exc:
+            result.update({"ok": False, "recoverable": False, "failure_category": "fatal_system_error", "artifact_validation": str(exc)})
+            observation_items = self._observation_items(result)
+        self._write_observations(observation_items)
         self.results.append(result)
         if result["ok"]:
             completed = list(self.state.get("completed_step_ids") or [])

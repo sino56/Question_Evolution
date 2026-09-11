@@ -14,11 +14,12 @@ from agent_runtime.budgeting import (
     write_budget_artifacts,
 )
 from agent_runtime.context import build_context_pack
+from agent_runtime.contracts import ContractViolation
 from agent_runtime.multi_agent.coordinator import run_post_experiment_review
 from agent_runtime.global_memory import GlobalMemoryStore, SnapshotUnavailable, router_cache_key
 from agent_runtime.executor import Executor, ExecutorError
 from agent_runtime.observer import observe_experiment
-from agent_runtime.planner import build_plan
+from agent_runtime.planner import build_plan, plan_env_overrides
 from agent_runtime.policy import PolicyViolation, validate_plan
 from agent_runtime.reporter import write_agent_report, write_global_review_artifacts
 from agent_runtime.skills import load_stage_skills
@@ -54,6 +55,29 @@ def _memory_runtime(task: AgentTask) -> tuple[dict[str, Any], dict[str, Any], st
         context = {"memory_snapshot_id": snapshot["memory_snapshot_id"], "memory_context_key": None, "retrieval_config_version": "global-memory-retrieval-v1", "top_k": 0, "cards": [], "mode": "no_global_memory" if degraded else snapshot.get("mode", "no_global_memory")}
     path = store.root / "snapshots" / f"{snapshot['memory_snapshot_id']}.json"
     return snapshot, context, str(path) if path.exists() else None
+
+
+def _bind_memory_identity(
+    plan: Dict[str, Any],
+    *,
+    task: AgentTask,
+    command: str,
+    snapshot: Dict[str, Any],
+    memory_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Attach the frozen memory identity to a plan from one single source.
+
+    Both the initial plan and every replanned plan go through this helper, so
+    ``env_overrides["MEMORY_SNAPSHOT_ID"]`` (which the router folds into its
+    cache identity) can never be dropped by a later rebuild.
+    """
+
+    snapshot_id = str(snapshot["memory_snapshot_id"])
+    plan["env_overrides"] = plan_env_overrides(task, command=command, memory_snapshot_id=snapshot_id)
+    plan["memory_snapshot_id"] = snapshot_id
+    plan["memory_context_key"] = memory_context.get("memory_context_key")
+    plan["router_cache_key"] = router_cache_key(base_key=str(plan["plan_id"]), memory_snapshot_id=snapshot_id)
+    return plan
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -138,10 +162,7 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
     )
     update_state(run_dir, state, status="context_ready")
     plan = build_plan(task, command=command, context_pack=initial_context)
-    plan["memory_snapshot_id"] = snapshot["memory_snapshot_id"]
-    plan["memory_context_key"] = memory_context.get("memory_context_key")
-    plan["router_cache_key"] = router_cache_key(base_key=str(plan["plan_id"]), memory_snapshot_id=str(snapshot["memory_snapshot_id"]))
-    plan["env_overrides"]["MEMORY_SNAPSHOT_ID"] = snapshot["memory_snapshot_id"]
+    plan = _bind_memory_identity(plan, task=task, command=command, snapshot=snapshot, memory_context=memory_context)
     try:
         validate_plan(task, plan)
     except PolicyViolation as exc:
@@ -256,7 +277,13 @@ def run_agent(command: str, task: AgentTask, *, registry: Optional[ToolRegistry]
             plan = write_plan_revision(
                 run_dir,
                 state,
-                {**build_plan(task, command=command, context_pack=replan_prompt_context), "memory_snapshot_id": snapshot["memory_snapshot_id"], "memory_context_key": memory_context.get("memory_context_key"), "router_cache_key": router_cache_key(base_key=str(plan["plan_id"]), memory_snapshot_id=str(snapshot["memory_snapshot_id"]))},
+                _bind_memory_identity(
+                    build_plan(task, command=command, context_pack=replan_prompt_context),
+                    task=task,
+                    command=command,
+                    snapshot=snapshot,
+                    memory_context=memory_context,
+                ),
                 trigger_reason=decision["reason"],
             )
         persisted_context = build_context_pack(
@@ -311,6 +338,9 @@ def main(argv: list[str] | None = None) -> int:
         code, run_dir = run_agent(args.command, task)
     except (TaskValidationError, PolicyViolation) as exc:
         print(f"AgentTask error: {exc}")
+        return 2
+    except ContractViolation as exc:
+        print(f"Agent contract violation: {exc}")
         return 2
     print(f"Agent run directory: {run_dir}")
     return code

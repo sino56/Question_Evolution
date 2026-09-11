@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping
 
+from .contracts import validate_contract
 from .events import append_event
 from .policy import validate_decision
 from .task import AgentTask
@@ -85,6 +86,9 @@ def _is_budget_exhausted(observation: Mapping[str, Any]) -> bool:
 def write_decision(run_dir: str | Path, decision: Mapping[str, Any]) -> Dict[str, Any]:
     root = Path(run_dir)
     root.mkdir(parents=True, exist_ok=True)
+    # Gate the decision against its published contract before it becomes an
+    # auditable record; drift must fail here rather than downstream.
+    validate_contract("agent_decision.schema.json", dict(decision), path="$.decision")
     with (root / "agent_decisions.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(dict(decision), ensure_ascii=False, sort_keys=True) + "\n")
     append_event(root / "agent_events.jsonl", "decision", dict(decision))

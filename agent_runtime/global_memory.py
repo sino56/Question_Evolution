@@ -64,6 +64,27 @@ def _file_hash(path: Path, *, lines: int | None = None) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def _card_fingerprint(card: Mapping[str, Any]) -> str:
+    """Content address of a strategy card as stored in the authoritative DB."""
+
+    return _hash(card)
+
+
+def _matches_frozen_card(card: Mapping[str, Any], fingerprints: Mapping[str, Any], allowed: Mapping[str, Any]) -> bool:
+    """Return True when a card still matches its frozen snapshot identity."""
+
+    card_id = str(card.get("card_id"))
+    entry = fingerprints.get(card_id)
+    if isinstance(entry, Mapping):
+        if int(card.get("version") or 0) != int(entry.get("version") or 0):
+            return False
+        return _card_fingerprint(card) == entry.get("body_sha256")
+    # Legacy snapshots froze only the version.  They still must not serve a
+    # card whose version advanced after the snapshot was taken.
+    recorded = allowed.get(card_id)
+    return recorded is None or int(card.get("version") or 0) == int(recorded)
+
+
 def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
@@ -521,8 +542,17 @@ class GlobalMemoryStore:
             self.publish_projections()
         index_hash = _file_hash(index_path)
         cards = self._cards()
-        versions = {card["card_id"]: card["version"] for card in cards if card["status"] != "retired"}
-        payload = {"local_memory_hashes": local_hashes, "global_index_hash": index_hash, "taxonomy_version": TAXONOMY_VERSION, "card_versions": versions}
+        versions: dict[str, Any] = {}
+        fingerprints: dict[str, Any] = {}
+        for card in cards:
+            if card.get("status") == "retired":
+                continue
+            versions[card["card_id"]] = card["version"]
+            # Content addressing: the frozen identity is the card body itself,
+            # not only its id.  ``retrieve`` refuses to serve a card whose body
+            # or version changed after the snapshot was taken.
+            fingerprints[card["card_id"]] = {"version": int(card.get("version") or 0), "body_sha256": _card_fingerprint(card)}
+        payload = {"local_memory_hashes": local_hashes, "global_index_hash": index_hash, "taxonomy_version": TAXONOMY_VERSION, "card_versions": versions, "card_fingerprints": fingerprints}
         snapshot_id = _hash(payload).split(":", 1)[1]
         snapshot = {"memory_snapshot_id": "MSNAP-" + snapshot_id[:20], **payload, "created_at": _now(), "mode": "no_global_memory" if not versions else "global_memory"}
         _atomic_write(self.root / "snapshots" / (snapshot["memory_snapshot_id"] + ".json"), json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
@@ -536,23 +566,56 @@ class GlobalMemoryStore:
             raise SnapshotUnavailable(f"memory snapshot is unavailable: {snapshot_id}")
         return _as_mapping(json.loads(path.read_text(encoding="utf-8")))
 
-    def retrieve(self, *, snapshot_id: str, query: str, top_k: int = 3) -> dict[str, Any]:
+    def verify_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+        """Report whether every frozen card still matches its fingerprint."""
+
+        snapshot = self.load_snapshot(snapshot_id)
+        allowed = _as_mapping(snapshot.get("card_versions"))
+        fingerprints = _as_mapping(snapshot.get("card_fingerprints"))
+        mismatches: list[dict[str, Any]] = []
+        for card in self._cards():
+            card_id = str(card.get("card_id"))
+            if card_id not in allowed:
+                continue
+            if card.get("status") == "retired":
+                mismatches.append({"card_id": card_id, "reason": "card_retired_after_freeze"})
+            elif not _matches_frozen_card(card, fingerprints, allowed):
+                mismatches.append({"card_id": card_id, "reason": "card_body_or_version_changed_after_freeze"})
+        return {
+            "memory_snapshot_id": snapshot_id,
+            "frozen_card_count": len(allowed),
+            "mismatches": mismatches,
+            "verified": not mismatches,
+        }
+
+    def retrieve(self, *, snapshot_id: str, query: str, top_k: int = 3, strict_frozen: bool = True) -> dict[str, Any]:
         if top_k < 1:
             raise ValueError("top_k must be positive")
         snapshot = self.load_snapshot(snapshot_id)
-        permitted = set(_as_mapping(snapshot.get("card_versions")).keys())
+        allowed = _as_mapping(snapshot.get("card_versions"))
+        fingerprints = _as_mapping(snapshot.get("card_fingerprints"))
+        permitted = set(allowed.keys())
         tokens = {token for token in query.lower().split() if token}
         scored: list[tuple[int, str, int, dict[str, Any]]] = []
+        stale: list[str] = []
         for card in self._cards():
-            if card["card_id"] not in permitted or card["status"] == "retired":
+            card_id = str(card.get("card_id"))
+            if card_id not in permitted or card.get("status") == "retired":
+                continue
+            if not _matches_frozen_card(card, fingerprints, allowed):
+                stale.append(card_id)
                 continue
             searchable = " ".join(str(card.get(field, "")) for field in ("scene_family", "question_form", "reasoning_mechanism", "overscore_pattern", "card_type")).lower()
             score = sum(token in searchable for token in tokens)
             scored.append((-score, card["card_id"], int(card.get("version") or 0), card))
+        if stale and strict_frozen:
+            raise SnapshotUnavailable(
+                "frozen memory snapshot no longer matches its cards: " + ", ".join(sorted(stale))
+            )
         selected = [(score, card) for score, _card_id, _version, card in sorted(scored)[:top_k]]
         summaries = [{"card_id": card["card_id"], "version": card["version"], "status": card["status"], "retrieval_score": -score, "summary": f"{card['card_type']}: {card.get('reasoning_mechanism') or card.get('question_form') or 'strategy evidence'}", "applicability": card.get("applicability_conditions", []), "exclusions": card.get("exclusion_conditions", []), "evidence_refs": card["evidence_refs"], "action_limit": "Audit-only reference; it must not alter the operator plan, routing, execution order, or scoring."} for score, card in selected]
         context_key = memory_context_key(memory_snapshot_id=snapshot_id, normalized_query=query, retrieval_config_version=RETRIEVAL_CONFIG_VERSION, top_k=top_k)
-        return {"memory_snapshot_id": snapshot_id, "memory_context_key": context_key, "retrieval_config_version": RETRIEVAL_CONFIG_VERSION, "top_k": top_k, "cards": summaries, "mode": snapshot.get("mode", "no_global_memory")}
+        return {"memory_snapshot_id": snapshot_id, "memory_context_key": context_key, "retrieval_config_version": RETRIEVAL_CONFIG_VERSION, "top_k": top_k, "cards": summaries, "mode": snapshot.get("mode", "no_global_memory"), "snapshot_integrity": {"status": "verified" if not stale else "mismatch", "frozen_card_count": len(permitted), "mismatched_card_ids": stale}}
 
     def import_trace(self, experiment_dir: str | Path) -> dict[str, Any]:
         experiment = Path(experiment_dir).resolve()
