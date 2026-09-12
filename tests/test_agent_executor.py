@@ -121,3 +121,49 @@ def test_model_billed_tools_consume_and_enforce_the_model_call_budget(tmp_path):
     with pytest.raises(ExecutorError):
         executor.execute_step(_step("run_full_loop", arguments={"search_max_depth": 2}, expected_outputs=[]))
     assert len(calls) == 1
+
+
+def test_model_calls_are_reconciled_with_the_pipeline_measurement(tmp_path):
+    """The pre-run unit charge is replaced by the pipeline's measured spend."""
+
+    class Registry:
+        def run_full_loop(self, task, env):
+            experiment_dir = tmp_path / "experiments" / "day" / "exp"
+            experiment_dir.mkdir(parents=True, exist_ok=True)
+            (experiment_dir / "experiment_statistics.json").write_text(
+                json.dumps({"model_calls": 7, "total_cost": 0.5}), encoding="utf-8"
+            )
+            return {"tool": "run_full_loop", "ok": True, "return_code": 0, "experiment_dir": str(experiment_dir)}
+
+    task = parse_agent_task(
+        {"goal": "find boundaries", "input_file": "data/data.jsonl", "budget_limits": {"model_calls": 100}, "allowed_tools": ["run_full_loop"]},
+        project_root=tmp_path,
+    )
+    executor = Executor(task=task, plan={"plan_id": "plan-1", "env_overrides": {}}, registry=Registry(), run_dir=tmp_path / "run", state={"completed_step_ids": []}, observe=lambda *_args, **_kwargs: {}, update_state=_update)
+    executor.execute_step(_step("run_full_loop", expected_outputs=[]))
+
+    ledger = json.loads((tmp_path / "run" / "budget_ledger.json").read_text(encoding="utf-8"))
+    assert ledger["consumed"]["model_calls"]["pool:unallocated"] == 7
+    events = (tmp_path / "run" / "agent_events.jsonl").read_text(encoding="utf-8")
+    assert "model_calls_reconciled" in events
+
+
+def test_model_calls_reconciliation_never_fails_the_completed_tool(tmp_path):
+    """A ledger refusal after a successful run must not flip the result."""
+
+    class Registry:
+        def run_full_loop(self, task, env):
+            experiment_dir = tmp_path / "experiments" / "day" / "exp"
+            experiment_dir.mkdir(parents=True, exist_ok=True)
+            (experiment_dir / "experiment_statistics.json").write_text(json.dumps({"model_calls": 9}), encoding="utf-8")
+            return {"tool": "run_full_loop", "ok": True, "return_code": 0, "experiment_dir": str(experiment_dir)}
+
+    task = parse_agent_task(
+        {"goal": "find boundaries", "input_file": "data/data.jsonl", "budget_limits": {"model_calls": 2}, "allowed_tools": ["run_full_loop"]},
+        project_root=tmp_path,
+    )
+    executor = Executor(task=task, plan={"plan_id": "plan-1", "env_overrides": {}}, registry=Registry(), run_dir=tmp_path / "run", state={"completed_step_ids": []}, observe=lambda *_args, **_kwargs: {}, update_state=_update)
+    result = executor.execute_step(_step("run_full_loop", expected_outputs=[]))
+
+    assert result["ok"] is True
+    assert "model_calls_reconciliation_refused" in (tmp_path / "run" / "agent_events.jsonl").read_text(encoding="utf-8")

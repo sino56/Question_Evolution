@@ -586,6 +586,8 @@ class Executor:
         self.ledger[key] = entry
         self._save_ledger()
         self.budget_ledger.record_tool_call(tool, tool_call_id=call_id, duration_seconds=float(result.get("duration_seconds") or 0), ok=bool(result.get("ok")))
+        if result.get("ok") and spec.cost_policy == "model_billed" and "model_calls" in self.budget_ledger.hard_limits:
+            self._reconcile_model_call_budget(result, call_id=call_id)
         save_ledger(self.run_dir, self.budget_ledger)
         self._write_observations(observation_items)
         event_type = "tool_completed" if result.get("ok") else "tool_failed"
@@ -599,6 +601,39 @@ class Executor:
             if result.get("experiment_dir"):
                 self.update_state(self.run_dir, self.state, experiment_dir=result["experiment_dir"])
         return result
+
+    def _reconcile_model_call_budget(self, result: Mapping[str, Any], *, call_id: str) -> None:
+        """Reconcile the coarse pre-run unit charge with the measured spend.
+
+        ``execute_step`` charges one ``model_calls`` unit before a model-billed
+        tool runs so a hard limit bites before the spend.  A full pipeline run
+        actually makes many model calls, so once the experiment publishes
+        ``experiment_statistics.json`` the measured count replaces the
+        placeholder and the ledger tracks real consumption.
+        """
+
+        experiment_dir = result.get("experiment_dir")
+        if not experiment_dir:
+            return
+        statistics_path = Path(str(experiment_dir)) / "experiment_statistics.json"
+        if not statistics_path.is_file():
+            return
+        try:
+            payload = json.loads(statistics_path.read_text(encoding="utf-8"))
+            measured = int(payload["model_calls"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return
+        if measured <= 0:
+            return
+        delta = float(measured) - 1.0
+        if delta <= 0:
+            return
+        try:
+            self.budget_ledger.consume("model_calls", UNALLOCATED_TARGET, delta, evidence_ref={"tool": result.get("tool"), "tool_call_id": call_id, "source_ref": str(statistics_path), "measured": measured})
+        except BudgetLedgerError as exc:
+            append_event(self.events_path, "model_calls_reconciliation_refused", {"tool": result.get("tool"), "tool_call_id": call_id, "measured": measured, "reason": str(exc)})
+            return
+        append_event(self.events_path, "model_calls_reconciled", {"tool": result.get("tool"), "tool_call_id": call_id, "measured": measured, "charged_total": self.budget_ledger.consumed_for("model_calls", UNALLOCATED_TARGET)})
 
     def rollback_to_previous_revision(self, *, reason: str) -> Optional[Dict[str, Any]]:
         """Roll the Session back to the plan revision this one replaced.

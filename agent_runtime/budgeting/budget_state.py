@@ -118,6 +118,26 @@ class BudgetLedger:
             if abs(total_remaining + total_consumed - hard_limit) > 1e-9:
                 raise BudgetLedgerError(f"ledger does not reconcile for {kind}")
 
+    def allocate(self, budget_type: str, target: str, amount: float, *, evidence_ref: Mapping[str, Any] | None = None) -> None:
+        """Move unused pooled allocation to a named target without consuming.
+
+        A fresh ledger holds every budget in ``pool:unallocated``.  Named
+        targets (for example ``operator:O16``) only become meaningful once an
+        initial allocation exists; otherwise the reallocator sees
+        ``remaining <= 0`` everywhere and the dynamic transfer can never fire.
+        """
+
+        amount = _number(amount, field_name="allocation amount")
+        if budget_type not in self.hard_limits:
+            raise BudgetLedgerError(f"budget type is not configured: {budget_type}")
+        pooled = self.remaining_for(budget_type, UNALLOCATED_TARGET)
+        if amount > pooled + 1e-9:
+            raise BudgetLedgerError(f"allocation exceeds the unallocated pool for {budget_type}")
+        self.allocations[budget_type][UNALLOCATED_TARGET] = pooled - amount
+        self.allocations[budget_type][target] = self.remaining_for(budget_type, target) + amount
+        self.events.append({"event_type": "budget_allocated", "created_at": _now(), "budget_type": budget_type, "target": target, "amount": amount, "evidence_ref": dict(evidence_ref or {})})
+        self.validate()
+
     def consume(self, budget_type: str, target: str, amount: float, *, evidence_ref: Mapping[str, Any] | None = None) -> None:
         amount = _number(amount, field_name="consumption amount")
         available = self.remaining_for(budget_type, target)
