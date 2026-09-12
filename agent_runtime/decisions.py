@@ -15,6 +15,13 @@ from .recovery import FALLBACK_RECIPE_ID, RECIPE_INDEX, recipe_fields, select_re
 from .task import AgentTask
 
 
+# A single not_applicable branch is a normal operator-routing signal, not a
+# session-level failure (the project rule: do not penalise the whole operator
+# family, prefer post-hoc feedback over upfront vetoes).  Only a repeated
+# pattern escalates to mandatory human review.
+NOT_APPLICABLE_REVIEW_THRESHOLD = 3
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -121,8 +128,12 @@ def decide_next_action(
         decision = {"action": "stop_and_report", "reason": "score_increased is negative gain and requires human review", "requires_human_review": True,
                     "terminal_reason": "manual_review_required"}
     elif "not_applicable" in observation_types or int(observation.get("not_applicable_count") or 0) > 0:
-        decision = {"action": "stop_and_report", "reason": "operator applicability issue observed; do not penalize the whole operator family", "requires_human_review": True,
-                    "terminal_reason": "manual_review_required"}
+        count = int(observation.get("not_applicable_count") or 0)
+        escalate = count >= NOT_APPLICABLE_REVIEW_THRESHOLD
+        decision = {"action": "stop_and_report",
+                    "reason": f"operator applicability issue observed on {count} branch(es); do not penalize the whole operator family",
+                    "requires_human_review": escalate,
+                    "terminal_reason": "manual_review_required" if escalate else "not_applicable_observed"}
     elif "judge_instability_detected" in observation_types:
         recipe_id = "judge_instability"
         decision = {"action": "suspend", "reason": "journal quality is unstable; attribution must pause and the affected samples must be re-evaluated",

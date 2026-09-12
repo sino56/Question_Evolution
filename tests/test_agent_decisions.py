@@ -52,3 +52,17 @@ def test_reflector_rules_separate_negative_gain_and_retryable_system_failure(tmp
     retryable = decide_next_action(task(tmp_path), observation(observations=[{"type": "tool_retryable_failure"}]))
     assert retryable["action"] == "suspend"
     assert retryable["terminal_reason"] == "retryable_tool_failure"
+
+
+def test_not_applicable_escalates_only_as_a_repeated_pattern(tmp_path):
+    # A single not_applicable branch is a normal operator-routing signal:
+    # it must not force a human review by itself.
+    single = decide_next_action(task(tmp_path), observation(not_applicable_count=1))
+    assert single["action"] == "stop_and_report"
+    assert single["requires_human_review"] is False
+    assert single["terminal_reason"] == "not_applicable_observed"
+
+    repeated = decide_next_action(task(tmp_path), observation(not_applicable_count=3))
+    assert repeated["action"] == "stop_and_report"
+    assert repeated["requires_human_review"] is True
+    assert repeated["terminal_reason"] == "manual_review_required"

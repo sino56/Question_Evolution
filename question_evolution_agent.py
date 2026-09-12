@@ -36,9 +36,32 @@ ROOT = Path(__file__).resolve().parent
 MAX_SESSION_ROUNDS = 3
 MAX_SESSION_ROLLBACKS = 1
 RESUMABLE_SESSION_STATUSES = {"planned", "executing", "observing", "replanning", "suspended", "stopped", "blocked", "failed"}
+# Snapshot housekeeping: a fresh snapshot is created per Session, so the
+# snapshot directory needs a bounded retention window (report M-9).
+MEMORY_SNAPSHOT_KEEP = 20
 
 
-def _memory_runtime(task: AgentTask, *, preferred_snapshot_id: str = "") -> tuple[dict[str, Any], dict[str, Any], str | None, dict[str, Any]]:
+def _prune_memory_snapshots(store: GlobalMemoryStore, run_dir: Path | None, *, protect: str) -> None:
+    """Bound the snapshot directory; housekeeping must never block a Session."""
+
+    try:
+        pruned = store.prune_snapshots(keep=MEMORY_SNAPSHOT_KEEP, protect=[protect])
+    except Exception as exc:
+        if run_dir is not None:
+            append_event(Path(run_dir) / "agent_events.jsonl", "memory_snapshot_prune_skipped", {"reason": str(exc)})
+        return
+    if run_dir is not None and pruned.get("removed"):
+        append_event(Path(run_dir) / "agent_events.jsonl", "memory_snapshots_pruned", {
+            "removed_count": len(pruned["removed"]), "kept": pruned["kept"],
+        })
+
+
+def _memory_runtime(
+    task: AgentTask,
+    *,
+    preferred_snapshot_id: str = "",
+    run_dir: Path | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], str | None, dict[str, Any]]:
     """Freeze memory before planning.
 
     Returns ``(snapshot, context, snapshot_path, audit)``.  The audit block makes
@@ -77,9 +100,26 @@ def _memory_runtime(task: AgentTask, *, preferred_snapshot_id: str = "") -> tupl
                 "memory_degraded": True,
                 "memory_degraded_reason": "the resumed session did not record its original memory snapshot",
             })
+        _prune_memory_snapshots(store, run_dir, protect=str(snapshot["memory_snapshot_id"]))
     read_allowed = task.allow_global_memory_read and not audit["memory_degraded"] and snapshot.get("mode") == "global_memory"
     if read_allowed:
-        context = store.retrieve(snapshot_id=str(snapshot["memory_snapshot_id"]), query=task.goal, top_k=3)
+        try:
+            context = store.retrieve(snapshot_id=str(snapshot["memory_snapshot_id"]), query=task.goal, top_k=3)
+        except SnapshotUnavailable as exc:
+            # A frozen card evolved after the snapshot was taken: serving the
+            # evolved body under the old identity would break reproducibility,
+            # but hard-blocking the Session is disproportionate (R-4 treats a
+            # missing snapshot the same way).  Degrade explicitly instead.
+            audit.update({
+                "memory_mode": "degraded_snapshot_mismatch",
+                "memory_degraded": True,
+                "memory_degraded_reason": f"the frozen memory snapshot {requested or snapshot['memory_snapshot_id']} no longer matches the evolved cards: {exc}",
+            })
+            context = {
+                "memory_snapshot_id": snapshot["memory_snapshot_id"], "memory_context_key": None,
+                "retrieval_config_version": RETRIEVAL_CONFIG_VERSION, "top_k": 0, "cards": [],
+                "mode": "no_global_memory",
+            }
     else:
         # Reference the single source of truth instead of a hard-coded literal:
         # a duplicated version string drifts from the real retriever (V-1/V-2).
@@ -294,7 +334,8 @@ def run_agent(
     write_task(run_dir, task.as_dict())
     try:
         snapshot, memory_context, snapshot_path, memory_audit = _memory_runtime(
-            task, preferred_snapshot_id=str(state.get("memory_snapshot_id") or "") if resumed else ""
+            task, preferred_snapshot_id=str(state.get("memory_snapshot_id") or "") if resumed else "",
+            run_dir=run_dir,
         )
     except SnapshotUnavailable as exc:
         observation = _blocked_observation(str(exc), task.resume_exp_dir)

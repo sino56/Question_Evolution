@@ -633,3 +633,71 @@ def test_a_session_bootstrap_freezes_memory_without_inventing_content(tmp_path, 
     assert context["cards"] == []
     assert context["mode"] == "no_global_memory"
     assert audit["memory_degraded"] is False
+
+
+# --------------------------------------------------------------------------- snapshot drift & housekeeping
+
+
+def _seed_global_memory_card(store):
+    experiment = store.project_root / "experiments" / "day" / "exp1"
+    source = experiment / "memory" / "failure_memory_bank.jsonl"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "sample_id": "sample-1", "round": 2, "operator_used": "O16",
+        "failure_type": "score_increased", "failure_reason": "O16 score_increased repeatedly",
+        "sample_signature": {"scene_family": "traffic", "question_form": "necessity", "reasoning_mechanism": "joint conditions"},
+    }
+    source.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+    store.extract(experiment)
+    store.integrate()
+
+
+def test_a_drifted_frozen_snapshot_degrades_instead_of_blocking(tmp_path, monkeypatch):
+    import sqlite3
+
+    monkeypatch.setattr(cli, "ROOT", tmp_path)
+    store = GlobalMemoryStore(tmp_path)
+    _seed_global_memory_card(store)
+    snapshot_id = store.create_snapshot()["memory_snapshot_id"]
+
+    # Another Session evolves the card after this snapshot was frozen.
+    con = sqlite3.connect(store.db_path)
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT card_id, body FROM cards").fetchone()
+    body = json.loads(row["body"])
+    body["reasoning_mechanism"] = "MUTATED-AFTER-SNAPSHOT"
+    con.execute("UPDATE cards SET body = ? WHERE card_id = ?", (json.dumps(body), row["card_id"]))
+    con.commit()
+    con.close()
+
+    task = _task(tmp_path, allow_global_memory_read=True)
+    snapshot, context, _path, audit = cli._memory_runtime(task, preferred_snapshot_id=snapshot_id)
+
+    # Serving evolved cards under the old identity would break reproducibility,
+    # but the Session must continue with an explicit degradation (R-4 parity).
+    assert audit["memory_mode"] == "degraded_snapshot_mismatch"
+    assert audit["memory_degraded"] is True
+    assert "no longer matches the evolved cards" in audit["memory_degraded_reason"]
+    assert context["cards"] == []
+    assert context["mode"] == "no_global_memory"
+    assert snapshot["memory_snapshot_id"] == snapshot_id
+
+
+def test_fresh_session_prunes_old_memory_snapshots(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "ROOT", tmp_path)
+    snapshots_dir = tmp_path / "memory_global" / "snapshots"
+    snapshots_dir.mkdir(parents=True)
+    for index in range(24):
+        stale = {
+            "memory_snapshot_id": f"MSNAP-old{index:03d}",
+            "created_at": f"2020-01-01T00:00:{index:02d}+00:00",
+            "mode": "no_global_memory", "card_versions": {}, "card_fingerprints": {},
+        }
+        (snapshots_dir / f"MSNAP-old{index:03d}.json").write_text(json.dumps(stale), encoding="utf-8")
+
+    snapshot, _context, _path, _audit = cli._memory_runtime(_task(tmp_path), run_dir=tmp_path / "run")
+
+    remaining = sorted(path.name for path in snapshots_dir.glob("MSNAP-*.json"))
+    assert len(remaining) == cli.MEMORY_SNAPSHOT_KEEP
+    assert f"{snapshot['memory_snapshot_id']}.json" in remaining
+    assert "memory_snapshots_pruned" in (tmp_path / "run" / "agent_events.jsonl").read_text(encoding="utf-8")
