@@ -15,6 +15,9 @@ both sides reference it:
 
 from __future__ import annotations
 
+import os
+from typing import Iterable, Mapping
+
 
 # Resolution order, highest precedence first.  Anything not listed below still
 # follows "explicit environment beats the script default".
@@ -74,14 +77,15 @@ def parse_script_declaration(text: str) -> set[str]:
     return set()
 
 
-def resolved_environment(environ: "object", *, names: "object" = None) -> dict[str, str]:
+def resolved_environment(environ: Mapping[str, str] | None = None, *, names: Iterable[str] | None = None) -> dict[str, str]:
     """Return the resolved values of the injectable variables for auditing.
 
     The design requires the *resolved* cross-layer values to be inspectable; an
     implicit environment hand-off otherwise leaves no record of what a run
-    actually used.
+    actually used.  ``os.environ`` is a ``Mapping``, so the default accepts the
+    live process environment directly.
     """
 
-    mapping = environ if isinstance(environ, dict) else {}
+    mapping: Mapping[str, str] = os.environ if environ is None else environ
     selected = names if names is not None else AGENT_INJECTABLE_ENV
     return {name: str(mapping[name]) for name in sorted(selected) if mapping.get(name) not in (None, "")}

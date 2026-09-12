@@ -16,7 +16,7 @@ from agent_runtime.budgeting import (
 from agent_runtime.context import build_context_pack
 from agent_runtime.contracts import ContractViolation
 from agent_runtime.events import append_event
-from agent_runtime.multi_agent.coordinator import run_post_experiment_review
+from agent_runtime.multi_agent.coordinator import run_human_review_precheck, run_post_experiment_review
 from agent_runtime.global_judge import mount_judge_for_review
 from agent_runtime.global_memory import RETRIEVAL_CONFIG_VERSION, GlobalMemoryStore, SnapshotUnavailable, router_cache_key
 from agent_runtime.executor import Executor, ExecutorError, supersede_tool_ledger
@@ -640,6 +640,13 @@ def run_agent(
         requires_manual_review=manual_review,
         manual_review_status="pending" if manual_review else None,
     )
+    human_review_precheck: Dict[str, Any] = {}
+    if manual_review and status in {"suspended", "blocked"}:
+        # The precheck advisor stage prepares the prioritised review aid; it is
+        # advisory-only and fails open, so a degradation never blocks the report.
+        human_review_precheck = run_human_review_precheck(
+            run_dir, task=task.as_dict(), state=state, plan=plan, observation=observation,
+        )
     global_judge: Dict[str, Any] = {}
     if command == "review":
         # V-6: mount the offline Global Judge on the review path.  It is
@@ -657,7 +664,7 @@ def run_agent(
             global_judge = {"status": "degraded", "reason": "no experiment directory was resolved for the review"}
     report_step = next((step for step in plan["steps"] if step.get("tool_name") == "write_agent_report"), None)
     if report_step and executor is not None:
-        executor.execute_report(report_step, lambda: write_agent_report(run_dir, task=task.as_dict(), state=state, plan=plan, observation=observation, tool_results=results, decision=decision, multi_agent_review=multi_agent_review, global_judge=global_judge))
+        executor.execute_report(report_step, lambda: write_agent_report(run_dir, task=task.as_dict(), state=state, plan=plan, observation=observation, tool_results=results, decision=decision, multi_agent_review=multi_agent_review, global_judge=global_judge, human_review_precheck=human_review_precheck))
     if command == "review":
         write_global_review_artifacts(run_dir, observation, global_judge=global_judge)
     return (2 if status == "blocked" else 0), run_dir

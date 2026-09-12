@@ -89,6 +89,25 @@ def _render_global_judge(lines: list[str], judge: Mapping[str, Any]) -> None:
     ])
 
 
+def _render_human_review_precheck(lines: list[str], precheck: Mapping[str, Any]) -> None:
+    """Render the machine-prepared review aid (advisory-only, never a confirmation)."""
+
+    if not precheck:
+        return
+    merge = dict(precheck.get("merge") or {})
+    records = list(precheck.get("advisor_records") or [])
+    lines.extend([
+        "",
+        "## Human review precheck (advisory aid)",
+        f"- Degraded: {precheck.get('degraded_reason') or 'no'}",
+        f"- Precheck advisors: {len(records)} ({', '.join(str(item.get('advisor_id')) + ':' + str(item.get('status')) for item in records) or 'none'})",
+        f"- Accepted advice: {len(merge.get('accepted_advice') or [])}",
+        f"- Policy-rejected advice: {len(merge.get('policy_rejections') or [])}",
+        f"- Conflicting advice: {len(merge.get('conflicts') or [])}",
+        "- This is a prioritised review aid; no candidate is confirmed by it.",
+    ])
+
+
 def write_agent_report(
     run_dir: str | Path,
     *,
@@ -100,6 +119,7 @@ def write_agent_report(
     decision: Optional[Mapping[str, Any]] = None,
     multi_agent_review: Optional[Mapping[str, Any]] = None,
     global_judge: Optional[Mapping[str, Any]] = None,
+    human_review_precheck: Optional[Mapping[str, Any]] = None,
 ) -> Path:
     run_path = Path(run_dir)
     skill_load = load_stage_skills(
@@ -179,6 +199,7 @@ def write_agent_report(
         lines.append("- These are read-only recommendations. They do not change scores, formal artifacts, prompts, operators, Router output, or active Memory.")
         _render_independence(lines, review)
     _render_global_judge(lines, dict(global_judge or {}))
+    _render_human_review_precheck(lines, dict(human_review_precheck or {}))
     return _write(run_path / "agent_report.md", "\n".join(lines) + "\n")
 
 

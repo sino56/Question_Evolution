@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional
 
-from .env_contract import INNER_LOOP_MARKER
+from .env_contract import INNER_LOOP_MARKER, resolved_environment
 from .events import append_event, summarize_text
 from .policy import validate_env_overrides
 from .task import AgentTask
@@ -314,6 +314,7 @@ class ToolRegistry:
                     "tool": tool, "tool_version": spec.version, "tool_call_id": call_id,
                     "idempotency_key": idempotency_key, "attempt": attempt,
                     "timeout_seconds": spec.timeout_seconds, "command": command, "env_keys": sorted(allowed_env),
+                    "resolved_env": resolved_environment(environment),
                 })
             started = time.monotonic()
             try:

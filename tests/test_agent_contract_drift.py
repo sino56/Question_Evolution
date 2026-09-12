@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from agent_runtime.context_layers import TOOL_REGISTRY_ORDER
-from agent_runtime.env_contract import AGENT_INJECTABLE_ENV, parse_script_declaration
+from agent_runtime.env_contract import AGENT_INJECTABLE_ENV, parse_script_declaration, resolved_environment
 from agent_runtime.observer import MANIFEST_STATUSES, OBSERVATION_TYPES, BUDGET_TERMINAL_REASONS
 from agent_runtime.policy import DECISIONS, ENV_ALLOWLIST, PLAN_KINDS, _REQUIRED_STEP_FIELDS, _REQUIRED_TOOL_OUTPUTS
 from agent_runtime.recovery import RECOVERY_ACTIONS
@@ -268,3 +268,15 @@ def test_reset_failed_sidecar_removes_only_the_stale_sidecar(tmp_path):
     # Idempotent when no sidecar exists.
     reset_failed_sidecar(output)
     assert output.is_file()
+
+
+def test_resolved_environment_accepts_the_live_process_environment(monkeypatch):
+    monkeypatch.setenv("SEARCH_MODE", "single_branch")
+    monkeypatch.setenv("INPUT_FILE", "data/data.jsonl")
+
+    resolved = resolved_environment()
+    assert resolved["SEARCH_MODE"] == "single_branch"
+    assert resolved["INPUT_FILE"] == "data/data.jsonl"
+
+    # Explicit mappings are accepted as-is (tool-side audit projection).
+    assert resolved_environment({"SEARCH_MODE": "multi_operator_branch"}) == {"SEARCH_MODE": "multi_operator_branch"}

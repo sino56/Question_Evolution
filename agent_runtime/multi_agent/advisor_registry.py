@@ -6,9 +6,9 @@ from dataclasses import asdict, dataclass
 from typing import Dict, Iterable, Mapping
 
 MODEL_TIERS = {"extract_low_cost", "reasoning_medium", "reasoning_high", "synthesis_high"}
-STAGES = {"post_experiment_review", "memory_compilation", "plan_candidates", "human_review_precheck"}
+STAGES = {"post_experiment_review", "memory_compilation", "human_review_precheck"}
 GLOBAL_FORBIDDEN_TOOLS = {"spawn_advisor", "ask_user", "run_full_loop", "resume_full_loop", "write_formal_artifact", "publish_active_memory", "modify_prompt", "modify_operator", "modify_score"}
-ALLOWED_TOOLS = {"read_evidence_pack", "read_artifact_ref", "read_memory_ledger", "read_context_pack", "read_policy_snapshot", "read_candidate_summary", "write_temp_advice", "write_strategy_card_draft", "write_plan_candidate", "write_review_precheck"}
+ALLOWED_TOOLS = {"read_evidence_pack", "read_artifact_ref", "read_memory_ledger", "read_context_pack", "read_policy_snapshot", "read_candidate_summary", "write_temp_advice", "write_strategy_card_draft", "write_review_precheck"}
 
 
 @dataclass(frozen=True)
@@ -46,10 +46,6 @@ def _memory(advisor_id: str, purpose: str, *, tier: str = "reasoning_high") -> A
     return AdvisorSpec(advisor_id, advisor_id.replace("_", " "), "memory_compilation", purpose, "memory_compilation_requested", ("evidence_pack.summary", "evidence_pack.memory_summary", "evidence_pack.evidence_refs"), ("read_memory_ledger", "read_evidence_pack", "write_strategy_card_draft"), tier, "reasoning_medium")
 
 
-def _plan(advisor_id: str, purpose: str) -> AdvisorSpec:
-    return AdvisorSpec(advisor_id, advisor_id.replace("_", " "), "plan_candidates", purpose, "plan_candidates_requested", ("evidence_pack.summary", "evidence_pack.observations", "evidence_pack.snapshot_ids"), ("read_context_pack", "read_policy_snapshot", "write_plan_candidate"), "reasoning_high", "reasoning_medium")
-
-
 def _precheck(advisor_id: str, purpose: str) -> AdvisorSpec:
     return AdvisorSpec(advisor_id, advisor_id.replace("_", " "), "human_review_precheck", purpose, "human_review_precheck_requested", ("evidence_pack.summary", "evidence_pack.observations", "evidence_pack.evidence_refs"), ("read_candidate_summary", "read_artifact_ref", "write_review_precheck"), "reasoning_medium", "extract_low_cost")
 
@@ -65,10 +61,6 @@ _SPECS = (
     _memory("strategy_induction", "Induce proposed strategy-card drafts."),
     _memory("conflict_review", "Find conflicts with failure and instability evidence."),
     _memory("publication_precheck", "Recommend only proposed, shadow, review, or rejection states.", tier="synthesis_high"),
-    _plan("conservative_plan", "Produce a low-risk, budget-constrained candidate plan."),
-    _plan("exploration_plan", "Produce a bounded horizontal-search candidate plan."),
-    _plan("vertical_stack_plan", "Assess a bounded two-layer operator plan."),
-    _plan("recovery_plan", "Produce a checkpoint-preserving recovery candidate plan."),
     _precheck("boundary_quality", "Classify boundary-evidence quality for human review."),
     _precheck("answerability", "Precheck whether a candidate remains answerable."),
     _precheck("leakage_risk", "Precheck answer and scaffold leakage risk."),

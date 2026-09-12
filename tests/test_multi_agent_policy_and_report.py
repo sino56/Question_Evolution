@@ -1,15 +1,7 @@
 from agent_runtime.multi_agent.coordinator import run_post_experiment_review
-from agent_runtime.multi_agent.planning_advisors import validate_candidate_plan
 from agent_runtime.multi_agent.memory_advisors import build_strategy_card_draft
 from agent_runtime.reporter import write_agent_report
 from agent_runtime.task import parse_agent_task
-
-
-def test_candidate_plan_must_pass_normal_plan_validator(tmp_path):
-    task = parse_agent_task({"goal": "run", "input_file": "data/data.jsonl"}, project_root=__import__("pathlib").Path.cwd())
-    ok, reason = validate_candidate_plan(task, {"plan_id": "bad", "steps": []})
-    assert not ok
-    assert reason
 
 
 def test_memory_draft_cannot_become_active_and_missing_evidence_needs_review():
@@ -28,3 +20,35 @@ def test_post_experiment_advisors_are_advisory_and_reported(tmp_path):
     content = path.read_text(encoding="utf-8")
     assert "Multi-agent review advice" in content
     assert review["merge"]["advisory_only"] is True
+
+
+def test_report_renders_the_human_review_precheck_aid(tmp_path):
+    precheck = {
+        "evidence_pack_hash": "sha256:abc",
+        "advisor_records": [{"advisor_id": "boundary_quality", "status": "completed"}, {"advisor_id": "review_synthesis", "status": "completed"}],
+        "merge": {"accepted_advice": [{"advisor_id": "boundary_quality"}], "policy_rejections": [], "conflicts": []},
+    }
+    path = write_agent_report(
+        tmp_path, task={"goal": "g"}, state={"status": "suspended", "requires_manual_review": True},
+        plan={"budget": {}}, observation={"status": "observed", "evidence_refs": []}, tool_results=[],
+        decision={"action": "stop_and_report", "reason": "review needed"}, human_review_precheck=precheck,
+    )
+    content = path.read_text(encoding="utf-8")
+    assert "Human review precheck (advisory aid)" in content
+    assert "boundary_quality:completed" in content
+    assert "no candidate is confirmed" in content
+
+
+def test_human_review_precheck_stage_fails_open(tmp_path):
+    from agent_runtime.multi_agent.coordinator import run_human_review_precheck
+
+    common = {"task": {"goal": "review"}, "state": {"agent_run_id": "run", "memory_snapshot_id": "m"}, "plan": {"plan_id": "p"}, "observation": {"experiment_dir": "x", "status": "observed", "evidence_refs": [{"path": "x"}]}}
+    result = run_human_review_precheck(tmp_path, **common)
+    assert result["advisor_records"], "the wired precheck stage must actually run advisors"
+    assert result["advisor_records"][-1]["advisor_id"] == "review_synthesis"
+    degraded = run_human_review_precheck(
+        tmp_path, task={"goal": "review"}, state={"agent_run_id": "run", "memory_snapshot_id": "m"},
+        plan={"plan_id": "p"}, observation={"status": "blocked", "blocked_reason": "no artifacts"},
+    )
+    # Fail-open: a degraded run returns an explicit, empty advisory result.
+    assert isinstance(degraded, dict)

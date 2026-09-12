@@ -56,3 +56,53 @@ def test_memory_stage_is_serial_and_review_synthesis_follows_prechecks(tmp_path)
     assert [record["advisor_id"] for record in memory["advisor_records"]] == ["fact_extraction", "classification_mapping", "strategy_induction", "conflict_review", "publication_precheck"]
     review = run_advisor_stage(tmp_path / "review", stage="human_review_precheck", **common)
     assert review["advisor_records"][-1]["advisor_id"] == "review_synthesis"
+
+
+def test_timeout_keeps_the_task_id_audit_chain_and_suppresses_late_output(tmp_path):
+    import json as _json
+
+    spec = replace(get_advisor("search_cost"), max_runtime_seconds=1, retry_count=0)
+
+    def handler(spec, context, selection):
+        time.sleep(1.2)
+        return {"summary": "late", "findings": [], "forbidden_actions_requested": []}
+
+    executor = AdvisorExecutor(tmp_path, parent_run_id="run", handler=handler)
+    records, _ = executor.execute([spec], _pack(tmp_path))
+
+    timeout_ids = [record["advisor_task_id"] for record in records if record["status"] == "timeout"]
+    assert timeout_ids, "expected a timeout record"
+    started = []
+    events_path = tmp_path / "multi_agent" / "advisor_events.jsonl"
+    for line in events_path.read_text(encoding="utf-8").splitlines():
+        event = _json.loads(line)
+        if event.get("event_type") == "advisor_started":
+            started.append(event["advisor_task_id"])
+    # The timeout record must reference the same advisor task that started.
+    assert set(timeout_ids).issubset(set(started))
+    # A late finishing worker must not publish a contradicting output file.
+    output = tmp_path / "multi_agent" / "advice" / spec.advisor_id / "advisor_output.json"
+    assert not output.exists()
+
+
+def test_deterministic_handlers_with_injected_models_are_labelled_deterministic(tmp_path, monkeypatch):
+    monkeypatch.delenv("ADVISOR_BASE_URL", raising=False)
+    monkeypatch.delenv("ADVISOR_API_KEY", raising=False)
+
+    def handler(spec, context, selection):
+        return {"summary": "ok", "findings": [], "forbidden_actions_requested": []}
+
+    records, _ = AdvisorExecutor(
+        tmp_path, parent_run_id="run", handler=handler, models={"reasoning_high": "external-model"},
+    ).execute([get_advisor("router_diagnosis")], _pack(tmp_path))
+
+    # Without provider credentials the advice is deterministic; recording it
+    # under the external model name would overstate the evidence (V-8).
+    assert records[0]["selected_model"] == "local-deterministic-advisor"
+
+
+def test_plan_candidates_stage_is_retired_from_the_registry():
+    from agent_runtime.multi_agent.advisor_registry import STAGES, list_advisors
+
+    assert "plan_candidates" not in STAGES
+    assert list_advisors(stage="plan_candidates") == []

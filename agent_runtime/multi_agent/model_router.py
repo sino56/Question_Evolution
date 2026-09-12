@@ -11,6 +11,9 @@ from .advisor_registry import MODEL_TIERS
 from ..skills import load_stage_skills
 
 MODEL_ROUTER_VERSION = "advisor-model-router-v1"
+# Single source for the deterministic adapter identity; the coordinator's
+# independence report and the executor both compare against this exact value.
+DETERMINISTIC_ADVISOR_MODEL = "local-deterministic-advisor"
 
 
 @dataclass(frozen=True)

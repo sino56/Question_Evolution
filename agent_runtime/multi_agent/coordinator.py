@@ -10,10 +10,8 @@ from .advisor_dispatcher import dependent_advisors, select_advisors
 from .advisor_executor import AdvisorExecutor
 from .evidence_pack import build_evidence_pack
 from .human_review_advisors import synthesize_prechecks
+from .model_router import DETERMINISTIC_ADVISOR_MODEL
 from ..skills import load_stage_skills
-
-
-DETERMINISTIC_ADVISOR_MODEL = "local-deterministic-advisor"
 
 
 def advisor_independence(records: Any) -> dict[str, Any]:
@@ -93,6 +91,29 @@ def run_post_experiment_review(
         # V-8: the realised independence of this review is part of its artifact.
         "independence": advisor_independence(records),
     }
+
+
+def run_human_review_precheck(
+    run_dir: str | Path,
+    *,
+    task: Mapping[str, Any],
+    state: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    observation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Run the human-review precheck advisors for a Session stopped for review.
+
+    The precheck stage was registered but never wired into any run path, so the
+    review queue had no machine-prepared prioritised review aid.  Like every
+    advisor stage it is advisory-only and fails open.
+    """
+
+    try:
+        return run_advisor_stage(
+            run_dir, stage="human_review_precheck", task=task, state=state, plan=plan, observation=observation,
+        )
+    except Exception as exc:
+        return {"degraded_reason": str(exc), "advisor_records": [], "merge": {"accepted_advice": [], "policy_rejections": [], "conflicts": []}}
 
 
 def run_advisor_stage(
