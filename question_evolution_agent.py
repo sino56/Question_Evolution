@@ -19,7 +19,7 @@ from agent_runtime.events import append_event
 from agent_runtime.multi_agent.coordinator import run_post_experiment_review
 from agent_runtime.global_judge import mount_judge_for_review
 from agent_runtime.global_memory import RETRIEVAL_CONFIG_VERSION, GlobalMemoryStore, SnapshotUnavailable, router_cache_key
-from agent_runtime.executor import Executor, ExecutorError
+from agent_runtime.executor import Executor, ExecutorError, supersede_tool_ledger
 from agent_runtime.observer import observe_experiment
 from agent_runtime.planner import build_plan, plan_env_overrides
 from agent_runtime.policy import PolicyViolation, validate_plan
@@ -460,14 +460,19 @@ def run_agent(
         if decision["action"] in {"run_pipeline", "resume_pipeline", "run_review"}:
             # O-2: the Session continues instead of parking every round.  Each
             # continuation is a *new plan revision* in the same Session, so the
-            # ledger and checkpoint keep their meaning.
+            # ledger and checkpoint keep their meaning -- and the continuation
+            # must actually *do* the pending work: the confirmed checkpoint is
+            # released and recorded side-effecting calls are superseded, so the
+            # new revision re-executes instead of being skipped or replayed.
             rounds_used += 1
             append_event(run_dir / "agent_events.jsonl", "session_round_started", {
                 "session_id": state.get("session_id"), "round": rounds_used,
                 "action": decision["action"], "plan_revision": state.get("plan_revision"),
                 "continuations_remaining": continuations_remaining, "reason": decision["reason"],
             })
-            update_state(run_dir, state, status="replanning", current_step_id=None)
+            supersede_tool_ledger(run_dir, reason=f"control_loop_continue:{decision['action']}")
+            update_state(run_dir, state, status="replanning", current_step_id=None, completed_step_ids=[])
+            continuation_experiment_dir = str(state.get("experiment_dir") or task.resume_exp_dir or "")
             continuation_context = build_context_pack(
                 task, plan=plan, observation=observation, previous_decision=decision,
                 memory_context=memory_context, runtime_state=state,
@@ -477,7 +482,10 @@ def run_agent(
                 run_dir,
                 state,
                 _bind_memory_identity(
-                    build_plan(task, command=command, context_pack=continuation_context),
+                    build_plan(
+                        task, command=command, context_pack=continuation_context,
+                        continuation_experiment_dir=continuation_experiment_dir,
+                    ),
                     task=task, command=command, snapshot=snapshot, memory_context=memory_context,
                 ),
                 trigger_reason=f"control_loop_continue:{decision['action']}",
@@ -497,6 +505,9 @@ def run_agent(
             if rolled_back is not None:
                 rollbacks_used += 1
                 plan = rolled_back
+                # A rolled-back retry means "execute again": recorded
+                # side-effecting results must not be replayed from the ledger.
+                supersede_tool_ledger(run_dir, reason=f"rollback_retry:{decision.get('recovery_recipe_id') or ''}")
                 # The rolled-back revision is the previous, already-executed
                 # plan: its steps are deliberately *not* marked completed, so the
                 # retry re-runs them against the current evidence.

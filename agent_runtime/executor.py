@@ -39,6 +39,25 @@ _STEP_ARGUMENT_ENV_ALIASES = {
 }
 # Positional tool parameters that are never environment overrides.
 _STEP_ARGUMENT_POSITIONAL = {"experiment_dir", "start_round", "resume_exp_dir", "resume_start_round"}
+# Positional Step arguments that project onto ``AgentTask`` fields for tools
+# that receive the task object.  ``experiment_dir`` / ``start_round`` are the
+# Planner's argument spellings on a resume step; they let a control-loop
+# continuation target the Session's own discovered experiment directory
+# without mutating the frozen ``AgentTask``.
+_STEP_ARGUMENT_POSITIONAL_TASK_FIELDS = {
+    "resume_exp_dir": "resume_exp_dir",
+    "experiment_dir": "resume_exp_dir",
+    "resume_start_round": "resume_start_round",
+    "start_round": "resume_start_round",
+}
+# Idempotency fields that may arrive under the Planner's argument spellings.
+_IDEMPOTENCY_ARGUMENT_ALIASES = {
+    "resume_exp_dir": "experiment_dir",
+    "resume_start_round": "start_round",
+}
+# Side-effecting pipeline tools whose recorded results a continuation may
+# legitimately supersede (the Session decided more work must happen now).
+_SUPERSEDEABLE_TOOLS = ("run_full_loop", "resume_full_loop")
 # A decision must always be made against a *fresh* view of the artifacts, so a
 # read-only observation step is never skipped when a Session resumes or
 # continues.  The checkpoint saves the effecting work, not the ability to look
@@ -69,6 +88,49 @@ def _as_costing(result: Mapping[str, Any]) -> str:
 
 class ExecutorError(RuntimeError):
     """A precondition, budget, idempotency, or artifact failure."""
+
+
+def supersede_tool_ledger(
+    run_dir: str | Path,
+    *,
+    reason: str,
+    tools: Iterable[str] = _SUPERSEDEABLE_TOOLS,
+) -> list[str]:
+    """Drop recorded side-effecting results so a continuation re-executes them.
+
+    The idempotency ledger means "this exact call already produced its effect
+    inside this Session".  A control-loop continuation (or a rollback) decides
+    that more work must happen *now*, so the previous entry no longer covers
+    the upcoming execution: it is explicitly superseded instead of silently
+    replayed.  The key function itself stays plan-independent (T-2); only the
+    stored entries are removed, and the removal is auditable.
+    """
+
+    ledger_path = Path(run_dir) / "tool_idempotency.json"
+    if not ledger_path.is_file():
+        return []
+    try:
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ExecutorError(f"idempotency ledger is unreadable: {exc}") from exc
+    if not isinstance(ledger, dict):
+        raise ExecutorError("idempotency ledger must be a JSON object")
+    doomed = {str(tool) for tool in tools}
+    removed = sorted(
+        key for key, entry in ledger.items()
+        if isinstance(entry, Mapping) and str(entry.get("tool") or "") in doomed
+    )
+    if not removed:
+        return []
+    for key in removed:
+        ledger.pop(key)
+    temporary = ledger_path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(ledger_path)
+    append_event(Path(run_dir) / "agent_events.jsonl", "ledger_entry_superseded", {
+        "reason": reason, "superseded_keys": removed, "tools": sorted(doomed),
+    })
+    return removed
 
 
 def _arguments_to_env_overrides(arguments: Mapping[str, Any]) -> Dict[str, str]:
@@ -178,7 +240,7 @@ class Executor:
         temporary.write_text(json.dumps(self.ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         temporary.replace(self.ledger_path)
 
-    def _idempotency_key(self, step: Mapping[str, Any]) -> str:
+    def _idempotency_key(self, step: Mapping[str, Any], *, step_task: Optional[AgentTask] = None) -> str:
         """Return a plan-independent idempotency key.
 
         The key intentionally excludes ``plan_id``.  ``plan_id`` is regenerated
@@ -194,16 +256,24 @@ class Executor:
         spec = get_tool_spec(str(step["tool_name"]))
         inputs = dict(step.get("arguments") or step.get("inputs") or {})
         overrides = self._effective_env_overrides(step)
+        task_source = step_task if step_task is not None else self.task
         values: Dict[str, Any] = {}
         for field in spec.idempotency_key_fields:
             if field in inputs:
                 values[field] = inputs[field]
                 continue
+            alias = _IDEMPOTENCY_ARGUMENT_ALIASES.get(field)
+            if alias and alias in inputs:
+                values[field] = inputs[alias]
+                continue
             # Prefer the resolved environment contract: the same logical call
             # must yield the same key even when a step supplies its input
             # through ``arguments`` rather than through its own task field.
             env_key = _STEP_ARGUMENT_ENV_ALIASES.get(field, field.upper())
-            values[field] = overrides.get(env_key, getattr(self.task, field, None))
+            if env_key in overrides:
+                values[field] = overrides[env_key]
+                continue
+            values[field] = getattr(task_source, field, None)
         # The allowlist *is* the business-input whitelist, so the whole
         # validated environment contract participates in the key.  Relying on
         # ``idempotency_key_fields`` alone let a step change e.g.
@@ -231,9 +301,12 @@ class Executor:
     def _task_for_step(self, step: Mapping[str, Any]) -> AgentTask:
         """Apply Step arguments to a task copy for tools that take a task.
 
-        ``check_environment`` and ``observe_experiment`` receive the ``AgentTask``
-        object rather than a raw env mapping, so their documented arguments are
-        projected onto the task instead of being dropped.
+        ``check_environment`` / ``observe_experiment`` receive the ``AgentTask``
+        object rather than a raw env mapping, and ``run_full_loop`` /
+        ``resume_full_loop`` may be retargeted per step: the documented
+        positional arguments (``experiment_dir``/``resume_exp_dir``,
+        ``start_round``/``resume_start_round``) are projected onto the task
+        instead of being dropped.
         """
 
         values = _arguments_to_env_overrides(step.get("arguments") or step.get("inputs") or {})
@@ -249,6 +322,23 @@ class Executor:
                     raise ExecutorError(f"step argument {env_key} must be an integer") from exc
             else:
                 changes[field_name] = raw_value
+        arguments = dict(step.get("arguments") or step.get("inputs") or {})
+        for argument_name, field_name in _STEP_ARGUMENT_POSITIONAL_TASK_FIELDS.items():
+            if argument_name not in arguments:
+                continue
+            raw_value = arguments[argument_name]
+            if raw_value is None or not str(raw_value).strip():
+                continue
+            if field_name == "resume_start_round":
+                try:
+                    rounded = int(raw_value)
+                except (TypeError, ValueError) as exc:
+                    raise ExecutorError(f"step argument {argument_name} must be an integer") from exc
+                if rounded < 1:
+                    raise ExecutorError(f"step argument {argument_name} must be a positive integer")
+                changes[field_name] = rounded
+            else:
+                changes[field_name] = str(raw_value)
         return replace(self.task, **changes) if changes else self.task
 
     def _validate_step(self, step: Mapping[str, Any]) -> None:
@@ -284,18 +374,18 @@ class Executor:
             if used >= maximum:
                 raise ExecutorError(f"step budget exhausted for {tool}: {field_name}={maximum}")
 
-    def _validate_preconditions(self, step: Mapping[str, Any]) -> None:
+    def _validate_preconditions(self, step: Mapping[str, Any], step_task: AgentTask) -> None:
         prior = {str(result.get("tool")): result for result in self.results}
         for condition in step.get("preconditions") or []:
             if condition == "environment_checked":
                 if not bool(prior.get("check_environment", {}).get("ready")):
                     raise ExecutorError("environment precondition is not satisfied")
             elif condition == "existing_experiment_dir":
-                exp_dir = self.state.get("experiment_dir") or self.task.resume_exp_dir
+                exp_dir = step_task.resume_exp_dir or self.state.get("experiment_dir") or self.task.resume_exp_dir
                 if not exp_dir or not Path(exp_dir).is_dir():
                     raise ExecutorError("existing experiment directory is missing")
             elif condition == "resume_checkpoint_valid":
-                exp_dir = self.task.resume_exp_dir
+                exp_dir = step_task.resume_exp_dir or self.task.resume_exp_dir
                 if not exp_dir or not Path(exp_dir).is_dir():
                     raise ExecutorError("resume checkpoint directory is missing")
             elif condition in {"published_manifest_validation_required", "real_scoring_required"}:
@@ -386,19 +476,19 @@ class Executor:
             return False
         return True
 
-    def _run_step(self, step: Mapping[str, Any], *, idempotency_key: str, tool_call_id: str) -> Dict[str, Any]:
+    def _run_step(self, step: Mapping[str, Any], step_task: AgentTask, *, idempotency_key: str, tool_call_id: str) -> Dict[str, Any]:
         tool = str(step["tool_name"])
         spec = get_tool_spec(tool)
         env_overrides = self._effective_env_overrides(step)
         allow_retry = self._allow_retry(spec)
         if tool == "check_environment":
-            return self._invoke_registry("check_environment", self._task_for_step(step), tool_call_id=tool_call_id, idempotency_key=idempotency_key, allow_retry=allow_retry)
+            return self._invoke_registry("check_environment", step_task, tool_call_id=tool_call_id, idempotency_key=idempotency_key, allow_retry=allow_retry)
         if tool == "run_full_loop":
-            return self._invoke_registry("run_full_loop", self.task, env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key, allow_retry=allow_retry)
+            return self._invoke_registry("run_full_loop", step_task, env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key, allow_retry=allow_retry)
         if tool == "resume_full_loop":
-            return self._invoke_registry("resume_full_loop", self.task, env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key, allow_retry=allow_retry)
+            return self._invoke_registry("resume_full_loop", step_task, env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key, allow_retry=allow_retry)
         if tool == "observe_experiment":
-            exp_dir = self.state.get("experiment_dir") or self.task.resume_exp_dir
+            exp_dir = self.state.get("experiment_dir") or step_task.resume_exp_dir
             if not exp_dir:
                 raise ExecutorError("experiment directory could not be located")
             boundary_target = env_overrides.get("SEARCH_BOUNDARY_TARGET") or env_overrides.get("BOUNDARY_TARGET")
@@ -414,9 +504,10 @@ class Executor:
 
     def execute_step(self, step: Mapping[str, Any]) -> Dict[str, Any]:
         self._validate_step(step)
-        self._validate_preconditions(step)
+        step_task = self._task_for_step(step)
+        self._validate_preconditions(step, step_task)
         tool = str(step["tool_name"])
-        key = self._idempotency_key(step)
+        key = self._idempotency_key(step, step_task=step_task)
         # A read-only observation is exempt from both the checkpoint and the
         # ledger shortcut: every decision needs a fresh view of the artifacts,
         # so reusing a previous observation would make the loop decide on stale
@@ -427,6 +518,15 @@ class Executor:
             if isinstance(reused.get("observation"), Mapping):
                 self.observation = dict(reused["observation"])
             self.results.append(reused)
+            # A reused call is a confirmed effect, so it re-enters the Session
+            # checkpoint: after a continuation cleared the checkpoint, the
+            # dependent steps must still see this dependency as completed.
+            step_id = str(step.get("step_id") or "")
+            completed = list(self.state.get("completed_step_ids") or [])
+            if step_id and step_id not in completed:
+                completed.append(step_id)
+                self.update_state(self.run_dir, self.state, completed_step_ids=completed)
+                append_event(self.events_path, "checkpoint_confirmed", {"step_id": step_id, "tool": tool, "idempotency_key": key, "reused": True})
             return reused
 
         call_id = f"call_{uuid.uuid4().hex[:16]}"
@@ -443,7 +543,7 @@ class Executor:
         append_event(self.events_path, "tool_started", {"tool": tool, "tool_version": spec.version, "tool_call_id": call_id, "idempotency_key": key, "timeout_seconds": spec.timeout_seconds})
         started = time.monotonic()
         try:
-            result = self._run_step(step, idempotency_key=key, tool_call_id=call_id)
+            result = self._run_step(step, step_task, idempotency_key=key, tool_call_id=call_id)
             result.setdefault("tool", tool)
             result.setdefault("tool_version", spec.version)
             result.setdefault("tool_call_id", call_id)

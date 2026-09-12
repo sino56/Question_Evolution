@@ -196,7 +196,7 @@ def test_raw_run_logs_are_projected_not_injected(tmp_path):
 def test_procedural_rule_library_is_versioned_and_loadable():
     memory = load_procedural_memory(ROOT)
 
-    assert memory.version == "procedural-v1"
+    assert memory.version == "procedural-v2"
     assert memory.content_hash.startswith("sha256:")
     assert memory.source_files == ("agent_procedural_rules.json",)
     assert (ROOT / PROCEDURAL_DIR / "agent_procedural_rules.json").is_file()
@@ -273,7 +273,7 @@ def test_context_snapshot_prefix_records_the_procedural_revision(tmp_path):
     pack = build_context_pack(_task(tmp_path))
     prefix = pack["snapshot_prefix"]
 
-    assert prefix["procedural_memory_version"] == "procedural-v1"
+    assert prefix["procedural_memory_version"] == "procedural-v2"
     assert prefix["procedural_memory_hash"].startswith("sha256:")
     assert prefix["skill_content_hash"].startswith("sha256:")
     assert "procedural_rules" in pack["stable_prefix"]

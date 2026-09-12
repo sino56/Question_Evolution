@@ -111,9 +111,14 @@ RECIPES: tuple[RecoveryRecipe, ...] = (
     ),
     RecoveryRecipe(
         recipe_id="score_increased",
-        recovery_action=ACTION_ROLLBACK_AND_RETRY,
-        max_attempts=1,
-        reason="a score increase is negative gain: roll back to the previous plan revision and retry with a different operator strategy",
+        recovery_action=ACTION_STOP_AND_REPORT,
+        max_attempts=0,
+        reason=(
+            "a score increase is negative gain: stop, keep the failure memory, and let the "
+            "next session change the operator strategy.  A v1 plan has no strategy variation "
+            "axis, so an automatic rollback would re-run the identical call instead of retrying "
+            "differently."
+        ),
         observation_types=("score_increased",),
     ),
     RecoveryRecipe(

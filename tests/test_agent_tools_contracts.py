@@ -200,6 +200,36 @@ def test_positional_step_arguments_are_not_environment_overrides(tmp_path):
     assert seen["INPUT_FILE"] == "data/data.jsonl"
 
 
+def test_resume_step_arguments_project_onto_the_task_and_idempotency_key(tmp_path):
+    """A continuation resume step must retarget the tool per Step, not per Task."""
+
+    seen = []
+
+    class Registry:
+        def resume_full_loop(self, task, env):
+            seen.append(task)
+            return {"tool": "resume_full_loop", "ok": True, "return_code": 0}
+
+    executor = _executor(tmp_path, registry=Registry())
+    step = _step("resume_full_loop", arguments={"experiment_dir": "experiments/day/exp", "start_round": 3})
+    step_task = executor._task_for_step(step)
+    assert step_task.resume_exp_dir == "experiments/day/exp"
+    assert step_task.resume_start_round == 3
+    # The original frozen task is untouched.
+    assert executor.task.resume_exp_dir == ""
+
+    result = executor.execute_step(step)
+    assert result["ok"] is True
+    assert seen[0].resume_exp_dir == "experiments/day/exp"
+    assert seen[0].resume_start_round == 3
+
+    # The idempotency key follows the step-level target, not the empty task field.
+    other = _step("resume_full_loop", arguments={"experiment_dir": "experiments/other/exp", "start_round": 3})
+    assert executor._idempotency_key(step, step_task=step_task) != executor._idempotency_key(other)
+    with pytest.raises(ExecutorError):
+        executor._task_for_step(_step("resume_full_loop", arguments={"start_round": 0}))
+
+
 # --------------------------------------------------------------------------- T-2
 
 

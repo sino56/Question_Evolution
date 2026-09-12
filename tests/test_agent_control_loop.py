@@ -3,8 +3,8 @@
 Each test maps to one finding of
 ``docs/Agent改造方案/Agent_Harness_代码审查报告_2026-09-11.md`` §4/§7:
 
-- O-2 ``run_pipeline`` / ``resume_pipeline`` / ``run_review`` are reachable and
-  the Session actually continues; rollback exists.
+- O-2 ``run_pipeline`` / ``resume_pipeline`` / ``run_review`` are reachable,
+  the Session actually continues *and re-executes*; rollback machinery exists.
 - O-7 a Session can be resumed from its confirmed checkpoint.
 - O-8 ``plan_revision`` is owned by the persistence boundary.
 - O-9 one single source declares which execution scopes are supported.
@@ -35,7 +35,6 @@ from agent_runtime.planner import build_plan
 from agent_runtime.policy import PolicyViolation, validate_plan
 from agent_runtime.recovery import (
     ACTION_REDUCE_OPERATOR_BUDGET,
-    ACTION_ROLLBACK_AND_RETRY,
     ACTION_REOBSERVE_THEN_FAIL_FAST,
     ACTION_STOP_AND_REPORT,
     ACTION_SUSPEND_WITH_BACKUP_ENDPOINT,
@@ -98,7 +97,12 @@ def test_recovery_recipe_table_is_the_data_source_for_recovery_actions():
     }
     assert select_recipe(failure_category="retryable_system_error").recovery_action == ACTION_SUSPEND_WITH_BACKUP_ENDPOINT
     assert select_recipe(failure_category="configuration_error").recovery_action == ACTION_STOP_AND_REPORT
-    assert select_recipe(observation_types=["score_increased"]).recovery_action == ACTION_ROLLBACK_AND_RETRY
+    # score_increased is negative gain: a v1 plan has no strategy variation
+    # axis, so the recipe stops instead of pretending an automatic rollback
+    # would "retry with a different operator strategy".
+    score_recipe = select_recipe(observation_types=["score_increased"])
+    assert score_recipe.recovery_action == ACTION_STOP_AND_REPORT
+    assert score_recipe.max_attempts == 0
     assert select_recipe(observation_types=["candidate_invalid"]).recovery_action == ACTION_REDUCE_OPERATOR_BUDGET
     assert select_recipe(observation_types=["artifact_missing"]).recovery_action == ACTION_REOBSERVE_THEN_FAIL_FAST
     # An unknown signature must still yield a terminal, bounded recipe.
@@ -117,8 +121,9 @@ def test_every_decision_carries_its_recovery_recipe(tmp_path):
 
     negative = decide_next_action(_task(tmp_path), {"status": "observed", "score_increased_count": 1})
     assert negative["recovery_recipe_id"] == "score_increased"
-    assert negative["recovery_action"] == ACTION_ROLLBACK_AND_RETRY
-    assert negative["recovery_max_attempts"] == 1
+    assert negative["recovery_action"] == ACTION_STOP_AND_REPORT
+    assert negative["recovery_max_attempts"] == 0
+    assert negative["action"] == "stop_and_report"
 
 
 # --------------------------------------------------------------------------- O-2 continuation
@@ -157,6 +162,7 @@ def test_a_session_actually_continues_and_bumps_the_plan_revision(tmp_path, monk
     monkeypatch.setattr(cli, "ROOT", tmp_path)
     monkeypatch.setattr("agent_runtime.executor.validate_published_artifact", lambda *_a, **_k: (True, "ok"))
     calls = []
+    observations = []
 
     class FakeRegistry(ToolRegistry):
         def __init__(self):
@@ -166,14 +172,15 @@ def test_a_session_actually_continues_and_bumps_the_plan_revision(tmp_path, monk
             return {"tool": "check_environment", "ok": True, "ready": True, "return_code": 0, "recoverable": False}
 
         def run_full_loop(self, _task, _env):
+            calls.append("run_full_loop")
             exp_dir = tmp_path / "experiments" / "day" / "exp"
             exp_dir.mkdir(parents=True, exist_ok=True)
             return {"tool": "run_full_loop", "ok": True, "return_code": 0, "recoverable": False, "experiment_dir": str(exp_dir)}
 
     def fake_observer(*_args, **kwargs):
-        calls.append(1)
+        observations.append(1)
         (Path(kwargs["run_dir"]) / "agent_observation.json").write_text("{}\n", encoding="utf-8")
-        pending = 3 if len(calls) == 1 else 0
+        pending = 3 if len(observations) == 1 else 0
         return {
             "status": "observed", "manifest_status": "ok", "target_reached": False,
             "boundary_candidate_count": 0, "pending_count": pending, "final_records_count": 0,
@@ -185,12 +192,126 @@ def test_a_session_actually_continues_and_bumps_the_plan_revision(tmp_path, monk
 
     manifest = json.loads((run_dir / "session_manifest.json").read_text(encoding="utf-8"))
     events = (run_dir / "agent_events.jsonl").read_text(encoding="utf-8")
-    assert len(calls) == 2
+    # The continuation actually re-executed the pipeline tool instead of
+    # replaying the checkpointed result.
+    assert calls == ["run_full_loop", "run_full_loop"]
+    assert len(observations) == 2
     assert manifest["plan_revision"] == 2
     assert manifest["status"] == "completed"
     assert manifest["terminal_reason"] == "no_pending_branches"
     assert "session_round_started" in events
+    assert "ledger_entry_superseded" in events
     assert code == 0
+
+
+def test_continuation_prefers_the_resume_entry_point_when_it_is_allowed(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "ROOT", tmp_path)
+    monkeypatch.setattr("agent_runtime.executor.validate_published_artifact", lambda *_a, **_k: (True, "ok"))
+    calls = []
+    observations = []
+    exp_dir = tmp_path / "experiments" / "day" / "exp"
+
+    class FakeRegistry(ToolRegistry):
+        def __init__(self):
+            pass
+
+        def check_environment(self, _task):
+            return {"tool": "check_environment", "ok": True, "ready": True, "return_code": 0, "recoverable": False}
+
+        def run_full_loop(self, _task, _env):
+            calls.append("run_full_loop")
+            exp_dir.mkdir(parents=True, exist_ok=True)
+            return {"tool": "run_full_loop", "ok": True, "return_code": 0, "recoverable": False, "experiment_dir": str(exp_dir)}
+
+        def resume_full_loop(self, task, _env):
+            calls.append(f"resume_full_loop:{task.resume_exp_dir}:{task.resume_start_round}")
+            return {"tool": "resume_full_loop", "ok": True, "return_code": 0, "recoverable": False, "experiment_dir": str(exp_dir), "resume_start_round": task.resume_start_round}
+
+    def fake_observer(*_args, **kwargs):
+        observations.append(1)
+        (Path(kwargs["run_dir"]) / "agent_observation.json").write_text("{}\n", encoding="utf-8")
+        pending = 2 if len(observations) == 1 else 0
+        return {
+            "status": "observed", "manifest_status": "ok", "target_reached": False,
+            "boundary_candidate_count": 0, "pending_count": pending, "final_records_count": 0,
+            "score_increased_count": 0, "evidence_refs": [],
+        }
+
+    monkeypatch.setattr(cli, "observe_experiment", fake_observer)
+    task = _task(tmp_path, allowed_tools=["check_environment", "run_full_loop", "resume_full_loop", "observe_experiment", "write_agent_report"])
+    code, run_dir = cli.run_agent("run", task, registry=FakeRegistry(), max_rounds=2)
+
+    manifest = json.loads((run_dir / "session_manifest.json").read_text(encoding="utf-8"))
+    # Round 2 resumed this Session's own experiment directory (start_round
+    # defaults to 1) instead of starting another fresh experiment.
+    assert calls == ["run_full_loop", f"resume_full_loop:{exp_dir}:1"]
+    assert manifest["plan_revision"] == 2
+    assert manifest["status"] == "completed"
+    assert code == 0
+
+
+def test_resume_session_continuation_supersedes_the_ledger_and_reexecutes(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "ROOT", tmp_path)
+    monkeypatch.setattr("agent_runtime.executor.validate_published_artifact", lambda *_a, **_k: (True, "ok"))
+    calls = []
+    observations = []
+    exp_dir = tmp_path / "experiments" / "day" / "exp"
+    exp_dir.mkdir(parents=True)
+
+    class FakeRegistry(ToolRegistry):
+        def __init__(self):
+            pass
+
+        def resume_full_loop(self, _task, _env):
+            calls.append("resume_full_loop")
+            return {"tool": "resume_full_loop", "ok": True, "return_code": 0, "recoverable": False, "experiment_dir": str(exp_dir), "resume_start_round": 2}
+
+    def fake_observer(*_args, **kwargs):
+        observations.append(1)
+        (Path(kwargs["run_dir"]) / "agent_observation.json").write_text("{}\n", encoding="utf-8")
+        return {
+            "status": "observed", "manifest_status": "ok", "target_reached": False,
+            "boundary_candidate_count": 0, "pending_count": 1, "final_records_count": 0,
+            "score_increased_count": 0, "evidence_refs": [],
+        }
+
+    monkeypatch.setattr(cli, "observe_experiment", fake_observer)
+    task = _task(tmp_path, input_file="", resume_exp_dir="experiments/day/exp", resume_start_round=2,
+                 allowed_tools=["resume_full_loop", "observe_experiment", "write_agent_report"])
+    code, run_dir = cli.run_agent("run", task, registry=FakeRegistry(), max_rounds=2)
+
+    manifest = json.loads((run_dir / "session_manifest.json").read_text(encoding="utf-8"))
+    events = (run_dir / "agent_events.jsonl").read_text(encoding="utf-8")
+    # Without ledger supersession the second resume would be a replayed
+    # idempotent result and pending work could never advance.
+    assert calls == ["resume_full_loop", "resume_full_loop"]
+    assert manifest["plan_revision"] == 2
+    assert "ledger_entry_superseded" in events
+    assert code == 0
+
+
+def test_supersede_tool_ledger_removes_only_side_effecting_entries(tmp_path):
+    from agent_runtime.executor import supersede_tool_ledger
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ledger = {
+        "run-key": {"tool": "run_full_loop", "ok": True},
+        "observe-key": {"tool": "observe_experiment", "ok": True},
+    }
+    (run_dir / "tool_idempotency.json").write_text(json.dumps(ledger), encoding="utf-8")
+
+    removed = supersede_tool_ledger(run_dir, reason="control_loop_continue:run_pipeline")
+
+    surviving = json.loads((run_dir / "tool_idempotency.json").read_text(encoding="utf-8"))
+    assert removed == ["run-key"]
+    assert set(surviving) == {"observe-key"}
+    assert "ledger_entry_superseded" in (run_dir / "agent_events.jsonl").read_text(encoding="utf-8")
+    # A missing or unreadable ledger never blocks the control loop silently.
+    assert supersede_tool_ledger(tmp_path / "missing", reason="x") == []
+    (run_dir / "tool_idempotency.json").write_text("{broken", encoding="utf-8")
+    with pytest.raises(ExecutorError):
+        supersede_tool_ledger(run_dir, reason="x")
 
 
 def test_rollback_reapplies_the_previous_revision_and_records_it(tmp_path, monkeypatch):

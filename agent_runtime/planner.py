@@ -105,7 +105,7 @@ def _append_if_allowed(steps: List[Dict[str, Any]], task: AgentTask, blocked: Li
     steps.append(step)
 
 
-def _deterministic_plan(task: AgentTask, *, command: str) -> Dict[str, Any]:
+def _deterministic_plan(task: AgentTask, *, command: str, continuation_experiment_dir: str = "") -> Dict[str, Any]:
     selected_mode, assumptions = select_search_mode(task)
     steps: List[Dict[str, Any]] = []
     blocked: List[str] = []
@@ -122,12 +122,22 @@ def _deterministic_plan(task: AgentTask, *, command: str) -> Dict[str, Any]:
             success_condition="published_artifacts_observed_or_blocked_with_evidence",
             business_failure_action="report_missing_or_invalid_artifacts",
         ))
-    elif command == "resume" or task.is_resume:
+    elif command == "resume" or task.is_resume or (
+        continuation_experiment_dir and "resume_full_loop" in task.allowed_tools
+    ):
+        # A recovery plan also serves a control-loop continuation: when this
+        # Session already discovered an experiment directory and pending work
+        # remains, resuming *that* directory is the only way the continuation
+        # advances it (a fresh run_full_loop would start a different experiment).
         plan_kind = "recovery_plan"
         plan_layers = ["recovery_plan"]
+        resume_dir = continuation_experiment_dir or task.resume_exp_dir
+        resume_start = task.resume_start_round if task.resume_start_round else 1
+        if continuation_experiment_dir and not task.is_resume:
+            assumptions.append("continuation resumes this Session's own experiment directory")
         _append_if_allowed(steps, task, blocked, _step(
             "resume_full_loop", "resume_full_loop", "resume the existing experiment using the registered loop entry point",
-            {"experiment_dir": task.resume_exp_dir, "start_round": task.resume_start_round}, ["updated experiment artifacts", "final/final_scored.jsonl"],
+            {"experiment_dir": resume_dir, "start_round": resume_start}, ["updated experiment artifacts", "final/final_scored.jsonl"],
             preconditions=["existing_experiment_dir", "resume_checkpoint_valid", "published_manifest_validation_required"],
             success_condition="resumed_loop_completed_with_published_scored_artifacts",
             business_failure_action="observe_and_report",
@@ -302,14 +312,18 @@ def build_plan(
     command: str,
     context_pack: Optional[Mapping[str, Any]] = None,
     model_client: Optional[Any] = None,
+    continuation_experiment_dir: str = "",
 ) -> Dict[str, Any]:
     """Build a deterministic plan, optionally accepting a schema-checked model plan.
 
     A model may improve explanations and assumptions, but cannot alter the
     registered v1 tool sequence, execution scope, or environment contract.
+    ``continuation_experiment_dir`` retargets a control-loop continuation at
+    the Session's own experiment directory (recovery plan instead of a fresh
+    ``run_full_loop``).
     """
 
-    baseline = _deterministic_plan(task, command=command)
+    baseline = _deterministic_plan(task, command=command, continuation_experiment_dir=continuation_experiment_dir)
     validate_contract("agent_plan.schema.json", baseline, path="$.plan")
     if task.planning_mode != "model_assisted":
         return baseline
