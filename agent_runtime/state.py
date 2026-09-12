@@ -211,4 +211,93 @@ def write_plan_revision(
 
 
 def write_context(run_dir: Path, context: Mapping[str, Any]) -> None:
+    # V-1 direction 6: the context pack had a published schema that nothing ever
+    # enforced.  Gate it here so a drifting layer fails before it reaches a model.
+    validate_contract("context_pack_v2.schema.json", dict(context), path="$.context_pack")
     _write_json(run_dir / "agent_context.json", context)
+
+
+def plan_revision_history(run_dir: Path) -> list[dict[str, Any]]:
+    """List the persisted plan revisions in order (the rollback candidates)."""
+
+    plans_dir = Path(run_dir) / "plans"
+    if not plans_dir.is_dir():
+        return []
+    revisions: list[dict[str, Any]] = []
+    for path in sorted(plans_dir.glob("plan_r*.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, Mapping):
+            continue
+        revisions.append({
+            "plan_revision": value.get("plan_revision"),
+            "plan_id": value.get("plan_id"),
+            "plan_kind": value.get("plan_kind"),
+            "path": str(path.resolve()),
+            "step_count": len(value.get("steps") or []),
+        })
+    return revisions
+
+
+def world_state(
+    run_dir: Path,
+    state: Mapping[str, Any],
+    *,
+    observation: Mapping[str, Any] | None = None,
+    plan: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Derive the structured ``world_state`` layer from this single source.
+
+    The dynamic context layer previously carried only paths and prose, so a
+    Planner could not see "which plan revision is in force, what is left in the
+    budget, which rollback points exist, how the candidate tree currently
+    looks" (report C-5 / design §8.1).  Everything below is derived from the
+    Session manifest and the published observation -- no new state is invented.
+    """
+
+    runtime = dict(state or {})
+    observed = dict(observation or {})
+    revisions = plan_revision_history(run_dir)
+    budgets = dict(runtime.get("budgets") or {})
+    remaining = budgets.get("remaining") if isinstance(budgets.get("remaining"), Mapping) else {}
+    return {
+        "session_id": runtime.get("session_id"),
+        "status": runtime.get("status"),
+        "plan_revision": runtime.get("plan_revision"),
+        "current_plan_id": (plan or {}).get("plan_id"),
+        "current_step_id": runtime.get("current_step_id"),
+        "completed_step_ids": list(runtime.get("completed_step_ids") or []),
+        "experiment_dir": runtime.get("experiment_dir"),
+        "resume_checkpoint": runtime.get("resume_checkpoint"),
+        "frozen_memory": {
+            "memory_snapshot_id": runtime.get("memory_snapshot_id"),
+            "memory_mode": runtime.get("memory_mode"),
+            "memory_degraded": bool(runtime.get("memory_degraded")),
+            "original_memory_snapshot_id": runtime.get("original_memory_snapshot_id"),
+        },
+        "budget": {
+            "declared": dict(runtime.get("budgets") or {}),
+            "remaining": dict(remaining),
+            "budget_exhausted": observed.get("budget_exhausted"),
+            "termination_reason": observed.get("termination_reason"),
+        },
+        "rollback_points": [item for item in revisions[:-1]],
+        "latest_plan_revision": revisions[-1] if revisions else None,
+        "candidate_state": {
+            "pending_count": observed.get("pending_count"),
+            "boundary_candidate_count": observed.get("boundary_candidate_count"),
+            "score_increased_count": observed.get("score_increased_count"),
+            "not_applicable_count": observed.get("not_applicable_count"),
+            "validation_failed_count": observed.get("validation_failed_count"),
+            "final_records_count": observed.get("final_records_count"),
+            "target_reached": observed.get("target_reached"),
+        },
+        "operator_yield": dict(observed.get("operator_status_counts") or {}),
+        "operator_attempts": dict(observed.get("operator_attempt_count") or {}),
+        "manifest_status": observed.get("manifest_status"),
+        "requires_human_review": bool(runtime.get("requires_manual_review")),
+        "derived_from": "session_manifest+published_observation",
+    }
+

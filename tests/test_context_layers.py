@@ -51,7 +51,19 @@ def test_context_pack_v2_classifies_dynamic_fields_and_keeps_legacy_fields(tmp_p
     assert [card["card_id"] for card in pack["memory_context"]["cards"]] == ["a", "b"]
     assert "agent_run_dir" not in json.dumps(pack["stable_prefix"], ensure_ascii=False)
     assert pack["dynamic_tail"]["agent_run_dir"] == "C:/runs/run-1"
-    assert pack["dynamic_tail"]["stderr_summary"] == "temporary failure detail"
+    # C-7: raw run logs are no longer injected; only a bounded structured
+    # projection (size + hash + short excerpt) reaches the control layer.
+    assert "stderr_summary" not in pack["dynamic_tail"]
+    diagnostics = pack["dynamic_tail"]["runtime_diagnostics"]["stderr_summary"]
+    assert diagnostics["chars"] == len("temporary failure detail")
+    assert diagnostics["sha256"].startswith("sha256:")
+    assert diagnostics["excerpt"] == "temporary failure detail"
+    # The structured world state layer is part of the v2 contract (C-5).
+    assert pack["world_state"]["plan_revision"] is None
+    assert pack["world_state"]["derived_from"] == "session_manifest+published_observation"
+    # Token accounting accompanies the character bound (C-6).
+    assert pack["token_budget"]["budget_tokens"] > 0
+    assert pack["token_budget"]["estimated_tokens"] > 0
     # Tests run from a temporary project root, so load the repository schema.
     import pathlib
 

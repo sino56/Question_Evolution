@@ -38,11 +38,17 @@ def context_cache_key(
     memory_snapshot_id: str | None,
     selected_search_mode: str,
     selected_execution_scope: str,
+    procedural_memory_version: str = "",
+    skill_content_hash: str = "",
 ) -> str:
     """Hash only the versioned, decision-relevant context identity.
 
     Run directories, timestamps, observations, and other dynamic state are
     deliberately absent to preserve prompt-prefix reuse across executions.
+
+    ``procedural_memory_version`` (L3 rules) and ``skill_content_hash`` (the
+    injected SKILL.md bodies) are *versioned identities*, so they belong here:
+    a Session must not reuse a cached prefix built under different rules.
     """
 
     return sha256_digest(
@@ -57,6 +63,8 @@ def context_cache_key(
             "memory_snapshot_id": memory_snapshot_id or "",
             "selected_search_mode": selected_search_mode,
             "selected_execution_scope": selected_execution_scope,
+            "procedural_memory_version": procedural_memory_version,
+            "skill_content_hash": skill_content_hash,
         }
     )
 
@@ -103,6 +111,8 @@ def cache_metadata(
             memory_snapshot_id=_as_text(snapshot_prefix.get("memory_snapshot_id")),
             selected_search_mode=str(task_context.get("selected_search_mode") or ""),
             selected_execution_scope=str(task_context.get("selected_execution_scope") or ""),
+            procedural_memory_version=str(snapshot_prefix.get("procedural_memory_version") or ""),
+            skill_content_hash=str(snapshot_prefix.get("skill_content_hash") or ""),
         ),
         "stable_prefix_hash": sha256_digest(stable_prefix),
         "snapshot_prefix_hash": sha256_digest(snapshot_prefix),

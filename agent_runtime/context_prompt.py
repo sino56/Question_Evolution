@@ -12,17 +12,21 @@ PROMPT_LAYER_ORDER = (
     "snapshot_prefix",
     "task_context",
     "memory_context",
+    "world_state",
     "dynamic_tail",
 )
+# Layers before this index are the reusable, cache-addressed prefix.  The
+# world state and the dynamic tail are volatile and must stay outside it.
+CACHED_LAYER_COUNT = 4
 
 
 def cached_prompt_prefix(context_pack: Mapping[str, Any]) -> str:
-    """Serialize the four reusable layers in the documented immutable order."""
+    """Serialize the reusable layers in the documented immutable order."""
 
     _require_v2(context_pack)
     return "\n".join(
         f"[{name}]\n{canonical_json(context_pack.get(name) or {})}"
-        for name in PROMPT_LAYER_ORDER[:4]
+        for name in PROMPT_LAYER_ORDER[:CACHED_LAYER_COUNT]
     )
 
 
@@ -30,9 +34,12 @@ def assemble_context_prompt(context_pack: Mapping[str, Any], *, instruction: str
     """Append volatile state and the current instruction after cached layers."""
 
     prefix = cached_prompt_prefix(context_pack)
-    dynamic = f"[dynamic_tail]\n{canonical_json(context_pack.get('dynamic_tail') or {})}"
+    volatile = [
+        f"[{name}]\n{canonical_json(context_pack.get(name) or {})}"
+        for name in PROMPT_LAYER_ORDER[CACHED_LAYER_COUNT:]
+    ]
     suffix = f"[user_or_system_instruction]\n{instruction}" if instruction else ""
-    return "\n".join(part for part in (prefix, dynamic, suffix) if part)
+    return "\n".join(part for part in (prefix, *volatile, suffix) if part)
 
 
 def _require_v2(context_pack: Mapping[str, Any]) -> None:

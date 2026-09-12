@@ -974,8 +974,50 @@ class GlobalMemoryStore:
         payload = {"local_memory_hashes": local_hashes, "global_index_hash": index_hash, "taxonomy_version": TAXONOMY_VERSION, "card_versions": versions, "card_fingerprints": fingerprints}
         snapshot_id = _hash(payload).split(":", 1)[1]
         snapshot = {"memory_snapshot_id": "MSNAP-" + snapshot_id[:20], **payload, "created_at": _now(), "mode": "no_global_memory" if not versions else "global_memory"}
-        _atomic_write(self.root / "snapshots" / (snapshot["memory_snapshot_id"] + ".json"), json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-        return snapshot
+        snapshot_path = self.root / "snapshots" / (snapshot["memory_snapshot_id"] + ".json")
+        # M-9: the id is a content hash, so an identical identity must reuse the
+        # existing file instead of rewriting it with a new timestamp -- which
+        # also kept resetting the ``created_at`` reference clock that retrieval
+        # freshness is measured against.
+        if snapshot_path.is_file():
+            existing = _as_mapping(json.loads(snapshot_path.read_text(encoding="utf-8")))
+            if existing.get("card_fingerprints") == fingerprints and existing.get("card_versions") == versions:
+                return {**snapshot, **existing, "reused": True}
+        _atomic_write(snapshot_path, json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        return {**snapshot, "reused": False}
+
+    def prune_snapshots(self, *, keep: int = 20, protect: Sequence[str] = ()) -> dict[str, Any]:
+        """Delete the oldest snapshots beyond ``keep`` (report M-9).
+
+        ``create_snapshot`` runs on every non-resumed Session, so the snapshot
+        directory grew without bound.  ``protect`` lists snapshot ids that must
+        survive (normally the one the current Session manifest references).
+        """
+
+        self._require_writable()
+        self.initialize()
+        if keep < 1:
+            raise GlobalMemoryError("keep must be a positive integer")
+        directory = self.root / "snapshots"
+        protected = {str(item) for item in protect if item}
+        entries: list[tuple[str, str]] = []
+        if directory.is_dir():
+            for path in directory.glob("MSNAP-*.json"):
+                try:
+                    value = _as_mapping(json.loads(path.read_text(encoding="utf-8")))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                entries.append((str(value.get("created_at") or ""), path.name))
+        entries.sort()
+        removable = [(created, name) for created, name in entries if name[:-5] not in protected]
+        removed: list[str] = []
+        for _created, name in removable[: max(0, len(entries) - int(keep))]:
+            try:
+                (directory / name).unlink()
+                removed.append(name)
+            except OSError:
+                continue
+        return {"kept": len(entries) - len(removed), "removed": removed, "protected": sorted(protected)}
 
     def load_snapshot(self, snapshot_id: str, *, allow_no_global_memory: bool = False) -> dict[str, Any]:
         path = self.root / "snapshots" / f"{snapshot_id}.json"
@@ -1177,6 +1219,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("rebuild-projections")
     snapshot = sub.add_parser("snapshot")
     snapshot.add_argument("--local-memory-dir", default=None)
+    prune = sub.add_parser("prune-snapshots")
+    prune.add_argument("--keep", type=int, default=20)
+    prune.add_argument("--protect", action="append", default=[], help="snapshot id that must survive")
     # Watermark governance: without these two commands a ``source_rewritten``
     # review could never be closed and the audit log grew without bound (M-4).
     bless = sub.add_parser("bless-source")
@@ -1200,6 +1245,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = store.bless_source(args.source_file, reason=args.reason)
     elif args.command == "reset-watermark":
         result = store.reset_watermark(args.source_file)
+    elif args.command == "prune-snapshots":
+        result = store.prune_snapshots(keep=int(args.keep), protect=tuple(args.protect or ()))
     elif args.command == "health":
         result = store.write_health_report()
     else:

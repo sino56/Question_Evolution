@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Mapping, Optional
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence
 
 from .context_cache import CONTEXT_SCHEMA_VERSION, PROMPT_TEMPLATE_VERSION, cache_metadata, memory_context_key
 from .events import redact
@@ -16,6 +17,11 @@ PROMPT_SNAPSHOT_ID = "frozen"
 OPERATOR_SNAPSHOT_ID = "frozen"
 TOOL_REGISTRY_VERSION = "agent-tool-registry-v1"
 SKILL_REGISTRY_VERSION = "agent-skill-registry-v1"
+# C-6: declared token budget for one context pack.  The character bound remains
+# for backward compatibility; this is the number that relates to a model window.
+CONTEXT_TOKEN_BUDGET = 24000
+# Maximum characters of one SKILL.md body injected into the stable prefix (V-5).
+SKILL_CONTENT_LIMIT = 4000
 TOOL_REGISTRY_ORDER = (
     "check_environment",
     "run_full_loop",
@@ -97,6 +103,8 @@ def build_context_layers(
     memory_context: Optional[Mapping[str, Any]] = None,
     runtime_state: Optional[Mapping[str, Any]] = None,
     snapshot_ids: Optional[Mapping[str, Any]] = None,
+    skills: Optional[Sequence[Any]] = None,
+    run_dir: Optional[str | Path] = None,
 ) -> dict[str, Any]:
     """Classify every current context field into its cache behavior layer."""
 
@@ -105,9 +113,15 @@ def build_context_layers(
     runtime = dict(runtime_state or {})
     snapshots = dict(snapshot_ids or {})
     memory = normalize_memory_context(memory_context, query=task.goal)
-    selected_search_mode = _text(plan_value.get("selected_search_mode")) or task.search_mode
+    # C-2: resolve the search mode from the *same* single source the Planner
+    # uses.  Falling back to ``task.search_mode`` made the first (plan-less)
+    # context key differ from the persisted one for every ``auto`` task, so the
+    # Session could never reproduce its own cache identity.
+    selected_search_mode = _text(plan_value.get("selected_search_mode")) or _resolved_search_mode(task)
     selected_execution_scope = _text(plan_value.get("selected_execution_scope")) or task.execution_scope
     selected_plan_type = _text(plan_value.get("plan_kind")) or "task_plan"
+    procedural = _procedural_memory()
+    skill_procedures = _skill_procedures(skills)
     snapshot_prefix = {
         "context_schema_version": CONTEXT_SCHEMA_VERSION,
         "prompt_template_version": PROMPT_TEMPLATE_VERSION,
@@ -117,6 +131,11 @@ def build_context_layers(
         "memory_snapshot_id": _text(snapshots.get("memory_snapshot_id")) or _text(memory.get("memory_snapshot_id")) or _text(task.memory_snapshot_id),
         "tool_registry_version": _text(snapshots.get("tool_registry_version")) or TOOL_REGISTRY_VERSION,
         "skill_registry_version": _text(snapshots.get("skill_registry_version")) or SKILL_REGISTRY_VERSION,
+        # M-7: the L3 rule revision this context was built under, plus the hash
+        # of the injected SKILL.md bodies (V-5).  Both are versioned identities.
+        "procedural_memory_version": procedural["procedural_memory_version"],
+        "procedural_memory_hash": procedural["procedural_memory_hash"],
+        "skill_content_hash": _skill_content_hash(skill_procedures),
     }
     stable_prefix = {
         "agent_role": "Controlled Question Evolution Agent; only registered tools may be called.",
@@ -132,6 +151,10 @@ def build_context_layers(
             "registry_version": snapshot_prefix["skill_registry_version"],
             "rule": "Skills are read-only procedures and may use only their declared context layers.",
         },
+        # V-5: the loaded SKILL.md bodies are injected here (bounded), so a
+        # "follow the procedure" claim can actually be inspected downstream.
+        "skill_procedures": skill_procedures,
+        "procedural_rules": procedural["procedural_rules"],
         "report_requirement": "Automatic scores are candidate evidence only, never confirmed capability boundaries.",
     }
     task_context = {
@@ -161,9 +184,9 @@ def build_context_layers(
         "observation_summary": _bounded(observation_value, 18000),
         "last_decision": _bounded(dict(previous_decision or {}), 4000),
         "generated_at": runtime.get("generated_at"),
-        "stdout_summary": runtime.get("stdout_summary"),
-        "stderr_summary": runtime.get("stderr_summary"),
-        "parse_errors": runtime.get("parse_errors"),
+        # C-7: raw run logs are replaced by a bounded structured projection so
+        # the control layer never receives stdout/stderr as free text.
+        "runtime_diagnostics": _runtime_diagnostics(runtime),
         "paths": {
             "input_file": task.input_file,
             "exp_root": task.exp_root,
@@ -172,6 +195,22 @@ def build_context_layers(
         "plan_revision": plan_value.get("plan_revision"),
         "selected_plan": _bounded(plan_value, 12000),
     }
+    # C-5: the structured world state is derived from the Session manifest (one
+    # source) plus the published observation, never re-invented here.
+    world_layer = world_state(Path(run_dir) if run_dir else Path("."), runtime, observation=observation_value, plan=plan_value)
+    layers = {
+        "context_schema_version": CONTEXT_SCHEMA_VERSION,
+        "context_cache": None,
+        "stable_prefix": stable_prefix,
+        "snapshot_prefix": snapshot_prefix,
+        "task_context": task_context,
+        "memory_context": memory,
+        "world_state": world_layer,
+        "dynamic_tail": dynamic_tail,
+    }
+    # C-6: characters are a poor proxy for tokens in Chinese text, so the pack
+    # also carries a token estimate and an explicit token budget.
+    layers["token_budget"] = token_budget(layers)
     context_cache = cache_metadata(
         stable_prefix=stable_prefix,
         snapshot_prefix=snapshot_prefix,
@@ -179,15 +218,141 @@ def build_context_layers(
         memory_context=memory,
         dynamic_tail=dynamic_tail,
     )
-    return {
-        "context_schema_version": CONTEXT_SCHEMA_VERSION,
-        "context_cache": context_cache,
-        "stable_prefix": stable_prefix,
-        "snapshot_prefix": snapshot_prefix,
-        "task_context": task_context,
-        "memory_context": memory,
-        "dynamic_tail": dynamic_tail,
+    layers["context_cache"] = context_cache
+    return layers
+
+
+def estimate_tokens(value: Any) -> int:
+    """Estimate model tokens for a context payload.
+
+    A character limit has no fixed relationship to a model window, and the
+    relationship differs sharply between Chinese and Latin text.  CJK
+    characters are counted as one token each; ASCII runs are counted at roughly
+    four characters per token.  The estimate is deliberately conservative and
+    is reported alongside the character count so a reader can audit it.
+    """
+
+    text = value if isinstance(value, str) else _canonical(value)
+    cjk = sum(1 for char in text if "\u4e00" <= char <= "\u9fff" or "\u3000" <= char <= "\u303f" or "\uff00" <= char <= "\uffef")
+    ascii_chars = sum(1 for char in text if ord(char) < 128)
+    other = max(0, len(text) - cjk - ascii_chars)
+    return int(cjk + other + (ascii_chars + 3) // 4)
+
+
+def token_budget(layers: Mapping[str, Any], *, budget: int = CONTEXT_TOKEN_BUDGET) -> dict[str, Any]:
+    """Report the per-layer token estimate against the declared budget."""
+
+    per_layer = {
+        name: estimate_tokens(layers.get(name))
+        for name in ("stable_prefix", "snapshot_prefix", "task_context", "memory_context", "world_state", "dynamic_tail")
     }
+    total = sum(per_layer.values())
+    return {"budget_tokens": int(budget), "estimated_tokens": total, "per_layer": per_layer, "within_budget": total <= int(budget)}
+
+
+def world_state(
+    run_dir: "Path",
+    runtime_state: Mapping[str, Any],
+    *,
+    observation: Optional[Mapping[str, Any]] = None,
+    plan: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Return the structured world state via the ``state`` single source."""
+
+    from .state import world_state as _world_state  # local import avoids an import cycle
+
+    return _world_state(run_dir, runtime_state, observation=observation, plan=plan)
+
+
+def _runtime_diagnostics(runtime: Mapping[str, Any]) -> dict[str, Any]:
+    """Project raw run logs into a bounded, structured diagnostic record.
+
+    ``PROJECT_HARD_CONSTRAINTS`` states that logs must not be injected into the
+    control layer; the previous ``stdout_summary``/``stderr_summary``/
+    ``parse_errors`` fields were raw text and contradicted it (report C-7).
+    Only sizes, hashes, and a short redacted excerpt survive.
+    """
+
+    diagnostics: dict[str, Any] = {}
+    for field, limit in (("stdout_summary", 600), ("stderr_summary", 600)):
+        raw = runtime.get(field)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        safe = redact_context(raw)
+        diagnostics[field] = {
+            "chars": len(raw),
+            "sha256": "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            "excerpt": str(safe)[:limit],
+            "excerpt_truncated": len(str(safe)) > limit,
+        }
+    parse_errors = runtime.get("parse_errors")
+    if isinstance(parse_errors, (list, tuple)):
+        diagnostics["parse_error_count"] = len(parse_errors)
+    return diagnostics
+
+
+def _resolved_search_mode(task: AgentTask) -> str:
+    """Resolve ``auto`` through the Planner's single source of truth (C-2)."""
+
+    if task.search_mode != "auto":
+        return task.search_mode
+    from .planner import select_search_mode  # local import avoids an import cycle
+
+    return select_search_mode(task)[0]
+
+
+def _procedural_memory() -> dict[str, Any]:
+    """Load the versioned L3 rules read-only, degrading explicitly (M-7)."""
+
+    from .procedural import load_procedural_memory
+
+    try:
+        memory = load_procedural_memory(_project_root(), required=False)
+    except Exception:  # pragma: no cover - a malformed library must not break context building
+        return {"procedural_memory_version": "procedural-unavailable", "procedural_memory_hash": "sha256:", "procedural_rules": {}}
+    return {
+        **memory.as_dict(),
+        "procedural_rules": {rule_id: _bounded(memory.rules[rule_id], 1200) for rule_id in sorted(memory.rules)},
+    }
+
+
+def _project_root() -> "Path":
+    return Path(__file__).resolve().parents[1]
+
+
+def _skill_procedures(skills: Optional[Sequence[Any]]) -> list[dict[str, Any]]:
+    """Render loaded SKILL.md bodies for injection (V-5), bounded per skill."""
+
+    rendered: list[dict[str, Any]] = []
+    for skill in skills or []:
+        spec = getattr(skill, "spec", None) or (skill if not isinstance(skill, Mapping) else None)
+        identifier = str(
+            getattr(spec, "skill_id", "")
+            or getattr(skill, "skill_id", "")
+            or (skill.get("skill_id") if isinstance(skill, Mapping) else "")
+            or ""
+        )
+        if not identifier:
+            continue
+        content = getattr(skill, "content", None)
+        if content is None and isinstance(skill, Mapping):
+            content = skill.get("content")
+        text = redact_context(str(content or ""))
+        rendered.append({
+            "skill_id": identifier,
+            "stage": str(getattr(spec, "stage", "") or (skill.get("stage") if isinstance(skill, Mapping) else "") or ""),
+            "version": str(getattr(spec, "version", "") or ""),
+            "content_sha256": "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "content": text[:SKILL_CONTENT_LIMIT],
+            "content_truncated": len(text) > SKILL_CONTENT_LIMIT,
+        })
+    rendered.sort(key=lambda item: item["skill_id"])
+    return rendered
+
+
+def _skill_content_hash(procedures: Sequence[Mapping[str, Any]]) -> str:
+    payload = [{"skill_id": item.get("skill_id"), "content_sha256": item.get("content_sha256")} for item in procedures]
+    return "sha256:" + hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
 
 
 def _text(value: Any) -> str:

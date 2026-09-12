@@ -1,0 +1,81 @@
+{
+  "rule_id": "agent_procedural_rules",
+  "version": "procedural-v1",
+  "approved_by": "agent-harness-review-2026-09-11",
+  "approved_at": "2026-09-11T00:00:00+00:00",
+  "scope": "Question Evolution Agent Harness (control plane only)",
+  "notes": "Declared as data so the runtime constants can be verified against a versioned rule revision. Changing a rule requires a new version and a new approved_by value.",
+  "rules": {
+    "tool_order": {
+      "sequence": [
+        "check_environment",
+        "run_full_loop",
+        "resume_full_loop",
+        "observe_experiment",
+        "write_agent_report"
+      ],
+      "note": "Registry order used for context and reporting; review plans use only observe_experiment + write_agent_report."
+    },
+    "retry_and_fail_fast": {
+      "failure_categories": [
+        "retryable_system_error",
+        "fatal_system_error",
+        "configuration_error"
+      ],
+      "retryable_categories": [
+        "retryable_system_error"
+      ],
+      "multiplier": 2.0,
+      "max_backoff_seconds": 60.0,
+      "per_tool": {
+        "check_environment": {"max_attempts": 1, "backoff_seconds": 0.0},
+        "run_full_loop": {"max_attempts": 2, "backoff_seconds": 0.25},
+        "resume_full_loop": {"max_attempts": 2, "backoff_seconds": 0.25},
+        "observe_experiment": {"max_attempts": 1, "backoff_seconds": 0.0},
+        "write_agent_report": {"max_attempts": 1, "backoff_seconds": 0.0}
+      },
+      "side_effect_retry_guard": "withheld_when_a_successful_session_record_or_an_experiment_dir_exists"
+    },
+    "budget": {
+      "model_calls_counts": "model_billed_tools_only",
+      "step_max_tool_calls": 1,
+      "session_max_rounds": 3,
+      "session_max_rollbacks": 1
+    },
+    "rollback": {
+      "mode": "reappend_previous_revision",
+      "max_per_session": 1,
+      "allowed_when": [
+        "score_increased"
+      ],
+      "note": "rollback_and_retry recipes re-apply the previous plan revision as a new append-only revision."
+    },
+    "publish_gate": {
+      "active_publication": "forbidden",
+      "run_full_loop_preconditions": [
+        "environment_checked",
+        "published_manifest_validation_required",
+        "real_scoring_required"
+      ],
+      "required_outputs": {
+        "check_environment": "environment_checked",
+        "run_full_loop": "final/final_scored.jsonl",
+        "resume_full_loop": "final/final_scored.jsonl",
+        "observe_experiment": "agent_observation.json",
+        "write_agent_report": "agent_report.md"
+      }
+    },
+    "approval": {
+      "human_required_for": [
+        "effective_boundary_found",
+        "score_increased",
+        "judge_instability_detected"
+      ],
+      "human_required_for_failure_categories": [
+        "configuration_error",
+        "fatal_system_error"
+      ],
+      "note": "These observations must never be converted into an automatic success terminal state."
+    }
+  }
+}

@@ -317,9 +317,7 @@ def run_agent(
             "substituted_memory_snapshot_id": snapshot["memory_snapshot_id"],
             "reason": memory_audit["memory_degraded_reason"],
         })
-    initial_context = build_context_pack(task, memory_context=memory_context, runtime_state=state)
-    update_state(run_dir, state, context_cache_key=initial_context["context_cache"]["context_cache_key"])
-    load_stage_skills(
+    planning_skills = load_stage_skills(
         "planning_strategy",
         requested_context_layers=(
             "task_context",
@@ -332,11 +330,22 @@ def run_agent(
         event_path=run_dir / "agent_events.jsonl",
     )
     update_state(run_dir, state, status="context_ready")
+    # V-5: the loaded SKILL.md bodies are injected into the stable prefix (and
+    # their content hash into the cache identity) instead of only being logged.
+    loaded_skills = list(getattr(planning_skills, "loaded", ()) or ())
+    initial_context = build_context_pack(
+        task, memory_context=memory_context, runtime_state=state,
+        skills=loaded_skills, run_dir=run_dir,
+    )
+    update_state(run_dir, state, context_cache_key=initial_context["context_cache"]["context_cache_key"])
     plan = _load_or_build_plan(
         command, task, run_dir=run_dir, state=state, context=initial_context,
         snapshot=snapshot, memory_context=memory_context, resumed=resumed,
     )
-    persisted_context = build_context_pack(task, plan=plan, memory_context=memory_context, runtime_state=state)
+    persisted_context = build_context_pack(
+        task, plan=plan, memory_context=memory_context, runtime_state=state,
+        skills=loaded_skills, run_dir=run_dir,
+    )
     write_context(run_dir, persisted_context)
     update_state(run_dir, state, context_cache_key=persisted_context["context_cache"]["context_cache_key"])
     update_state(run_dir, state, status="planned", current_step_id=plan["steps"][0]["step_id"] if plan["steps"] else None)
@@ -461,6 +470,7 @@ def run_agent(
             continuation_context = build_context_pack(
                 task, plan=plan, observation=observation, previous_decision=decision,
                 memory_context=memory_context, runtime_state=state,
+                skills=loaded_skills, run_dir=run_dir,
             )
             plan = write_plan_revision(
                 run_dir,
@@ -474,6 +484,7 @@ def run_agent(
             persisted_context = build_context_pack(
                 task, plan=plan, observation=observation, previous_decision=decision,
                 memory_context=memory_context, runtime_state=state,
+                skills=loaded_skills, run_dir=run_dir,
             )
             write_context(run_dir, persisted_context)
             update_state(run_dir, state, context_cache_key=persisted_context["context_cache"]["context_cache_key"])
@@ -503,6 +514,8 @@ def run_agent(
                 previous_decision=decision,
                 memory_context=memory_context,
                 runtime_state=state,
+                skills=loaded_skills,
+                run_dir=run_dir,
             )
             if budget_decision["status"] == "approved":
                 budget_ledger.apply_changes(budget_decision["approved_changes"], proposal_id=budget_proposal["proposal_id"])
@@ -540,6 +553,8 @@ def run_agent(
                 previous_decision=decision,
                 memory_context=memory_context,
                 runtime_state=state,
+                skills=loaded_skills,
+                run_dir=run_dir,
             )
             write_context(run_dir, persisted_context)
             update_state(run_dir, state, context_cache_key=persisted_context["context_cache"]["context_cache_key"])
