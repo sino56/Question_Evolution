@@ -293,9 +293,14 @@ def _metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     total = len(rows)
     def rate(*names: str) -> float:
         return sum(labels[name] for name in names) / total if total else 0.0
+    # Judge instability is a structured signal only: the typed
+    # ``score_summary.judge_consistent`` field or an exact instability label.
+    # Free-text containment ("judge ... unstable") inferred instability from
+    # unrelated wording and made the core rates fragile (report V-7).
+    instability_labels = {"judge_instability", "judge_unstable", "judge_disagreement"}
     judge_unstable = sum(
         1 for row in rows
-        if ("judge" in _label(row) and ("unstable" in _label(row) or "disagreement" in _label(row)))
+        if _label(row) in instability_labels
         or _as_mapping(row.get("score_summary")).get("judge_consistent") is False
     )
     repeat_count = sum(int(_as_mapping(row.get("score_summary")).get("judge_repeat_count") or 0) for row in rows)
@@ -389,7 +394,7 @@ def _diagnose_row(row: Mapping[str, Any]) -> dict[str, Any]:
         _as_mapping(value).get("passed") is False for value in validation.values()
     ):
         kind, level, reason, confidence = "business_failure", "validation", "The candidate failed a validation contract or generated invalid material.", "medium"
-    elif "judge" in label and ("unstable" in label or "disagreement" in label) or score_summary.get("judge_consistent") is False:
+    elif label in {"judge_instability", "judge_unstable", "judge_disagreement"} or score_summary.get("judge_consistent") is False:
         kind, level, reason, confidence = "judge_instability", "rubric/judge", "Repeated Judge evidence is unstable or disagrees; the conclusion requires review.", "medium"
     elif label in {"strategy_conflict", "memory_conflict"}:
         kind, level, reason, confidence = "strategy_conflict", "memory", "Conflicting strategy evidence requires reconciliation before it can be used in Shadow or release.", "medium"

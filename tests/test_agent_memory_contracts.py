@@ -363,3 +363,24 @@ def test_control_plane_observations_are_not_l1_facts(tmp_path):
     assert result["included"] == 0
     watermarks = (store.root / "global_memory_watermarks.jsonl").read_text(encoding="utf-8")
     assert "agent_observation.json" not in watermarks
+
+
+def test_unparseable_lines_are_quarantined_instead_of_blocking_extraction(tmp_path):
+    experiment = tmp_path / "experiments" / "day" / "exp1"
+    source = experiment / "memory" / "failure_memory_bank.jsonl"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    good = {"sample_id": "sample-q", "round": 1, "operator_used": "O16", "failure_type": "score_increased", "failure_reason": "quarantine case"}
+    source.write_text(json.dumps(good, ensure_ascii=False) + "\n" + "{broken json\n", encoding="utf-8")
+
+    store = GlobalMemoryStore(tmp_path)
+    result = store.extract(experiment)
+
+    assert result["included"] == 1
+    assert result["quarantined_lines"] == 1
+    rows = _log_rows(store)
+    assert any("unparseable line quarantined" in str(row["reason"]) for row in rows if row["decision"] == "needs_human_review")
+
+    # The watermark advanced past the bad line: no reprocessing on the next run.
+    again = store.extract(experiment)
+    assert again["included"] == 0
+    assert again["quarantined_lines"] == 0

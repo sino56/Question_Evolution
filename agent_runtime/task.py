@@ -64,6 +64,9 @@ class AgentTask:
     execution_scope: str = "full_iteration"
     review_mode: str = "none"
     planning_mode: str = "deterministic"
+    # Structured target for ``search_mode=auto`` (report O-5): the goal keyword
+    # matcher is only a fallback and must not be the primary selection signal.
+    search_mode_hint: str = ""
     allowed_tools: List[str] = field(default_factory=lambda: sorted(REGISTERED_TOOLS))
     allow_prompt_mutation: bool = False
     allow_memory_active_publish: bool = False
@@ -104,6 +107,9 @@ def parse_agent_task(raw: Mapping[str, Any], *, project_root: Path) -> AgentTask
     planning_mode = _clean(raw.get("planning_mode")) or "deterministic"
     if planning_mode not in PLANNING_MODES:
         raise TaskValidationError(f"unsupported planning_mode: {planning_mode}")
+    search_mode_hint = _clean(raw.get("search_mode_hint"))
+    if search_mode_hint and (search_mode_hint not in SEARCH_MODES or search_mode_hint == "auto"):
+        raise TaskValidationError(f"search_mode_hint must name a concrete search mode, not: {search_mode_hint}")
 
     input_file = _clean(raw.get("input_file"))
     resume_exp_dir = _clean(raw.get("resume_exp_dir"))
@@ -170,6 +176,7 @@ def parse_agent_task(raw: Mapping[str, Any], *, project_root: Path) -> AgentTask
         execution_scope=execution_scope,
         review_mode=review_mode,
         planning_mode=planning_mode,
+        search_mode_hint=search_mode_hint,
         allowed_tools=allowed_tools,
         allow_prompt_mutation=bool(raw.get("allow_prompt_mutation", False)),
         allow_memory_active_publish=bool(raw.get("allow_memory_active_publish", False)),

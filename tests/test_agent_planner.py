@@ -67,3 +67,32 @@ def test_model_assisted_plan_uses_schema_checked_result_or_fallback(tmp_path):
     fallback = build_plan(task, command="dry-run", model_client=lambda _: {"not": "a plan"})
     assert fallback["planner_source"] == "deterministic"
     assert fallback["model_fallback_reason"] == "SchemaValidationError"
+
+
+# --------------------------------------------------------------------------- O-5 structured hint
+
+
+def test_search_mode_hint_overrides_keyword_matching(tmp_path):
+    from agent_runtime.planner import select_search_mode
+    from agent_runtime.task import TaskValidationError
+
+    # A structured hint wins even when the goal text would keyword-match
+    # a different mode.
+    hinted = parse_agent_task(
+        {"goal": "逐轮主链评估", "input_file": "data/data.jsonl", "search_mode_hint": "multi_operator_vertical_stack"},
+        project_root=tmp_path,
+    )
+    mode, assumptions = select_search_mode(hinted)
+    assert mode == "multi_operator_vertical_stack"
+    assert any("search_mode_hint" in item for item in assumptions)
+
+    # Without a hint the documented keyword fallback still applies.
+    fallback = parse_agent_task({"goal": "逐轮主链评估", "input_file": "data/data.jsonl"}, project_root=tmp_path)
+    assert select_search_mode(fallback)[0] == "single_branch"
+
+    for bad in ("auto", "nonsense"):
+        with pytest.raises(TaskValidationError):
+            parse_agent_task(
+                {"goal": "g", "input_file": "data/data.jsonl", "search_mode_hint": bad},
+                project_root=tmp_path,
+            )

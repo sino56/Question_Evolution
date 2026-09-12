@@ -22,6 +22,11 @@ from .context_prompt import assemble_context_prompt
 def select_search_mode(task: AgentTask) -> tuple[str, List[str]]:
     if task.search_mode != "auto":
         return task.search_mode, []
+    if task.search_mode_hint:
+        # Structured hint first (report O-5): a goal phrase must not be the
+        # primary selector for a frozen execution contract.
+        return task.search_mode_hint, ["search_mode=auto resolved through the structured search_mode_hint"]
+    # Keyword matching is only a fallback for goals that carry no hint.
     goal = task.goal.lower()
     if any(marker in goal for marker in ("组合", "叠加", "二次进化", "两算子", "vertical", "stack")):
         return "multi_operator_vertical_stack", ["search_mode=auto matched an operator-composition goal"]

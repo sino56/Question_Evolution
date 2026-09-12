@@ -475,8 +475,17 @@ class GlobalMemoryStore:
         return con.execute("SELECT * FROM watermarks WHERE source_file = ?", (str(source.resolve()),)).fetchone()
 
     @staticmethod
-    def _read_jsonl(path: Path, start_line: int) -> list[tuple[int, dict[str, Any]]]:
+    def _read_jsonl(path: Path, start_line: int) -> tuple[list[tuple[int, dict[str, Any]]], list[tuple[int, str]]]:
+        """Read new records; unparseable lines are quarantined, not fatal.
+
+        A single corrupt line (for example from a crashed writer) used to raise
+        and block the whole extraction forever.  Quarantining the line keeps the
+        source processable while the ``needs_human_review`` audit entry makes
+        the defect explicit (report: memory bad-line isolation).
+        """
+
         records: list[tuple[int, dict[str, Any]]] = []
+        quarantined: list[tuple[int, str]] = []
         with path.open("r", encoding="utf-8") as handle:
             for number, raw in enumerate(handle, 1):
                 if number <= start_line or not raw.strip():
@@ -484,11 +493,13 @@ class GlobalMemoryStore:
                 try:
                     value = json.loads(raw)
                 except json.JSONDecodeError as exc:
-                    raise GlobalMemoryError(f"invalid JSONL in {path} line {number}: {exc.msg}") from exc
+                    quarantined.append((number, f"invalid JSON: {exc.msg}"))
+                    continue
                 if not isinstance(value, Mapping):
-                    raise GlobalMemoryError(f"invalid JSONL object in {path} line {number}")
+                    quarantined.append((number, "line is not a JSON object"))
+                    continue
                 records.append((number, dict(value)))
-        return records
+        return records, quarantined
 
     def _candidate_from_record(self, record: Mapping[str, Any], *, source: Path, line: int, experiment: Path, fact_type: str) -> dict[str, Any]:
         if fact_type == "mechanism_publish_candidate":
@@ -580,7 +591,7 @@ class GlobalMemoryStore:
         # L1 is experiment facts only; control-plane observations are excluded
         # by construction (report M-10).
         job = self.acquire_lease(job_type="phase1_extract", source_exp_dir=str(experiment))
-        included = excluded = rewritten = 0
+        included = excluded = rewritten = quarantined = 0
         try:
             sources = [path for path in experiment.rglob("*") if path.is_file() and path.name in LOCAL_SOURCES]
             with self._connect() as con:
@@ -603,13 +614,16 @@ class GlobalMemoryStore:
                         continue
                     before = included
                     if source.suffix == ".jsonl":
-                        records = self._read_jsonl(source, previous_lines)
+                        records, bad_lines = self._read_jsonl(source, previous_lines)
                     else:
                         try:
                             raw = json.loads(source.read_text(encoding="utf-8"))
                         except json.JSONDecodeError as exc:
                             raise GlobalMemoryError(f"invalid JSON in {source}: {exc.msg}") from exc
-                        records = [] if previous_lines else [(1, _as_mapping(raw))]
+                        records, bad_lines = ([] if previous_lines else [(1, _as_mapping(raw))]), []
+                    for number, reason in bad_lines:
+                        self._log(con, f"{source.resolve()}#{number}", "needs_human_review", f"unparseable line quarantined: {reason}")
+                        quarantined += 1
                     for number, record in records:
                         candidate = self._candidate_from_record(record, source=source, line=number, experiment=experiment, fact_type=fact_type)
                         if self._admit(con, candidate):
@@ -627,7 +641,7 @@ class GlobalMemoryStore:
             self.finish_lease(job_type="phase1_extract", source_exp_dir=str(experiment), success=False)
             raise
         self.publish_projections()
-        return {"job_id": job, "included": included, "excluded": excluded, "source_rewritten": rewritten}
+        return {"job_id": job, "included": included, "excluded": excluded, "source_rewritten": rewritten, "quarantined_lines": quarantined}
 
     def _resolve_source(self, source_file: str) -> Path:
         target = Path(source_file)

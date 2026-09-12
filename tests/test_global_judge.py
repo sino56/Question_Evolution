@@ -128,3 +128,18 @@ def test_judge_instability_is_explicitly_diagnosed(tmp_path: Path):
     )
     report = run_global_judge(build_evidence_pack(exp, project_root=tmp_path, snapshot={"memory_snapshot_id": "MSNAP-test"}))
     assert any(row["diagnosis_kind"] == "judge_instability" and row["diagnosis_level"] == "rubric/judge" for row in report["diagnoses"])
+
+
+def test_judge_instability_metrics_use_structured_signals_only():
+    from agent_runtime.global_judge import _metrics
+
+    rows = [
+        # Free-text wording mentioning judge disagreement must not be inferred
+        # as instability (report V-7).
+        {"branch_status": "the judge disagreed with the label wording"},
+        # Exact structured labels and the typed signal do count.
+        {"branch_status": "judge_instability"},
+        {"score_summary": {"judge_consistent": False}},
+    ]
+    metrics = _metrics(rows)
+    assert abs(metrics["judge_disagreement_rate"] - (2 / 3)) < 1e-9
