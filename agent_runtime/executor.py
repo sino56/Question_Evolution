@@ -22,7 +22,7 @@ from .contracts import ContractViolation, validate_contract
 from .events import append_event, redact
 from .budgeting import BudgetLedgerError, load_or_create_ledger, save_ledger
 from .budgeting.budget_state import UNALLOCATED_TARGET
-from .observer import normalize_tool_result
+from .observer import normalize_tool_result, record_observations, rollback_completed_observation
 from .policy import ENV_ALLOWLIST, validate_env_overrides, validate_plan
 from .task import AgentTask, REGISTERED_TOOLS
 from .tools import ToolExecutionError, cost_estimate, get_tool_spec
@@ -39,6 +39,11 @@ _STEP_ARGUMENT_ENV_ALIASES = {
 }
 # Positional tool parameters that are never environment overrides.
 _STEP_ARGUMENT_POSITIONAL = {"experiment_dir", "start_round", "resume_exp_dir", "resume_start_round"}
+# A decision must always be made against a *fresh* view of the artifacts, so a
+# read-only observation step is never skipped when a Session resumes or
+# continues.  The checkpoint saves the effecting work, not the ability to look
+# at its result (report O-7).
+_ALWAYS_FRESH_TOOLS = {"observe_experiment"}
 # Step arguments that must stay integers when applied to an ``AgentTask``.
 _STEP_ARGUMENT_INT_FIELDS = {
     "SEARCH_BOUNDARY_TARGET": "boundary_target",
@@ -51,6 +56,15 @@ _STEP_ARGUMENT_TASK_FIELDS = {
     "EXECUTION_SCOPE": "execution_scope",
     **{env: field for env, field in _STEP_ARGUMENT_INT_FIELDS.items()},
 }
+
+
+def _as_costing(result: Mapping[str, Any]) -> str:
+    """Return a result's declared cost policy (``""`` when unreported)."""
+
+    cost = result.get("cost")
+    if isinstance(cost, Mapping):
+        return str(cost.get("cost_policy") or "")
+    return ""
 
 
 class ExecutorError(RuntimeError):
@@ -107,6 +121,7 @@ class Executor:
         state: MutableMapping[str, Any],
         observe: Callable[..., Dict[str, Any]],
         update_state: Callable[..., Any],
+        rollback: Optional[Callable[[], Optional[Mapping[str, Any]]]] = None,
     ) -> None:
         self.task = task
         self.plan = plan
@@ -120,6 +135,10 @@ class Executor:
         self.state = state
         self.observe = observe
         self.update_state = update_state
+        # Rolls the Session back to the plan revision this one replaced.  It is
+        # injected because plan persistence belongs to ``state.write_plan_revision``
+        # (report O-2 / R-3: rollback was entirely missing).
+        self.rollback = rollback
         self.events_path = self.run_dir / "agent_events.jsonl"
         self.ledger_path = self.run_dir / "tool_idempotency.json"
         self.ledger = self._load_ledger()
@@ -140,13 +159,8 @@ class Executor:
         return validated
 
     def _write_observations(self, items: Iterable[Mapping[str, Any]]) -> None:
-        target = self.run_dir / "agent_observation_timeline.jsonl"
-        with target.open("a", encoding="utf-8") as handle:
-            for item in items:
-                safe_item = redact(item)
-                handle.write(json.dumps(safe_item, ensure_ascii=False, sort_keys=True) + "\n")
-                append_event(self.events_path, "observation_created", safe_item)
-                self.normalized_observations.append(safe_item)
+        written = record_observations(self.run_dir, items)
+        self.normalized_observations.extend(written)
 
     def _load_ledger(self) -> Dict[str, Dict[str, Any]]:
         if not self.ledger_path.exists():
@@ -241,7 +255,7 @@ class Executor:
         tool = str(step.get("tool_name") or step.get("tool") or "")
         if tool not in REGISTERED_TOOLS or tool not in self.task.allowed_tools:
             raise ExecutorError(f"step uses an unregistered or unauthorized tool: {tool}")
-        get_tool_spec(tool)
+        spec = get_tool_spec(tool)
         # Fail fast: a Step argument that cannot be projected onto the tool's
         # contract must never be dropped silently (T-1).
         _arguments_to_env_overrides(step.get("arguments") or step.get("inputs") or {})
@@ -250,11 +264,25 @@ class Executor:
         if missing_dependencies:
             raise ExecutorError("step dependencies are not completed: " + ", ".join(sorted(missing_dependencies)))
         budget = step.get("budget_limit") or {}
-        maximum = budget.get("max_tool_calls")
-        if maximum is not None and (not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1):
-            raise ExecutorError("max_tool_calls must be a positive integer")
-        if isinstance(maximum, int) and sum(1 for result in self.results if result.get("tool") == tool) >= maximum:
-            raise ExecutorError(f"tool budget exhausted for {tool}")
+        # Step-level budgets are only meaningful when they name a counter the
+        # executor actually maintains.  ``max_tool_calls`` bounds how often this
+        # step may invoke its own tool inside one plan revision, and
+        # ``max_model_calls`` bounds the model-billed invocations (report R-2).
+        for field_name, counter in (("max_tool_calls", None), ("max_model_calls", "model_billed")):
+            maximum = budget.get(field_name)
+            if maximum is None:
+                continue
+            if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1:
+                raise ExecutorError(f"{field_name} must be a positive integer")
+            if counter is None:
+                used = sum(1 for result in self.results if result.get("tool") == tool)
+            else:
+                used = sum(
+                    1 for result in self.results
+                    if result.get("tool") == tool and str(_as_costing(result)) == counter
+                )
+            if used >= maximum:
+                raise ExecutorError(f"step budget exhausted for {tool}: {field_name}={maximum}")
 
     def _validate_preconditions(self, step: Mapping[str, Any]) -> None:
         prior = {str(result.get("tool")): result for result in self.results}
@@ -314,7 +342,7 @@ class Executor:
                 return False, "artifact_missing:agent_observation.json", True
         return True, "ok", False
 
-    def _invoke_registry(self, method_name: str, *args: Any, tool_call_id: str, idempotency_key: str, **kwargs: Any) -> Dict[str, Any]:
+    def _invoke_registry(self, method_name: str, *args: Any, tool_call_id: str, idempotency_key: str, allow_retry: bool = True, **kwargs: Any) -> Dict[str, Any]:
         """Invoke a registry capability, passing only the kwargs it declares.
 
         The previous implementation toggled *all three* runtime kwargs based on
@@ -322,7 +350,8 @@ class Executor:
         declared ``tool_call_id`` but not ``record_events`` therefore silently
         lost its idempotency key -- and any signature change degraded into
         duplicate event recording instead of an error (T-8).  Each runtime kwarg
-        is now injected independently and only when the callable accepts it.
+        is now injected independently and only when the callable accepts it, so
+        a minimal test double that declares none of them still works.
         """
 
         method = getattr(self.registry, method_name)
@@ -332,20 +361,42 @@ class Executor:
             ("tool_call_id", tool_call_id),
             ("idempotency_key", idempotency_key),
             ("record_events", False),
+            ("allow_retry", allow_retry),
         ):
             if accepts_kwargs or name in parameters:
                 kwargs[name] = value
         return dict(method(*args, **kwargs))
 
+    def _allow_retry(self, spec: Any) -> bool:
+        """Return False when retrying a side-effecting tool is unsafe (R-6).
+
+        ``run_full_loop`` / ``resume_full_loop`` restart the *entire* pipeline, so
+        a retry after observable progress risks double-billing.  A retry is
+        refused when this Session already holds a successful result for that
+        tool, or when the pipeline already produced an experiment directory.
+        Read-only tools keep their retry policy unchanged.
+        """
+
+        if not getattr(spec, "side_effects", False):
+            return True
+        for entry in self.ledger.values():
+            if entry.get("ok") and str(entry.get("tool") or "") == spec.tool_name:
+                return False
+        if spec.tool_name == "run_full_loop" and self.state.get("experiment_dir"):
+            return False
+        return True
+
     def _run_step(self, step: Mapping[str, Any], *, idempotency_key: str, tool_call_id: str) -> Dict[str, Any]:
         tool = str(step["tool_name"])
+        spec = get_tool_spec(tool)
         env_overrides = self._effective_env_overrides(step)
+        allow_retry = self._allow_retry(spec)
         if tool == "check_environment":
-            return self._invoke_registry("check_environment", self._task_for_step(step), tool_call_id=tool_call_id, idempotency_key=idempotency_key)
+            return self._invoke_registry("check_environment", self._task_for_step(step), tool_call_id=tool_call_id, idempotency_key=idempotency_key, allow_retry=allow_retry)
         if tool == "run_full_loop":
-            return self._invoke_registry("run_full_loop", self.task, env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key)
+            return self._invoke_registry("run_full_loop", self.task, env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key, allow_retry=allow_retry)
         if tool == "resume_full_loop":
-            return self._invoke_registry("resume_full_loop", self.task, env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key)
+            return self._invoke_registry("resume_full_loop", self.task, env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key, allow_retry=allow_retry)
         if tool == "observe_experiment":
             exp_dir = self.state.get("experiment_dir") or self.task.resume_exp_dir
             if not exp_dir:
@@ -366,15 +417,24 @@ class Executor:
         self._validate_preconditions(step)
         tool = str(step["tool_name"])
         key = self._idempotency_key(step)
-        if key in self.ledger and self.ledger[key].get("ok"):
+        # A read-only observation is exempt from both the checkpoint and the
+        # ledger shortcut: every decision needs a fresh view of the artifacts,
+        # so reusing a previous observation would make the loop decide on stale
+        # evidence (report O-7).
+        if key in self.ledger and self.ledger[key].get("ok") and tool not in _ALWAYS_FRESH_TOOLS:
             reused = {**self.ledger[key], "reused": True}
             append_event(self.events_path, "tool_reused", {"tool": tool, "idempotency_key": key, "tool_call_id": reused.get("tool_call_id")})
+            if isinstance(reused.get("observation"), Mapping):
+                self.observation = dict(reused["observation"])
             self.results.append(reused)
             return reused
 
         call_id = f"call_{uuid.uuid4().hex[:16]}"
         spec = get_tool_spec(tool)
-        if "model_calls" in self.budget_ledger.hard_limits:
+        # ``model_calls`` counts *model-billed* invocations only.  Charging it for
+        # every tool call made the counter a tool-call tally and mis-stated real
+        # model consumption (report R-2); local tools consume nothing.
+        if "model_calls" in self.budget_ledger.hard_limits and spec.cost_policy == "model_billed":
             try:
                 self.budget_ledger.consume("model_calls", UNALLOCATED_TARGET, 1, evidence_ref={"tool": tool, "tool_call_id": call_id})
             except BudgetLedgerError as exc:
@@ -409,7 +469,13 @@ class Executor:
                         result["recoverable"] = False
             validate_contract("agent_tool_result.schema.json", dict(result), path="$.tool_result")
             observation_items = self._observation_items(result)
-        except (ExecutorError, ToolExecutionError, OSError, ValueError, ContractViolation) as exc:
+        except (ValueError, TypeError) as exc:
+            # A malformed argument or configuration defect is something to *fix*,
+            # not a system fault: classifying it as fatal pushed an agent bug
+            # into manual review instead of surfacing it (report R-5).
+            result = {"tool": tool, "tool_version": spec.version, "tool_call_id": call_id, "idempotency_key": key, "ok": False, "return_code": -1, "duration_seconds": round(time.monotonic() - started, 6), "retry_count": 0, "failure_category": "configuration_error", "recoverable": False, "stderr_summary": str(exc), "cost": cost_estimate(spec)}
+            observation_items = self._observation_items(result)
+        except (ExecutorError, ToolExecutionError, OSError, ContractViolation) as exc:
             result = {"tool": tool, "tool_version": spec.version, "tool_call_id": call_id, "idempotency_key": key, "ok": False, "return_code": -1, "duration_seconds": round(time.monotonic() - started, 6), "retry_count": 0, "failure_category": "fatal_system_error", "recoverable": False, "stderr_summary": str(exc), "cost": cost_estimate(spec)}
             observation_items = self._observation_items(result)
         entry = redact(result)
@@ -434,9 +500,44 @@ class Executor:
                 self.update_state(self.run_dir, self.state, experiment_dir=result["experiment_dir"])
         return result
 
+    def rollback_to_previous_revision(self, *, reason: str) -> Optional[Dict[str, Any]]:
+        """Roll the Session back to the plan revision this one replaced.
+
+        Design §6.2 requires an ``Observing → RollingBack → Replanning`` path but
+        no rollback existed (report O-2/R-3).  The rollback is recorded as a
+        first-class observation so the audit trail shows *why* a Session re-ran
+        an earlier plan, and it is bounded by the caller's round budget.
+        """
+
+        if self.rollback is None:
+            raise ExecutorError("rollback is not configured for this Executor")
+        rolled_back = self.rollback()
+        if rolled_back is None:
+            return None
+        observation = rollback_completed_observation(
+            from_plan_id=str(self.plan.get("plan_id") or ""),
+            to_plan_id=str(rolled_back.get("plan_id") or ""),
+            reason=reason,
+        )
+        self._write_observations([observation])
+        append_event(self.events_path, "rollback_completed", {
+            "from_plan_id": self.plan.get("plan_id"),
+            "to_plan_id": rolled_back.get("plan_id"),
+            "to_plan_revision": rolled_back.get("plan_revision"),
+            "reason": reason,
+        })
+        return dict(rolled_back)
+
     def execute(self, steps: Iterable[Mapping[str, Any]]) -> list[Dict[str, Any]]:
         for step in steps:
             if step.get("tool_name") == "write_agent_report":
+                continue
+            step_id = str(step.get("step_id") or "")
+            completed = set(self.state.get("completed_step_ids") or [])
+            if step_id and step_id in completed and str(step.get("tool_name")) not in _ALWAYS_FRESH_TOOLS:
+                # Session resume consumes the confirmed checkpoint instead of
+                # re-invoking a step that already produced its artifact (O-7).
+                append_event(self.events_path, "step_skipped", {"step_id": step_id, "tool": step.get("tool_name"), "reason": "already_confirmed_in_session_checkpoint"})
                 continue
             self.update_state(self.run_dir, self.state, status="observing" if step.get("tool_name") == "observe_experiment" else "executing", current_step_id=step.get("step_id"))
             result = self.execute_step(step)

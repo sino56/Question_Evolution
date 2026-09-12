@@ -19,6 +19,11 @@ EXECUTION_SCOPES = {
     "reference_rebuild_only",
     "debug_generation_only",
 }
+# Scopes that a registered entry point actually implements.  Declared scopes
+# without an implementation are still parseable (so a task can be described),
+# but every Planner/Policy check must agree on the same, single-source set
+# instead of each re-hard-coding "only full_iteration works" (report O-9).
+SUPPORTED_EXECUTION_SCOPES = {"full_iteration"}
 REVIEW_MODES = {"none", "report_only"}
 PLANNING_MODES = {"deterministic", "model_assisted"}
 REGISTERED_TOOLS = {

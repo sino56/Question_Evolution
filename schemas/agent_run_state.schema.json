@@ -22,6 +22,9 @@
     "memory_context_key": {"type": ["string", "null"]},
     "context_cache_key": {"type": ["string", "null"], "pattern": "^sha256:"},
     "memory_mode": {"type": "string"},
+    "original_memory_snapshot_id": {"type": ["string", "null"]},
+    "memory_degraded": {"type": "boolean"},
+    "memory_degraded_reason": {"type": ["string", "null"]},
     "requires_manual_review": {"type": "boolean"},
     "manual_review_status": {"type": ["string", "null"]},
     "resume_checkpoint": {"type": "object", "required": ["resume_exp_dir", "resume_start_round", "last_completed_step_id"]}

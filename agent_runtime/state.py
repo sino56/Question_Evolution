@@ -70,6 +70,11 @@ def _default_manifest(run_dir: Path, *, run_id: str, mode: str, root_goal: str =
         "memory_context_key": None,
         "context_cache_key": None,
         "memory_mode": "no_global_memory",
+        # Explicit downgrade audit: a resume whose frozen snapshot is gone must
+        # say so instead of silently substituting a fresh one (report R-4).
+        "original_memory_snapshot_id": None,
+        "memory_degraded": False,
+        "memory_degraded_reason": None,
         "requires_manual_review": False,
         "manual_review_status": None,
         "resume_checkpoint": {
@@ -182,6 +187,11 @@ def write_plan_revision(
             "replaces_plan_path": previous_path,
         },
     })
+    # ``plan_revision`` is owned here: the schema no longer requires it on the
+    # pre-persist in-memory plan (O-8), so the persistence boundary must assert
+    # that every *stored* plan carries a real revision.
+    if not isinstance(revised.get("plan_revision"), int) or isinstance(revised.get("plan_revision"), bool) or revised["plan_revision"] < 1:
+        raise ValueError("a persisted plan must carry a positive integer plan_revision")
     target = run_dir / "plans" / f"plan_r{revision:03d}.json"
     _write_json(target, revised)
     write_plan(run_dir, revised)

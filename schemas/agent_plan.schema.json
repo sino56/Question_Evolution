@@ -2,10 +2,10 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Question Evolution Agent Plan",
   "type": "object",
-  "required": ["plan_id", "plan_revision", "plan_kind", "plan_layers", "goal_summary", "selected_search_mode", "selected_execution_scope", "selected_review_mode", "budget", "env_overrides", "steps", "assumptions", "blocked_reasons"],
+  "required": ["plan_id", "plan_kind", "plan_layers", "goal_summary", "selected_search_mode", "selected_execution_scope", "selected_review_mode", "budget", "env_overrides", "steps", "assumptions", "blocked_reasons"],
   "properties": {
     "plan_id": {"type": "string", "minLength": 1},
-    "plan_revision": {"type": "integer", "minimum": 0},
+    "plan_revision": {"type": "integer", "minimum": 0, "description": "Assigned by state.write_plan_revision when the plan is persisted; a pre-persist in-memory plan legitimately has no revision yet."},
     "plan_kind": {"enum": ["task_plan", "recovery_plan", "review_plan"]},
     "plan_layers": {"type": "array", "minItems": 1, "items": {"enum": ["task_plan", "round_plan", "recovery_plan", "review_plan"]}},
     "goal_summary": {"type": "string", "minLength": 1},

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Mapping
 
-from .task import EXECUTION_SCOPES, REGISTERED_TOOLS, AgentTask
+from .task import EXECUTION_SCOPES, REGISTERED_TOOLS, SUPPORTED_EXECUTION_SCOPES, AgentTask
 
 
 class PolicyViolation(ValueError):
@@ -125,8 +125,11 @@ def validate_plan(task: AgentTask, plan: Mapping[str, Any]) -> None:
                 raise PolicyViolation("plan cannot modify protected formal assets: " + ", ".join(sorted(protected)))
     if task.review_mode == "report_only" and any(step["tool"] in {"check_environment", "run_full_loop", "resume_full_loop"} for step in steps):
         raise PolicyViolation("report_only plans cannot execute pipeline tools")
-    if task.execution_scope != "full_iteration" and any(step["tool"] in {"run_full_loop", "resume_full_loop"} for step in steps):
-        raise PolicyViolation("current registered loop only supports full_iteration execution")
+    if task.execution_scope not in SUPPORTED_EXECUTION_SCOPES and any(step["tool"] in {"run_full_loop", "resume_full_loop"} for step in steps):
+        raise PolicyViolation(
+            f"execution_scope {task.execution_scope} has no registered entry point; "
+            "the current registered loop only supports full_iteration execution"
+        )
     _validate_execution_skeleton(task, steps)
 
 

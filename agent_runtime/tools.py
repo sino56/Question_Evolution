@@ -286,13 +286,23 @@ class ToolRegistry:
         tool_call_id: str = "",
         idempotency_key: str = "",
         record_events: bool = True,
+        allow_retry: bool = True,
     ) -> Dict[str, Any]:
         spec = get_tool_spec(tool)
         allowed_env = validate_env_overrides(env_overrides)
         environment = os.environ.copy()
         environment.update(allowed_env)
         call_id = tool_call_id or f"call_{uuid.uuid4().hex[:16]}"
-        attempts = max(1, spec.retry_policy.max_attempts)
+        # A side-effecting tool whose Session already produced a result must not
+        # restart the whole pipeline: the executor withholds the retry budget
+        # (report R-6) and the withheld decision is recorded for audit.
+        attempts = max(1, spec.retry_policy.max_attempts) if allow_retry else 1
+        if not allow_retry and record_events:
+            append_event(self.events_path, "tool_retry_withheld", {
+                "tool": tool, "tool_version": spec.version, "tool_call_id": call_id,
+                "idempotency_key": idempotency_key,
+                "reason": "side_effecting_tool_already_has_a_successful_session_record",
+            })
 
         for attempt in range(1, attempts + 1):
             if record_events:
@@ -354,9 +364,9 @@ class ToolRegistry:
         # fall through; the previous unreachable ``return last_result`` is gone.
         raise ToolExecutionError(f"{tool} produced no result")
 
-    def check_environment(self, task: AgentTask, *, tool_call_id: str = "", idempotency_key: str = "", record_events: bool = True) -> Dict[str, Any]:
+    def check_environment(self, task: AgentTask, *, tool_call_id: str = "", idempotency_key: str = "", record_events: bool = True, allow_retry: bool = True) -> Dict[str, Any]:
         command = [sys.executable, "check_runtime_environment.py", "--input-file", task.input_file, "--json"]
-        result = self._execute("check_environment", command, env_overrides={}, tool_call_id=tool_call_id, idempotency_key=idempotency_key, record_events=record_events)
+        result = self._execute("check_environment", command, env_overrides={}, tool_call_id=tool_call_id, idempotency_key=idempotency_key, record_events=record_events, allow_retry=allow_retry)
         parsed: Optional[Dict[str, Any]] = None
         if result["_stdout"].strip():
             try:
@@ -449,20 +459,20 @@ class ToolRegistry:
         cost["source_ref"] = str(path.resolve())
         result["cost"] = cost
 
-    def run_full_loop(self, task: AgentTask, env_overrides: Mapping[str, Any], *, tool_call_id: str = "", idempotency_key: str = "", record_events: bool = True) -> Dict[str, Any]:
+    def run_full_loop(self, task: AgentTask, env_overrides: Mapping[str, Any], *, tool_call_id: str = "", idempotency_key: str = "", record_events: bool = True, allow_retry: bool = True) -> Dict[str, Any]:
         exp_root = str(env_overrides.get("EXP_ROOT", task.exp_root))
         before = self._experiment_dirs(exp_root)
-        result = self._execute("run_full_loop", [self._bash_path(), "run_loop.sh"], env_overrides=env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key, record_events=record_events)
+        result = self._execute("run_full_loop", [self._bash_path(), "run_loop.sh"], env_overrides=env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key, record_events=record_events, allow_retry=allow_retry)
         result["experiment_dir"] = self._locate_experiment_dir(result.pop("_stdout", ""), exp_root, before=before)
         result.pop("_stderr", None)
         self._write_experiment_dir(result["experiment_dir"])
         self._backfill_cost(result)
         return result
 
-    def resume_full_loop(self, task: AgentTask, env_overrides: Mapping[str, Any], *, tool_call_id: str = "", idempotency_key: str = "", record_events: bool = True) -> Dict[str, Any]:
+    def resume_full_loop(self, task: AgentTask, env_overrides: Mapping[str, Any], *, tool_call_id: str = "", idempotency_key: str = "", record_events: bool = True, allow_retry: bool = True) -> Dict[str, Any]:
         if not task.resume_exp_dir or not task.resume_start_round:
             raise ToolExecutionError("resume_full_loop requires resume_exp_dir and resume_start_round")
-        result = self._execute("resume_full_loop", [self._bash_path(), "run_loop.sh", "--resume-exp-dir", task.resume_exp_dir], env_overrides=env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key, record_events=record_events)
+        result = self._execute("resume_full_loop", [self._bash_path(), "run_loop.sh", "--resume-exp-dir", task.resume_exp_dir], env_overrides=env_overrides, tool_call_id=tool_call_id, idempotency_key=idempotency_key, record_events=record_events, allow_retry=allow_retry)
         result.pop("_stdout", None)
         result.pop("_stderr", None)
         result["experiment_dir"] = str(Path(task.resume_exp_dir).resolve())

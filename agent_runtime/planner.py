@@ -15,7 +15,7 @@ from schema_validation import SchemaValidationError, load_schema, validate_insta
 
 from .contracts import ContractViolation, validate_contract
 from .policy import PolicyViolation, validate_plan
-from .task import AgentTask
+from .task import SUPPORTED_EXECUTION_SCOPES, AgentTask
 from .context_prompt import assemble_context_prompt
 
 
@@ -91,7 +91,7 @@ def _step(
         "success_condition": success_condition,
         "business_failure_action": business_failure_action,
         "system_failure_action": system_failure_action,
-        "budget_limit": dict(budget_limit or {}),
+        "budget_limit": {"max_tool_calls": 1, **dict(budget_limit or {})},
         "depends_on": list(depends_on or []),
         "stop_if_failed": stop_if_failed,
         "run_when": run_when,
@@ -174,12 +174,17 @@ def _deterministic_plan(task: AgentTask, *, command: str) -> Dict[str, Any]:
         business_failure_action="report_failure",
         stop_if_failed=False,
     ))
-    if task.execution_scope != "full_iteration" and not task.is_review_only:
-        blocked.append("the current registered loop only supports full_iteration; no partial execution entry point is registered")
+    if task.execution_scope not in SUPPORTED_EXECUTION_SCOPES and not task.is_review_only:
+        blocked.append(
+            f"execution_scope {task.execution_scope} is declared but has no registered entry point; "
+            "only full_iteration is executable"
+        )
 
     return {
         "plan_id": f"plan_{uuid.uuid4().hex[:16]}",
-        "plan_revision": 0,
+        # ``plan_revision`` is owned by ``state.write_plan_revision``: emitting a
+        # constant here produced a field that never represented the real
+        # revision and was overwritten every time (report O-8).
         "plan_kind": plan_kind,
         "plan_layers": plan_layers,
         "goal_summary": task.goal[:1000],

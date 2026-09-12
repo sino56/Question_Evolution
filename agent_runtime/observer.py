@@ -10,6 +10,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 from pipeline_runtime import StageJsonError, load_json_records, validate_published_artifact
 
+from .contracts import validate_contract
+from .events import append_event, redact
+
 
 OBSERVATION_TYPES = {
     "environment_ready", "pipeline_started", "pipeline_completed", "candidate_invalid",
@@ -18,6 +21,8 @@ OBSERVATION_TYPES = {
     "tool_fatal_failure", "artifact_missing", "manifest_corrupted", "review_report_ready",
     # Design §12.1 reflector actions that had no representable observation.
     "effective_boundary_found", "judge_instability_detected", "rollback_completed", "memory_written",
+    # R-5: a configuration defect is a distinct, non-retryable failure class.
+    "configuration_error",
 }
 MANIFEST_STATUSES = ("ok", "damaged", "not_checked")
 BUDGET_TERMINAL_REASONS = {
@@ -61,6 +66,43 @@ def _observation(
     }
 
 
+def rollback_completed_observation(*, from_plan_id: str, to_plan_id: str, reason: str) -> Dict[str, Any]:
+    """Describe a completed plan rollback as a normalized observation (V-3)."""
+
+    return _observation(
+        "rollback",
+        "rollback_completed",
+        reason,
+        severity="warning",
+        metrics={"from_plan_id": from_plan_id, "to_plan_id": to_plan_id},
+        recommended_actions=["re_execute_previous_plan_revision"],
+        requires_human_review=False,
+    )
+
+
+def record_observations(run_dir: str | Path, items: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """Validate and append normalized observations to the Session timeline.
+
+    This is the single writer for the observation timeline, so every producer
+    (executor steps and control-loop rollbacks) publishes byte-identical
+    records and the same ``observation_created`` event.
+    """
+
+    root = Path(run_dir)
+    timeline = root / "agent_observation_timeline.jsonl"
+    events_path = root / "agent_events.jsonl"
+    written: List[Dict[str, Any]] = []
+    for item in items:
+        validate_contract("agent_normalized_observation.schema.json", dict(item), path="$.observation")
+        safe_item = redact(dict(item))
+        timeline.parent.mkdir(parents=True, exist_ok=True)
+        with timeline.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(safe_item, ensure_ascii=False, sort_keys=True) + "\n")
+        append_event(events_path, "observation_created", safe_item)
+        written.append(safe_item)
+    return written
+
+
 def _judge_stability(statistics: Mapping[str, Any]) -> Dict[str, Any]:
     """Derive judge stability from structured statistics only, never labels."""
 
@@ -94,6 +136,18 @@ def normalize_tool_result(tool_result: Mapping[str, Any], *, experiment_observat
 
     tool = str(tool_result.get("tool") or "unknown_tool")
     if not tool_result.get("ok", False) and not (tool == "observe_experiment" and experiment_observation is not None):
+        if str(tool_result.get("failure_category") or "") == "configuration_error":
+            # A configuration/argument defect is neither retryable nor a system
+            # fault: it must surface as a defect to fix (report R-5).
+            return [_observation(
+                tool,
+                "configuration_error",
+                str(tool_result.get("stderr_summary") or "the step configuration is invalid"),
+                severity="error",
+                metrics={"return_code": tool_result.get("return_code"), "retry_count": tool_result.get("retry_count", 0)},
+                recommended_actions=["fix_configuration"],
+                requires_human_review=True,
+            )]
         retryable = bool(tool_result.get("recoverable"))
         return [_observation(
             tool,

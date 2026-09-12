@@ -2,12 +2,14 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agent_runtime.executor import Executor
+from agent_runtime.executor import Executor, ExecutorError
 from agent_runtime.task import parse_agent_task
 from schema_validation import load_schema, validate_instance
 
@@ -75,7 +77,7 @@ def test_executor_marks_missing_formal_artifact_as_fatal_failure(tmp_path):
     assert state["completed_step_ids"] == []
 
 
-def test_executor_records_every_non_reused_call_and_enforces_model_call_budget(tmp_path):
+def test_local_tools_do_not_consume_the_model_call_budget(tmp_path):
     calls = []
 
     class Registry:
@@ -91,5 +93,31 @@ def test_executor_records_every_non_reused_call_and_enforces_model_call_budget(t
     executor = Executor(task=task, plan={"plan_id": "plan-1", "env_overrides": {}}, registry=Registry(), run_dir=tmp_path / "run", state=state, observe=lambda *_args, **_kwargs: {}, update_state=_update)
     executor.execute_step(_step("check_environment"))
     ledger = json.loads((tmp_path / "run" / "budget_ledger.json").read_text(encoding="utf-8"))
-    assert ledger["consumed"]["model_calls"]["pool:unallocated"] == 1
+    # ``model_calls`` counts model-billed invocations only; a local preflight
+    # must not consume it (report R-2).
+    assert ledger["consumed"].get("model_calls", {}) == {}
     assert any(event["event_type"] == "tool_call_observed" for event in ledger["events"])
+
+
+def test_model_billed_tools_consume_and_enforce_the_model_call_budget(tmp_path):
+    calls = []
+
+    class Registry:
+        def run_full_loop(self, task, env):
+            calls.append(task.input_file)
+            return {"tool": "run_full_loop", "ok": True, "return_code": 0}
+
+    state = {"completed_step_ids": []}
+    task = parse_agent_task(
+        {"goal": "find boundaries", "input_file": "data/data.jsonl", "budget_limits": {"model_calls": 1}, "allowed_tools": ["run_full_loop"]},
+        project_root=tmp_path,
+    )
+    executor = Executor(task=task, plan={"plan_id": "plan-1", "env_overrides": {}}, registry=Registry(), run_dir=tmp_path / "run", state=state, observe=lambda *_args, **_kwargs: {}, update_state=_update)
+    executor.execute_step(_step("run_full_loop", expected_outputs=[]))
+    ledger = json.loads((tmp_path / "run" / "budget_ledger.json").read_text(encoding="utf-8"))
+    assert ledger["consumed"]["model_calls"]["pool:unallocated"] == 1
+
+    # The hard limit is enforced for a *different* logical invocation.
+    with pytest.raises(ExecutorError):
+        executor.execute_step(_step("run_full_loop", arguments={"search_max_depth": 2}, expected_outputs=[]))
+    assert len(calls) == 1
