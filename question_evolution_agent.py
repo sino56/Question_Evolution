@@ -17,6 +17,7 @@ from agent_runtime.context import build_context_pack
 from agent_runtime.contracts import ContractViolation
 from agent_runtime.events import append_event
 from agent_runtime.multi_agent.coordinator import run_post_experiment_review
+from agent_runtime.global_judge import mount_judge_for_review
 from agent_runtime.global_memory import RETRIEVAL_CONFIG_VERSION, GlobalMemoryStore, SnapshotUnavailable, router_cache_key
 from agent_runtime.executor import Executor, ExecutorError
 from agent_runtime.observer import observe_experiment
@@ -587,11 +588,26 @@ def run_agent(
         requires_manual_review=manual_review,
         manual_review_status="pending" if manual_review else None,
     )
+    global_judge: Dict[str, Any] = {}
+    if command == "review":
+        # V-6: mount the offline Global Judge on the review path.  It is
+        # proposal-only and fail-open, so a rejection can never change the
+        # Session outcome -- but the design's offline attribution now runs.
+        experiment_dir = str(state.get("experiment_dir") or task.resume_exp_dir or "")
+        if experiment_dir:
+            global_judge = mount_judge_for_review(
+                run_dir,
+                experiment_dir=experiment_dir,
+                snapshot_id=str(state.get("memory_snapshot_id") or ""),
+                project_root=ROOT,
+            )
+        else:
+            global_judge = {"status": "degraded", "reason": "no experiment directory was resolved for the review"}
     report_step = next((step for step in plan["steps"] if step.get("tool_name") == "write_agent_report"), None)
     if report_step and executor is not None:
-        executor.execute_report(report_step, lambda: write_agent_report(run_dir, task=task.as_dict(), state=state, plan=plan, observation=observation, tool_results=results, decision=decision, multi_agent_review=multi_agent_review))
+        executor.execute_report(report_step, lambda: write_agent_report(run_dir, task=task.as_dict(), state=state, plan=plan, observation=observation, tool_results=results, decision=decision, multi_agent_review=multi_agent_review, global_judge=global_judge))
     if command == "review":
-        write_global_review_artifacts(run_dir, observation)
+        write_global_review_artifacts(run_dir, observation, global_judge=global_judge)
     return (2 if status == "blocked" else 0), run_dir
 
 

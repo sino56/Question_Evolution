@@ -547,6 +547,70 @@ def run_global_judge(pack: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def mount_judge_for_review(
+    run_dir: str | Path,
+    *,
+    experiment_dir: str | Path,
+    snapshot_id: str,
+    project_root: str | Path = ".",
+    manual_review: str | Path | None = None,
+) -> dict[str, Any]:
+    """Run the offline Global Judge on the *review* path (design §17, report V-6).
+
+    The Judge used to be reachable only through its own CLI, so the design's
+    offline attribution never ran inside a Session.  This mounts it, with two
+    hard guarantees preserved:
+
+    * **fail-open** -- the Judge is advisory, so any rejection returns an
+      explicit ``degraded`` summary and never changes the Session outcome;
+    * **proposal-only** -- outputs are written below
+      ``memory_global/global_judge/`` (``write_json`` refuses any other path) and
+      no formal pipeline artifact can be overwritten.
+    """
+
+    governance = Path(project_root).resolve() / "memory_global" / "global_judge"
+    try:
+        pack = build_evidence_pack(
+            experiment_dir,
+            project_root=project_root,
+            snapshot={"memory_snapshot_id": str(snapshot_id), "source": "agent_session_manifest"},
+            manual_review=manual_review,
+        )
+        report = run_global_judge(pack)
+    except EvidencePackRejected as exc:
+        return {"status": "degraded", "reason": f"evidence pack rejected: {exc}"}
+    except (GlobalJudgeError, OSError, ValueError) as exc:
+        return {"status": "degraded", "reason": f"global judge unavailable: {exc}"}
+    evidence_path = governance / f"evidence_pack_{pack['evidence_pack_id']}.json"
+    report_path = governance / f"judge_report_{report['run_id']}.json"
+    write_json(evidence_path, pack, project_root=project_root)
+    write_json(report_path, report, project_root=project_root)
+    index_path = governance / "judge_runs.jsonl"
+    with index_path.open("a", encoding="utf-8") as handle:
+        handle.write(_json({
+            "run_id": report["run_id"],
+            "evidence_pack_id": pack["evidence_pack_id"],
+            "created_at": report["created_at"],
+            "agent_run_dir": str(Path(run_dir).resolve()),
+            "diagnosis_summary": report["diagnosis_summary"],
+            "proposal_count": len(report["proposals"]),
+            "shadow_card_count": len(report["shadow_strategy_cards"]),
+        }) + "\n")
+    return {
+        "status": "completed",
+        "run_id": report["run_id"],
+        "evidence_pack_id": pack["evidence_pack_id"],
+        "diagnosis_summary": report["diagnosis_summary"],
+        "proposal_count": len(report["proposals"]),
+        "shadow_card_count": len(report["shadow_strategy_cards"]),
+        "shadow_rejections": report["shadow_rejections"],
+        "evidence_pack_path": str(evidence_path),
+        "report_path": str(report_path),
+        "conclusion": report["conclusion"],
+        "action_limit": "Proposal-only: the Judge cannot modify prompts, Router, Rubric, scores, state, operators, or active Memory.",
+    }
+
+
 def _scope_match(scope: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
     declared = {key: _text(value).lower() for key, value in scope.items() if _text(value) and key in {"scene_family", "question_form", "reasoning_mechanism"}}
     if not declared:

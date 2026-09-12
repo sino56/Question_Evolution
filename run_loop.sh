@@ -3,10 +3,27 @@
 # 每轮把上一轮 scored/state 结果接入画像、分流、路由、多候选进化、复杂度校验、
 # 标准采答案/rubric/评分闭环、效果统计和状态更新。
 # 支持断点续跑：仅在目标文件及 manifest 完整校验通过时跳过该步。
+#
+# ===================== 跨层环境契约（单一来源） =====================
+# 解析优先级（高 → 低）：
+#   1. 显式进程环境（含 Agent 的 plan.env_overrides）
+#   2. local_api_config / config.py
+#   3. 本脚本内置默认值
+# Agent 允许注入的变量集合必须与 agent_runtime/env_contract.py 完全一致，
+# 由 tests/test_agent_loop_integration.py 断言两侧不漂移：
+# AGENT_INJECTABLE_ENV= BOUNDARY_TARGET EXECUTION_SCOPE EXP_ROOT INPUT_FILE MAX_SEARCH_STEPS MEMORY_SNAPSHOT_ID ROUTER_CONCURRENCY SCORING_CONCURRENCY SEARCH_BOUNDARY_TARGET SEARCH_BRANCH_WINDOW SEARCH_MAX_DEPTH SEARCH_MAX_EVALUATIONS_PER_SAMPLE SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE SEARCH_MODE SEARCH_SAMPLE_TIMEOUT_SECONDS
+#
+# Agent 接入开关（默认关闭）：`--agent --agent-task <task.json>` 把控制权交给
+# question_evolution_agent.py；Harness 再通过注册工具回调本脚本。
+# 若检测到 QE_AGENT_INNER=1（说明已处于 Harness 内部），则拒绝再次进入 Agent 模式，
+# 以避免控制面递归。
 
 set -euo pipefail
 
 RESUME_EXP_DIR=${RESUME_EXP_DIR:-}
+AGENT_MODE=${AGENT_MODE:-false}
+AGENT_TASK_FILE=${AGENT_TASK_FILE:-}
+AGENT_MAX_ROUNDS=${AGENT_MAX_ROUNDS:-3}
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --resume-exp-dir)
@@ -17,8 +34,24 @@ while [ "$#" -gt 0 ]; do
             RESUME_EXP_DIR="$2"
             shift 2
             ;;
+        --agent)
+            AGENT_MODE=true
+            shift
+            ;;
+        --agent-task)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                echo "--agent-task 需要 AgentTask JSON 路径" >&2
+                exit 2
+            fi
+            AGENT_TASK_FILE="$2"
+            shift 2
+            ;;
+        --agent-max-rounds)
+            AGENT_MAX_ROUNDS="$2"
+            shift 2
+            ;;
         -h|--help)
-            echo "Usage: bash run_loop.sh [--resume-exp-dir experiments/YYYY-MM-DD/expN]"
+            echo "Usage: bash run_loop.sh [--resume-exp-dir experiments/YYYY-MM-DD/expN] [--agent --agent-task agent_task.json [--agent-max-rounds N]]"
             exit 0
             ;;
         *)
@@ -27,6 +60,21 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+if [ "$AGENT_MODE" = "true" ]; then
+    if [ "${QE_AGENT_INNER:-0}" = "1" ]; then
+        echo "拒绝嵌套 Agent 模式：当前进程已由 Harness 驱动（QE_AGENT_INNER=1）" >&2
+        exit 2
+    fi
+    AGENT_TASK_FILE=${AGENT_TASK_FILE:-"agent_task.json"}
+    if [ ! -f "$AGENT_TASK_FILE" ]; then
+        echo "Agent 任务文件不存在: $AGENT_TASK_FILE" >&2
+        exit 2
+    fi
+    echo "本次运行模式: Harness 外层控制（--agent），任务文件 $AGENT_TASK_FILE"
+    exec python question_evolution_agent.py run --task "$AGENT_TASK_FILE" --max-rounds "$AGENT_MAX_ROUNDS"
+fi
+
 
 # ===================== 可配置参数 =====================
 read_config_value() {
@@ -250,6 +298,29 @@ for bank_file in operator_memory_bank.jsonl failure_memory_bank.jsonl invalid_ge
 done
 
 echo "本次实验目录: $EXP_DIR"
+# 跨层环境契约审计：把本次实际生效的注入变量值落盘，避免隐式传参不可追溯。
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+python - "$EXP_DIR" "$SCRIPT_DIR" <<'PYEOF'
+import json
+import os
+import sys
+from pathlib import Path
+
+project_root = Path(sys.argv[2])
+sys.path.insert(0, str(project_root))
+try:
+    from agent_runtime.env_contract import ENV_PRECEDENCE, resolved_environment
+except Exception:  # the audit must never break the pipeline
+    sys.exit(0)
+
+target = Path(sys.argv[1]) / "resolved_env.json"
+payload = {
+    "precedence": list(ENV_PRECEDENCE),
+    "resolved": resolved_environment(dict(os.environ)),
+    "inner_loop_marker": os.environ.get("QE_AGENT_INNER", ""),
+}
+target.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PYEOF
 echo "Memory 目录: $MEMORY_DIR"
 if [ "$IS_RESUME" = "true" ]; then
     echo "运行模式: 从已有实验目录恢复"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Mapping
 
+from .env_contract import AGENT_INJECTABLE_ENV
 from .task import EXECUTION_SCOPES, REGISTERED_TOOLS, SUPPORTED_EXECUTION_SCOPES, AgentTask
 
 
@@ -11,25 +12,9 @@ class PolicyViolation(ValueError):
     pass
 
 
-ENV_ALLOWLIST = {
-    "INPUT_FILE",
-    "EXP_ROOT",
-    "SEARCH_MODE",
-    "SEARCH_BOUNDARY_TARGET",
-    "BOUNDARY_TARGET",
-    "MAX_SEARCH_STEPS",
-    "EXECUTION_SCOPE",
-    "SEARCH_MAX_DEPTH",
-    "SEARCH_BRANCH_WINDOW",
-    "SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE",
-    "SEARCH_MAX_EVALUATIONS_PER_SAMPLE",
-    "SEARCH_SAMPLE_TIMEOUT_SECONDS",
-    "ROUTER_CONCURRENCY",
-    "SCORING_CONCURRENCY",
-    # Metadata only: the router includes it in its cache identity and route
-    # artifact; it never injects global strategy cards into the router.
-    "MEMORY_SNAPSHOT_ID",
-}
+# Derived from the single cross-layer declaration so the Agent and the loop
+# scripts can never disagree about what an Agent may inject (report X-3).
+ENV_ALLOWLIST = set(AGENT_INJECTABLE_ENV)
 DECISIONS = {"run_pipeline", "resume_pipeline", "run_review", "stop_and_report", "replan", "suspend", "blocked"}
 PLAN_KINDS = {"task_plan", "recovery_plan", "review_plan"}
 _REQUIRED_STEP_FIELDS = {

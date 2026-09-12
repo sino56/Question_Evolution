@@ -1,6 +1,16 @@
 ﻿# Windows PowerShell entry point for the Question Evolution pipeline.
 # Creates a new experiment by default, or resumes -ResumeExperimentDir when
 # provided. Any Python stage failure still stops the pipeline immediately.
+#
+# 跨层环境契约（单一来源，与 run_loop.sh 一致）：
+#   解析优先级（高 → 低）：显式进程环境（含 Agent plan.env_overrides）
+#     > local_api_config / config.py > 本脚本内置默认值。
+#   Agent 允许注入的变量集合必须与 agent_runtime/env_contract.py 完全一致，
+#   由 tests/test_agent_loop_integration.py 断言两侧不漂移：
+# AGENT_INJECTABLE_ENV= BOUNDARY_TARGET EXECUTION_SCOPE EXP_ROOT INPUT_FILE MAX_SEARCH_STEPS MEMORY_SNAPSHOT_ID ROUTER_CONCURRENCY SCORING_CONCURRENCY SEARCH_BOUNDARY_TARGET SEARCH_BRANCH_WINDOW SEARCH_MAX_DEPTH SEARCH_MAX_EVALUATIONS_PER_SAMPLE SEARCH_MAX_REQUEST_ATTEMPTS_PER_SAMPLE SEARCH_MODE SEARCH_SAMPLE_TIMEOUT_SECONDS
+#
+# Agent 接入开关（默认关闭）：-Agent -AgentTaskFile <task.json> 把控制权交给
+# question_evolution_agent.py；检测到 QE_AGENT_INNER=1 时拒绝嵌套，避免控制面递归。
 
 [CmdletBinding()]
 param(
@@ -8,7 +18,10 @@ param(
     [string]$ExperimentRoot = $env:EXP_ROOT,
     [string]$ResumeExperimentDir = $env:RESUME_EXP_DIR,
     [int]$MaxRounds = 0,
-    [string]$PythonExe = $env:PYTHON_EXE
+    [string]$PythonExe = $env:PYTHON_EXE,
+    [switch]$Agent,
+    [string]$AgentTaskFile = $env:AGENT_TASK_FILE,
+    [int]$AgentMaxRounds = 3
 )
 
 Set-StrictMode -Version Latest
@@ -22,6 +35,21 @@ if ([string]::IsNullOrWhiteSpace($PythonExe)) {
 }
 if (-not (Get-Command $PythonExe -ErrorAction SilentlyContinue)) {
     throw "未找到 Python 可执行文件 '$PythonExe'。请安装 Python，或设置 PYTHON_EXE。"
+}
+
+if ($Agent) {
+    if ($env:QE_AGENT_INNER -eq "1") {
+        throw "拒绝嵌套 Agent 模式：当前进程已由 Harness 驱动（QE_AGENT_INNER=1）"
+    }
+    if ([string]::IsNullOrWhiteSpace($AgentTaskFile)) {
+        $AgentTaskFile = "agent_task.json"
+    }
+    if (-not (Test-Path -LiteralPath $AgentTaskFile)) {
+        throw "Agent 任务文件不存在: $AgentTaskFile"
+    }
+    Write-Host "本次运行模式: Harness 外层控制（-Agent），任务文件 $AgentTaskFile"
+    & $PythonExe "question_evolution_agent.py" run --task $AgentTaskFile --max-rounds $AgentMaxRounds
+    exit $LASTEXITCODE
 }
 
 function Get-EnvOrDefault {

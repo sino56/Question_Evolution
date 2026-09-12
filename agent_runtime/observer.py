@@ -6,7 +6,7 @@ import json
 import hashlib
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from pipeline_runtime import StageJsonError, load_json_records, validate_published_artifact
 
@@ -235,6 +235,23 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _text(value: Any) -> str:
+    """Render a field as UTF-8 text for report/contract fields.
+
+    The final-output contract must stay a pure projection of the published
+    records: nested ``question_evolved`` values are re-serialized rather than
+    dropped, and missing values collapse to an empty string.
+    """
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (Mapping, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return str(value)
+
+
 def _collect_statuses(records: Iterable[Mapping[str, Any]], counter: Counter[str], evidence: List[Dict[str, Any]], source: Path, operator_counter: Counter[tuple[str, str]]) -> None:
     for record in records:
         for container in (record, _mapping(record.get("branch_result")), _mapping(record.get("effect_analysis"))):
@@ -288,6 +305,101 @@ def _operator_plan_summary(records: Iterable[Mapping[str, Any]]) -> tuple[Dict[s
                 if operator:
                     attempts[operator] += int(entry.get("generation_attempt_count") or 0)
     return dict(statuses), dict(attempts)
+
+
+def _number(value: Any) -> Optional[float]:
+    """Return a real number, never a bool or a numeric string."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _score_of(record: Mapping[str, Any]) -> Optional[float]:
+    for field in ("score_rate", "score", "final_score"):
+        value = _number(record.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def _baseline_score_of(record: Mapping[str, Any]) -> Optional[float]:
+    """Recover the pre-evolution score from the published round-0 evidence."""
+
+    summary = _mapping(record.get("round0_score_summary"))
+    for field in ("score_rate", "mean_score", "score"):
+        value = _number(summary.get(field))
+        if value is not None:
+            return value
+    trials = record.get("round0_score_trials")
+    if isinstance(trials, list):
+        values = [_number(_mapping(item).get("score_rate")) for item in trials]
+        numbers = [value for value in values if value is not None]
+        if numbers:
+            return round(sum(numbers) / len(numbers), 6)
+    return None
+
+
+def _operator_path(record: Mapping[str, Any]) -> List[str]:
+    route = _mapping(record.get("operator_route"))
+    metadata = _mapping(_mapping(record.get("meta_info")).get("question_evolution_metadata"))
+    path: List[str] = []
+    for value in (
+        route.get("selected_operator"),
+        record.get("candidate_operator"),
+        metadata.get("operator_used"),
+        record.get("operator_used"),
+    ):
+        text = _text(value)
+        if text and text not in path:
+            path.append(text)
+    return path
+
+
+def final_output_contract(final_records: Iterable[Mapping[str, Any]], *, statistics: Mapping[str, Any] | None = None) -> Dict[str, Any]:
+    """Derive the design §20 final output contract from published records.
+
+    The report previously listed internal status fields only, so the fields the
+    design declares as the *output contract* (best question, score before/after,
+    delta, operator path, judge stability, cost) were never produced (report
+    X-5).  Everything here is read-only and bounded; a smaller final score is the
+    goal, so the best record carries the most negative delta.
+    """
+
+    evaluated: List[tuple[float, Mapping[str, Any], Optional[float], float]] = []
+    for record in final_records:
+        after = _score_of(record)
+        if after is None:
+            continue
+        before = _baseline_score_of(record)
+        delta = after - (before if before is not None else after)
+        evaluated.append((round(delta, 6), record, before, after))
+    if not evaluated:
+        return {
+            "available": False,
+            "reason": "no published final record carries a numeric score" if final_records else "no final scored record was published",
+            "evaluated_records": 0,
+        }
+    delta, record, before, after = min(
+        evaluated, key=lambda item: (item[0], str(item[1].get("sample_id") or item[1].get("index") or ""))
+    )
+    stats = _mapping(statistics)
+    cost_keys = ("total_cost", "cost", "request_count", "evaluation_count", "model_calls", "duration_seconds", "elapsed_seconds")
+    return {
+        "available": True,
+        "evaluated_records": len(evaluated),
+        "scored_records": len(list(final_records)) if isinstance(final_records, list) else len(evaluated),
+        "best_sample_id": str(record.get("sample_id") or record.get("index") or ""),
+        "best_question": _text(record.get("question_evolved"))[:4000],
+        "score_before": before,
+        "score_after": after,
+        "score_delta": delta,
+        "operator_path": _operator_path(record),
+        "judge_stability": _judge_stability(stats),
+        "cost_summary": {key: stats[key] for key in cost_keys if key in stats},
+        "direction": "score_drop" if delta < 0 else ("score_increase" if delta > 0 else "unchanged"),
+        "note": "A score decrease is the expected outcome; a score increase is negative gain and requires human review.",
+    }
 
 
 def _memory_summary(memory_dir: Path, issues: List[str]) -> Dict[str, Any]:
@@ -442,6 +554,10 @@ def observe_experiment(
         "missing_artifacts": missing,
         "memory_summary": memory,
         "evidence_refs": evidence,
+        # X-5: the design §20 final output contract, derived read-only from the
+        # published final records so the reporter renders real values instead of
+        # a fixed field checklist.
+        "final_output_contract": final_output_contract(final_records, statistics=statistics),
     }
     observation["observations"] = normalize_tool_result(
         {"tool": "observe_experiment", "ok": observation["status"] != "blocked", "observation": observation},

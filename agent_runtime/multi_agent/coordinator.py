@@ -13,6 +13,51 @@ from .human_review_advisors import synthesize_prechecks
 from ..skills import load_stage_skills
 
 
+DETERMINISTIC_ADVISOR_MODEL = "local-deterministic-advisor"
+
+
+def advisor_independence(records: Any) -> dict[str, Any]:
+    """State plainly whether the review was multi-view or one view repeated.
+
+    With no advisor provider configured, ``select_model`` returns the local
+    deterministic advisor and ``request_model_advice`` returns ``None``, so every
+    Advisor renders the same template.  Reporting that as "cross-validated by N
+    advisors" would overstate the evidence (report V-8).  The realised model tier
+    is therefore recorded explicitly and labelled.
+    """
+
+    items = [dict(item) for item in records or [] if isinstance(item, Mapping)]
+    model_backed = [item for item in items if str(item.get("selected_model") or "") != DETERMINISTIC_ADVISOR_MODEL]
+    completed = [item for item in items if str(item.get("status") or "") == "completed"]
+    tiers = sorted({str(item.get("model_tier") or "") for item in items if str(item.get("model_tier") or "")})
+    fallback_used = sum(1 for item in items if item.get("fallback_used"))
+    if not items:
+        interpretation = "not_run"
+        statement = "No Advisor was executed; no advisory evidence exists for this Session."
+    elif not model_backed:
+        interpretation = "deterministic_checklist"
+        statement = (
+            "Every Advisor ran the local deterministic template, so this is a structured "
+            "checklist rather than independent multi-model judgement. It must not be cited as cross-validation."
+        )
+    else:
+        interpretation = "partially_model_backed"
+        statement = (
+            f"{len(model_backed)} of {len(items)} Advisors were model-backed; the remainder ran the "
+            "local deterministic template. Treat the deterministic findings as a checklist only."
+        )
+    return {
+        "advisor_runs": len(items),
+        "completed_advisors": len(completed),
+        "model_backed_advisors": len(model_backed),
+        "deterministic_advisors": len(items) - len(model_backed),
+        "model_tiers": tiers,
+        "fallback_used_count": fallback_used,
+        "interpretation": interpretation,
+        "statement": statement,
+    }
+
+
 def run_post_experiment_review(
     run_dir: str | Path,
     *,
@@ -40,7 +85,14 @@ def run_post_experiment_review(
     executor = AdvisorExecutor(run_dir, parent_run_id=str(state.get("agent_run_id") or Path(run_dir).name))
     records, advice_items = executor.execute(specs, evidence_pack)
     merged = merge_advice(run_dir, advice_items=advice_items, evidence_pack=evidence_pack)
-    return {"evidence_pack_hash": evidence_pack["evidence_pack_hash"], "advisor_records": records, "merge": merged, "skill_load": skill_load.as_dict()}
+    return {
+        "evidence_pack_hash": evidence_pack["evidence_pack_hash"],
+        "advisor_records": records,
+        "merge": merged,
+        "skill_load": skill_load.as_dict(),
+        # V-8: the realised independence of this review is part of its artifact.
+        "independence": advisor_independence(records),
+    }
 
 
 def run_advisor_stage(

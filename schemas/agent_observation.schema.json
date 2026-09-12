@@ -7,6 +7,7 @@
     "experiment_dir": {"type": "string"},
     "status": {"enum": ["observed", "blocked"]},
     "manifest_status": {"enum": ["ok", "not_checked", "damaged"]},
+    "termination_reason": {"type": ["string", "null"], "examples": ["manual_review_required", "review_completed", "no_pending_branches", "effective_boundary_found", "judge_instability", "retryable_tool_failure", "unrecoverable_tool_failure", "manifest_corrupted", "artifact_blocked", "configuration_error", "dry_run_completed", "invalid_plan", "memory_snapshot_unavailable", "replan_pending_execution", "budget_exhausted", "evaluation_budget_exhausted", "generation_budget_exhausted", "max_search_steps_budget_exhausted", "request_budget_exhausted", "scoring_budget_exhausted", "search_budget_exhausted"], "description": "Documented terminal reasons. The type stays open because a pipeline stage may report its own reason; every BUDGET_TERMINAL_REASONS entry must appear in this list (asserted by tests/test_agent_contract_drift.py)."},
     "judge_stability": {
       "type": "object",
       "required": ["status"],

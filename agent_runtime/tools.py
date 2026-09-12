@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional
 
+from .env_contract import INNER_LOOP_MARKER
 from .events import append_event, summarize_text
 from .policy import validate_env_overrides
 from .task import AgentTask
@@ -292,6 +293,9 @@ class ToolRegistry:
         allowed_env = validate_env_overrides(env_overrides)
         environment = os.environ.copy()
         environment.update(allowed_env)
+        # Mark this process tree as *inside* the Agent control plane so
+        # run_loop.sh refuses to start a nested Harness (report X-1/X-3).
+        environment[INNER_LOOP_MARKER] = "1"
         call_id = tool_call_id or f"call_{uuid.uuid4().hex[:16]}"
         # A side-effecting tool whose Session already produced a result must not
         # restart the whole pipeline: the executor withholds the retry budget
