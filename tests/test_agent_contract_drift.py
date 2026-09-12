@@ -220,3 +220,51 @@ def test_mapping_table_covers_every_defect_id_tracked_by_the_plan():
     ]
     absent = [identifier for identifier in expected if identifier not in text]
     assert not absent, f"the mapping table omits: {absent}"
+
+
+# -------------------------------------------------- orchestration layer contracts
+
+
+def test_run_loop_sh_pins_the_project_root_before_any_stage_runs():
+    shell = (ROOT / "run_loop.sh").read_text(encoding="utf-8")
+
+    # The script must cd into its own directory (SCRIPT_DIR) and pin
+    # caller-relative path arguments before any python stage is invoked.
+    cd_position = shell.index('cd "$SCRIPT_DIR"')
+    script_dir_position = shell.index("SCRIPT_DIR=$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)")
+    assert script_dir_position < cd_position
+    first_python = shell.index("python ")
+    assert cd_position < first_python
+    # Relative --resume-exp-dir / --agent-task arguments are resolved against
+    # the caller's working directory before the cd happens.
+    assert 'RESUME_EXP_DIR=$(abs_path "$2")' in shell
+    assert 'AGENT_TASK_FILE=$(abs_path "$2")' in shell
+
+
+def test_loop_scripts_surface_artifact_validation_failure_reasons():
+    shell = (ROOT / "run_loop.sh").read_text(encoding="utf-8")
+    powershell = (ROOT / "run_loop.ps1").read_text(encoding="utf-8-sig")
+
+    # A rejected overwrite must include the validator's reason, not just a
+    # bare exit code (run_if_missing / Invoke-Step).
+    assert "校验失败原因" in shell
+    assert "validate_reason=" in shell
+    assert "校验失败原因" in powershell
+    assert "$script:LastArtifactValidationReason" in powershell
+
+
+def test_reset_failed_sidecar_removes_only_the_stale_sidecar(tmp_path):
+    from pipeline_runtime import reset_failed_sidecar
+
+    output = tmp_path / "scored.jsonl"
+    output.write_text("{}\n", encoding="utf-8")
+    stale = tmp_path / "scored.jsonl.failed"
+    stale.write_text("previous run failure\n", encoding="utf-8")
+
+    reset_failed_sidecar(output)
+
+    assert not stale.exists()
+    assert output.is_file()
+    # Idempotent when no sidecar exists.
+    reset_failed_sidecar(output)
+    assert output.is_file()

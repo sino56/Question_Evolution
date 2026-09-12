@@ -25,6 +25,7 @@ from pipeline_runtime import (
     consume_model_request_budget,
     ensure_passthrough_reusable,
     iter_json_records,
+    reset_failed_sidecar,
     validate_published_artifact,
 )
 
@@ -1699,6 +1700,7 @@ class ScoringProcessor:
         if evaluation_mode == "experimental":
             self.load_input_traces(input_path)
         failed_path = output_path + ".failed"
+        reset_failed_sidecar(output_path)
         results: List[Dict[str, Any]] = []
         failed_count = 0
 

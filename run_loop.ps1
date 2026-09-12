@@ -97,7 +97,9 @@ function Test-NonEmptyFile {
 
 function Test-PublishedArtifact {
     param([string]$OutputFile, [string]$StageName, [string]$InputFile)
-    & $PythonExe (Join-Path $ProjectRoot "artifact_cli.py") validate --output $OutputFile --stage $StageName --input $InputFile *> $null
+    # Capture the validator's reason so a "reject overwrite" failure can say
+    # why it failed instead of leaving a bare exit code (mirrors run_if_missing).
+    $script:LastArtifactValidationReason = (& $PythonExe (Join-Path $ProjectRoot "artifact_cli.py") validate --output $OutputFile --stage $StageName --input $InputFile 2>&1 | Out-String).Trim()
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -114,7 +116,7 @@ function Invoke-Step {
         return
     }
     if (Test-Path -LiteralPath $OutputFile) {
-        throw "已有产物未通过 manifest 校验，拒绝覆盖: $OutputFile"
+        throw "已有产物未通过 manifest 校验，拒绝覆盖: $OutputFile`n校验失败原因: $script:LastArtifactValidationReason"
     }
     Write-Host $Label
     & $Action

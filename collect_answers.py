@@ -23,6 +23,7 @@ from pipeline_runtime import (
     consume_model_request_budget,
     ensure_passthrough_reusable,
     iter_json_records,
+    reset_failed_sidecar,
     stable_record_key,
     validate_published_artifact,
 )
@@ -462,6 +463,7 @@ class AnswerCollector:
             metrics=metrics,
         )
         failed_path = output_path + ".failed"
+        reset_failed_sidecar(output_path)
         failed_count = 0
 
         async def worker(item: Dict[str, Any]):

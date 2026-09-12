@@ -44,6 +44,26 @@ class RequestBudgetExceeded(RuntimeError):
     """Raised before a model request would exceed a configured search budget."""
 
 
+FAILED_SIDECAR_SUFFIX = ".failed"
+
+
+def reset_failed_sidecar(output_path: str | os.PathLike[str]) -> None:
+    """Drop a stale ``.failed`` sidecar before a stage run starts.
+
+    Stage writers open the sidecar in append mode and on success only delete it
+    when it is empty, so a leftover from a previous failed run would otherwise
+    survive a later successful re-run and mislead triage.  Removing it at run
+    start makes the sidecar reflect exactly the latest attempt.
+    """
+
+    sidecar = Path(str(output_path) + FAILED_SIDECAR_SUFFIX)
+    try:
+        if sidecar.exists():
+            sidecar.unlink()
+    except OSError:
+        pass  # best effort; the stage run re-creates the sidecar on failure
+
+
 REQUEST_BUDGET_PATH_ENV = "SEARCH_REQUEST_BUDGET_PATH"
 
 

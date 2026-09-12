@@ -26,6 +26,7 @@ from pipeline_runtime import (
     consume_model_request_budget,
     iter_json_records,
     load_json_records,
+    reset_failed_sidecar,
     stable_record_key,
     validate_published_artifact,
 )
@@ -1881,6 +1882,7 @@ class QuestionEvolutionProcessor:
         sidecar_path = output_path + ".evolution_traces.jsonl.gz"
         traces = TraceStore(stage, recovery_path=sidecar_path + ".partial")
         failed_path = output_path + ".failed"
+        reset_failed_sidecar(output_path)
         failed_count = 0
 
         def externalize_trace(record: Dict[str, Any]) -> Dict[str, Any]:

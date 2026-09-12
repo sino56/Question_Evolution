@@ -20,6 +20,20 @@
 
 set -euo pipefail
 
+# 统一执行目录：所有阶段按相对路径调用，EXP_ROOT / INPUT_FILE 默认值也相对
+# 项目根解析。先记住调用者工作目录，把用户提供的相对路径参数钉到它上面，
+# 再切换到脚本目录执行（与 run_loop.ps1 的 Set-Location $PSScriptRoot 对齐）。
+INVOCATION_PWD=$PWD
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$SCRIPT_DIR"
+
+abs_path() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *) printf '%s\n' "$INVOCATION_PWD/$1" ;;
+    esac
+}
+
 RESUME_EXP_DIR=${RESUME_EXP_DIR:-}
 AGENT_MODE=${AGENT_MODE:-false}
 AGENT_TASK_FILE=${AGENT_TASK_FILE:-}
@@ -31,7 +45,7 @@ while [ "$#" -gt 0 ]; do
                 echo "--resume-exp-dir 需要已有实验目录路径" >&2
                 exit 2
             fi
-            RESUME_EXP_DIR="$2"
+            RESUME_EXP_DIR=$(abs_path "$2")
             shift 2
             ;;
         --agent)
@@ -43,7 +57,7 @@ while [ "$#" -gt 0 ]; do
                 echo "--agent-task 需要 AgentTask JSON 路径" >&2
                 exit 2
             fi
-            AGENT_TASK_FILE="$2"
+            AGENT_TASK_FILE=$(abs_path "$2")
             shift 2
             ;;
         --agent-max-rounds)
@@ -61,12 +75,17 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+# 环境变量形式的相对路径同样按调用者工作目录解析。
+if [ -n "$RESUME_EXP_DIR" ]; then
+    RESUME_EXP_DIR=$(abs_path "$RESUME_EXP_DIR")
+fi
+
 if [ "$AGENT_MODE" = "true" ]; then
     if [ "${QE_AGENT_INNER:-0}" = "1" ]; then
         echo "拒绝嵌套 Agent 模式：当前进程已由 Harness 驱动（QE_AGENT_INNER=1）" >&2
         exit 2
     fi
-    AGENT_TASK_FILE=${AGENT_TASK_FILE:-"agent_task.json"}
+    AGENT_TASK_FILE=$(abs_path "${AGENT_TASK_FILE:-agent_task.json}")
     if [ ! -f "$AGENT_TASK_FILE" ]; then
         echo "Agent 任务文件不存在: $AGENT_TASK_FILE" >&2
         exit 2
@@ -299,7 +318,7 @@ done
 
 echo "本次实验目录: $EXP_DIR"
 # 跨层环境契约审计：把本次实际生效的注入变量值落盘，避免隐式传参不可追溯。
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# SCRIPT_DIR 已在脚本头部定义并 cd；此处仅复用该值作为项目根。
 python - "$EXP_DIR" "$SCRIPT_DIR" <<'PYEOF'
 import json
 import os
@@ -346,10 +365,12 @@ run_if_missing() {
     local step_label="$4"
     shift 4
 
-    if python artifact_cli.py validate --output "$output_file" --stage "$stage_name" --input "$input_file" >/dev/null 2>&1; then
+    local validate_reason=""
+    if validate_reason=$(python artifact_cli.py validate --output "$output_file" --stage "$stage_name" --input "$input_file" 2>&1); then
         echo "检测到已验证产物 $output_file，跳过 $step_label"
     elif [ -e "$output_file" ]; then
         echo "已有产物未通过 manifest 校验，拒绝覆盖: $output_file" >&2
+        echo "校验失败原因: $validate_reason" >&2
         exit 1
     else
         echo "$step_label"

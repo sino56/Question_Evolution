@@ -23,6 +23,7 @@ from pipeline_runtime import (
     consume_model_request_budget,
     ensure_passthrough_reusable,
     iter_json_records,
+    reset_failed_sidecar,
     stable_record_key,
     validate_published_artifact,
 )
@@ -875,6 +876,7 @@ async def main(
         metrics=metrics,
     )
     failed_path = output_file + ".failed"
+    reset_failed_sidecar(output_file)
     failed_count = 0
     progress_bar = tqdm_asyncio(total=0, desc="生成评分标准")
 
