@@ -16,7 +16,7 @@ from agent_runtime.budgeting import (
 from agent_runtime.context import build_context_pack
 from agent_runtime.contracts import ContractViolation
 from agent_runtime.multi_agent.coordinator import run_post_experiment_review
-from agent_runtime.global_memory import GlobalMemoryStore, SnapshotUnavailable, router_cache_key
+from agent_runtime.global_memory import RETRIEVAL_CONFIG_VERSION, GlobalMemoryStore, SnapshotUnavailable, router_cache_key
 from agent_runtime.executor import Executor, ExecutorError
 from agent_runtime.observer import observe_experiment
 from agent_runtime.planner import build_plan, plan_env_overrides
@@ -52,7 +52,9 @@ def _memory_runtime(task: AgentTask) -> tuple[dict[str, Any], dict[str, Any], st
     if task.allow_global_memory_read and not degraded and snapshot.get("mode") == "global_memory":
         context = store.retrieve(snapshot_id=str(snapshot["memory_snapshot_id"]), query=task.goal, top_k=3)
     else:
-        context = {"memory_snapshot_id": snapshot["memory_snapshot_id"], "memory_context_key": None, "retrieval_config_version": "global-memory-retrieval-v1", "top_k": 0, "cards": [], "mode": "no_global_memory" if degraded else snapshot.get("mode", "no_global_memory")}
+        # Reference the single source of truth instead of a hard-coded literal:
+        # a duplicated version string drifts from the real retriever (V-1/V-2).
+        context = {"memory_snapshot_id": snapshot["memory_snapshot_id"], "memory_context_key": None, "retrieval_config_version": RETRIEVAL_CONFIG_VERSION, "top_k": 0, "cards": [], "mode": "no_global_memory" if degraded else snapshot.get("mode", "no_global_memory")}
     path = store.root / "snapshots" / f"{snapshot['memory_snapshot_id']}.json"
     return snapshot, context, str(path) if path.exists() else None
 
